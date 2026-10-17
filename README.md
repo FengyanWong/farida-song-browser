@@ -2,7 +2,7 @@
 
 轻量的哔哩哔哩歌切收藏工具。中文深色界面，显示封面、标题、UP 主和上传时间；点击标题，在默认浏览器打开原视频。
 
-**[下载 Windows 版 v0.0.3](https://github.com/FengyanWong/farida-song-browser/releases/download/v0.0.3/FaridaSongBrowser-0.0.3-windows-x64.exe)** · [全部下载与更新说明](https://github.com/FengyanWong/farida-song-browser/releases/latest)
+**[下载 Windows 版 v0.0.4](https://github.com/FengyanWong/farida-song-browser/releases/download/v0.0.4/FaridaSongBrowser-0.0.4-windows-x64.exe)** · [全部下载与更新说明](https://github.com/FengyanWong/farida-song-browser/releases/latest)
 
 ## 开始使用
 
@@ -10,7 +10,7 @@
 2. 首次用哔哩哔哩手机 App 扫码登录。之后有效登录会自动使用，每次启动更新一次来源。
 3. 搜索歌名、点击标题看原视频，或用星标收藏。退出时点击右上角账号菜单 → **退出应用**。
 
-关闭浏览器标签页后，应用仍在后台运行；再次双击 EXE 可重新打开页面。
+关闭最后一个应用标签页后约 5 秒自动退出。刷新页面、切换标签页不会退出；再次双击 EXE 即可重新打开。
 
 ## 功能与来源
 

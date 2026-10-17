@@ -1,13 +1,14 @@
-法里达 · 歌切收藏 / Farida Song Browser v0.0.3
+法里达 · 歌切收藏 / Farida Song Browser v0.0.4
 
-1. Double-click FaridaSongBrowser-0.0.3-windows-x64.exe. No Python installation is needed.
+1. Double-click FaridaSongBrowser-0.0.4-windows-x64.exe. No Python installation is needed.
 2. Your default browser opens the app. The EXE runs in the background without a console window.
 3. Scan the QR code with Bilibili's mobile app if a login is needed.
 4. The bundled catalog loads automatically on a new computer. Existing data is preserved.
 5. Click a song title to open the original Bilibili video and part.
 6. Choose 退出应用 in the upper-right account menu or login dialog to stop. Open the EXE again to return.
 
-Closing a browser tab leaves the app running. Launching the EXE again reopens it.
+Closing the last app tab stops the backend after about 5 seconds. Refreshing the page or switching tabs keeps it running.
+If several app tabs are open, close all of them to exit. Open the EXE again to restart.
 When upgrading from v0.0.1, close the old launcher window before opening this version.
 
 The two tabs are 片段收藏 (clips) and 采集来源 (sources).

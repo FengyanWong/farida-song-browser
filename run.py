@@ -155,13 +155,14 @@ def main():
     try:
         if seed_new_catalog(settings.db_path, resource_root() / "data" / "catalog.json"):
             print("已载入随应用提供的歌切目录。", flush=True)
-        print(f"法里达 · 歌切收藏 {__version__}: {url}\n数据目录: {settings.data_dir}\n在页面右上角账号菜单中选择“退出应用”以停止后台运行。",flush=True)
+        print(f"法里达 · 歌切收藏 {__version__}: {url}\n数据目录: {settings.data_dir}\n关闭最后一个应用网页后约 5 秒自动退出，也可在账号菜单选择“退出应用”。",flush=True)
         def shutdown():
             server.should_exit = True
 
-        app = create_app(settings, scan_on_start=not args.no_startup_scan, shutdown_callback=shutdown)
+        app = create_app(settings, scan_on_start=not args.no_startup_scan, shutdown_callback=shutdown,
+                         browser_start_timeout=None if args.no_browser else 60)
         server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, access_log=False,
-                                             log_level="warning", use_colors=False, timeout_graceful_shutdown=5))
+                                             log_level="warning", use_colors=False, ws="wsproto", timeout_graceful_shutdown=5))
         if not args.no_browser:
             threading.Thread(target=open_when_ready,args=(url,),daemon=True).start()
         server.run()

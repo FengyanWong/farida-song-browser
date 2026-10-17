@@ -9,7 +9,7 @@ from datetime import date
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,6 +22,7 @@ from .resources import resource_root
 from .auth import BilibiliLogin
 from .db import Database
 from .sync import Collector
+from .lifetime import WindowLifetime
 
 
 class Model(BaseModel):
@@ -62,13 +63,15 @@ class SyncRequest(Model):
     mode: Literal["full","incremental"] = "incremental"
 
 
-def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan_on_start=True, preview_mode=False, auth_transport=None, shutdown_callback=None):
+def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan_on_start=True, preview_mode=False, auth_transport=None, shutdown_callback=None, window_grace_seconds=5.0, browser_start_timeout=None):
     settings = settings or Settings.from_env()
     db = Database(settings.db_path)
     collector = Collector(db,settings,adapter_factory) if adapter_factory else Collector(db,settings)
     login = BilibiliLogin(settings, transport=auth_transport, before_change=collector.stop)
     token = secrets.token_urlsafe(32)
     startup_pending = scan_on_start
+    lifetime = WindowLifetime(shutdown_callback, grace_seconds=window_grace_seconds,
+                              startup_timeout=browser_start_timeout) if shutdown_callback and not preview_mode else None
 
     def start_update_locked():
         # Called under login.lock. A successful login releases exactly one
@@ -100,9 +103,13 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         # Keep the UI available while validating a saved session. No source
         # request is made until login has been verified.
         startup = app.state.startup_task = asyncio.create_task(initialize_account())
+        if lifetime:
+            lifetime.start()
         try:
             yield
         finally:
+            if lifetime:
+                await lifetime.close()
             startup.cancel()
             try:
                 await startup
@@ -114,6 +121,7 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     app = FastAPI(title="法里达 · 歌切收藏", version=__version__, lifespan=lifespan)
     app.state.db,app.state.collector = db,collector
     app.state.login = login
+    app.state.window_lifetime = lifetime
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=["127.0.0.1","localhost","[::1]","testserver"])
 
     @app.middleware("http")
@@ -127,7 +135,8 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: blob: https://*.hdslb.com; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
+        socket_origin = f"{'wss' if request.url.scheme == 'https' else 'ws'}://{request.url.netloc}"
+        response.headers["Content-Security-Policy"] = f"default-src 'self'; img-src 'self' data: blob: https://*.hdslb.com; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' {socket_origin}; object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -150,15 +159,49 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
 
     @app.get("/api/session")
     def session():
-        return {"token":token,"request_interval":settings.request_interval,"discovery_pages":settings.discovery_pages,"incremental_pages":settings.incremental_pages,"preview_mode":preview_mode,"can_shutdown":shutdown_callback is not None and not preview_mode}
+        return {"token":token,"request_interval":settings.request_interval,"discovery_pages":settings.discovery_pages,"incremental_pages":settings.incremental_pages,"preview_mode":preview_mode,"can_shutdown":lifetime is not None,"close_with_page":lifetime is not None,"close_grace_seconds":window_grace_seconds}
+
+    @app.websocket('/api/window')
+    async def app_window(websocket: WebSocket):
+        origin = urlsplit(websocket.headers.get('origin', ''))
+        expected_scheme = 'https' if websocket.url.scheme == 'wss' else 'http'
+        if not lifetime or origin.scheme != expected_scheme or origin.netloc != websocket.headers.get('host'):
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        window = None
+        try:
+            # Keep the local token out of URLs and accept only same-origin
+            # app documents. This endpoint also works on the login screen.
+            hello = await asyncio.wait_for(websocket.receive_json(), timeout=5)
+            supplied = hello.get('token') if isinstance(hello, dict) else None
+            if not isinstance(supplied, str) or not secrets.compare_digest(supplied.encode(), token.encode()):
+                await websocket.close(code=1008)
+                return
+            window = lifetime.connect()
+            if window is None:
+                await websocket.close(code=1001)
+                return
+            await websocket.send_json({'state': 'connected'})
+            while (await websocket.receive())['type'] != 'websocket.disconnect':
+                pass
+        except WebSocketDisconnect:
+            pass
+        except asyncio.TimeoutError:
+            await websocket.close(code=1008)
+        except (ValueError, KeyError, TypeError):
+            await websocket.close(code=1008)
+        finally:
+            if window is not None:
+                lifetime.disconnect(window)
 
     @app.post("/api/shutdown")
     async def shutdown():
-        if shutdown_callback is None or preview_mode:
+        if lifetime is None:
             raise HTTPException(409, "当前启动方式不支持从页面退出应用。")
         # Send the response before stopping the server. Its lifespan cleanup
         # closes the collector and login clients, keeping committed progress.
-        return JSONResponse({"status": "stopping"}, background=BackgroundTask(shutdown_callback))
+        return JSONResponse({"status": "stopping"}, background=BackgroundTask(lifetime.shutdown))
 
     @app.get("/api/overview")
     def overview():

@@ -14,11 +14,13 @@ py -3 -m venv .venv
 ```
 
 Linux / macOS 使用 `python3` 和 `.venv/bin/python`。测试使用离线数据，不需要哔哩哔哩登录。
-源码方式保留终端输出；Windows EXE 在后台运行，可从页面账号菜单或登录界面选择「退出应用」。
+源码方式保留终端输出；Windows EXE 不显示终端。关闭最后一个应用标签页约 5 秒后自动退出，也可从账号菜单或登录界面选择「退出应用」。
+每个页面通过同源 WebSocket 保持连接，不使用后台标签页定时心跳。刷新和页面恢复会重新连接，退出时沿用正常采集清理流程。
 
 应用只监听 `127.0.0.1`，默认端口为 8765；端口被占用时自动选择并记住其他端口。
 可用 `--port` 指定端口，`--data-dir` 指定独立数据目录，`--no-browser` 不打开浏览器，
 `--no-startup-scan` 暂停该次启动的自动采集。后者仍要求验证登录。
+普通启动在 60 秒内没有页面连接时会退出；`--no-browser` 允许没有页面的维护操作，但首次打开页面后，最后一个页面关闭仍会自动退出。
 
 配置示例见 [`config.example.env`](../config.example.env)，该文件不会自动加载。
 数据目录默认为 Windows 的 `%LOCALAPPDATA%\FaridaSongBrowser`，或其他系统的
@@ -34,7 +36,7 @@ py -3.12 -m venv .build-venv
 .\.build-venv\Scripts\python.exe -m pip install -r requirements-build.txt
 .\.build-venv\Scripts\python.exe -X utf8 scripts\build_windows.py
 .\.build-venv\Scripts\python.exe -X utf8 scripts\download_dependency_sources.py
-.\.build-venv\Scripts\python.exe -X utf8 scripts\smoke_exe.py release\FaridaSongBrowser-0.0.3-windows-x64.exe
+.\.build-venv\Scripts\python.exe -X utf8 scripts\smoke_exe.py release\FaridaSongBrowser-0.0.4-windows-x64.exe
 ```
 
 产物在 `release/`：单文件 EXE、ZIP、公开目录与链接清单、依赖源码包及 SHA-256 校验值。
@@ -59,4 +61,4 @@ EXE 包含 Python 运行时、界面、Frida 精灵图、公开目录和许可�
 .\.venv\Scripts\python.exe -X utf8 scripts\diagnose.py --uid 210887872 --bvid BV1br4y1R7BP
 ```
 
-[v0.0.2 验证记录](release-0.0.2-verification.md)
+[v0.0.4 验证记录](release-0.0.4-verification.md) · [v0.0.2 验证记录](release-0.0.2-verification.md)

@@ -3,7 +3,7 @@
 The application source is Copyright (C) 2026 FengyanWong and is distributed under
 GNU GPL version 3 only. See [LICENSE](LICENSE). It comes without any warranty.
 The corresponding application source and build instructions are published at
-https://github.com/FengyanWong/farida-song-browser, with release sources tagged `v0.0.1`.
+https://github.com/FengyanWong/farida-song-browser, with each release source identified by its matching Git tag.
 
 ## Collected metadata
 
@@ -24,7 +24,7 @@ from text, and no Microsoft font files are redistributed.
 
 The executable bundles Python and these runtime packages: FastAPI, Starlette,
 HTTPX, HTTPCore, AnyIO, Uvicorn, Pydantic, pydantic-core, Segno, Certifi, Click,
-Colorama, h11, IDNA, annotated-doc, annotated-types, OpenTelemetry API,
+Colorama, h11, wsproto, IDNA, annotated-doc, annotated-types, OpenTelemetry API,
 typing-extensions, and typing-inspection. Exact versions are pinned in
 `requirements-lock.txt`. They retain their own license terms.
 

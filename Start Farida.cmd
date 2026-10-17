@@ -21,7 +21,7 @@ if not errorlevel 1 (
 )
 if errorlevel 1 goto failure
 :dependencies
-".venv\Scripts\python.exe" -X utf8 -c "import fastapi,httpx,uvicorn,pydantic,segno; assert int(pydantic.__version__.split('.')[0]) >= 2" >nul 2>nul
+".venv\Scripts\python.exe" -X utf8 -c "import fastapi,httpx,uvicorn,pydantic,segno,wsproto; assert int(pydantic.__version__.split('.')[0]) >= 2" >nul 2>nul
 if not errorlevel 1 goto launch
 echo Installing the small Python dependencies. This is needed only on first launch.
 ".venv\Scripts\python.exe" -X utf8 -m pip install --quiet --no-warn-script-location -r requirements.txt

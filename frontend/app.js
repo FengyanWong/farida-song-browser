@@ -1,9 +1,11 @@
 import { $, $$, escape as e, icon, hydrateIcons, toast, dateTime } from './ui.js';
 import { Pet } from './pet.js';
 import { AccountLogin } from './account.js';
+import { AppLifetime } from './lifetime.js';
 
 hydrateIcons();
 const pet = new Pet(); pet.initialize();
+const appLifetime = new AppLifetime();
 const state = {view:'catalog',filter:'included',page:1,pageSize:40,overview:null,clips:null,token:null,preview:false,stopping:false,selected:new Set(),editSource:null,request:0};
 const failedCovers = new Set();
 const clipFilters = {included:'已收录',bookmarked:'星标收藏',needs_review:'待确认',all:'全部候选',excluded:'已排除'};
@@ -26,6 +28,7 @@ async function quitApp() {
   $$('[data-quit-app]').forEach(button=>button.disabled=true);
   try {
     await api('/api/shutdown',{method:'POST'});
+    appLifetime.stop();
     accountLogin.stop();
     $$('dialog[open]').forEach(dialog=>dialog.close());
     $('#shutdown-dialog').showModal();
@@ -255,4 +258,4 @@ $('#source-form').onsubmit=async event=>{
 document.addEventListener('keydown',event=>{if(event.key==='/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName) && !document.querySelector('dialog[open]')){event.preventDefault();if(state.view==='sources')setView('catalog');$('#search').focus();}});
 window.addEventListener('hashchange',readRoute);
 async function poll(){if(state.stopping)return;if(document.hidden){schedulePoll(10000);return;}try{const active=state.overview?.jobs.some(j=>['running','queued'].includes(j.state));await loadOverview();await accountLogin.refresh();if(active && state.view!=='sources')await loadClips();}catch{if(state.stopping)return;$('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';schedulePoll(10000);}}
-try {const session=await api('/api/session');state.token=session.token;state.preview=!!session.preview_mode;$('#preview-notice').hidden=!state.preview;$$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);accountLogin.initialize(state.preview);await loadOverview();readRoute();}catch(error){notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);}
+try {const session=await api('/api/session');state.token=session.token;state.preview=!!session.preview_mode;if(session.close_with_page)appLifetime.start(state.token);$('#preview-notice').hidden=!state.preview;$$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);accountLogin.initialize(state.preview);await loadOverview();readRoute();}catch(error){notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);}

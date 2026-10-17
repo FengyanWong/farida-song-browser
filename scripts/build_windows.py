@@ -96,6 +96,7 @@ def main():
                "--paths", str(ROOT / "backend"), "--distpath", str(dist),
                "--workpath", str(work), "--specpath", str(build),
                "--collect-submodules", "uvicorn", "--hidden-import", "anyio._backends._asyncio",
+               "--hidden-import", "wsproto",
                "--exclude-module", "PIL", "--exclude-module", "tkinter", "--exclude-module", "pytest"]
     for source, target in [(ROOT / "frontend", "frontend"), (ROOT / "data", "data"),
                            (ROOT / "LICENSE", "."), (ROOT / "THIRD_PARTY_NOTICES.md", "."), (licenses, "licenses")]:
