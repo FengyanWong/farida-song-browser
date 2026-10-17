@@ -76,3 +76,28 @@ def test_bulk_validation_is_atomic(settings,video):
         result=client.patch('/api/review/bulk',json={'ids':[video['bvid']+':100','missing'],'inclusion_status':'excluded'})
         assert result.status_code==404
         assert db.clips()['total']==2
+
+
+def test_shutdown_requires_local_token_but_not_bilibili_login(settings):
+    stopped = []
+    app = create_app(settings, scan_on_start=False, shutdown_callback=lambda: stopped.append(True))
+    with TestClient(app) as client:
+        assert client.get('/api/session').json()['can_shutdown'] is True
+        assert client.get('/api/auth').json()['state'] == 'signed_out'
+        assert client.post('/api/shutdown').status_code == 403
+        authorize(client)
+        assert client.post('/api/shutdown', headers={'Origin': 'https://evil.example'}).status_code == 403
+        assert stopped == []
+        response = client.post('/api/shutdown')
+        assert response.status_code == 200 and response.json() == {'status': 'stopping'}
+        assert stopped == [True]
+
+
+def test_shutdown_unavailable_in_preview_or_without_launcher(settings):
+    stopped = []
+    for options in ({}, {'preview_mode': True, 'shutdown_callback': lambda: stopped.append(True)}):
+        with TestClient(create_app(settings, scan_on_start=False, **options)) as client:
+            assert client.get('/api/session').json()['can_shutdown'] is False
+            authorize(client)
+            assert client.post('/api/shutdown').status_code == 409
+    assert stopped == []

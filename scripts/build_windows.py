@@ -91,7 +91,7 @@ def main():
         "StringStruct('LegalCopyright', 'Copyright (C) 2026 FengyanWong. GPL-3.0-only.')"
         "])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])])", encoding="utf-8")
     name = f"FaridaSongBrowser-{__version__}-windows-x64"
-    command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--console",
+    command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
                "--name", name, "--icon", str(icon), "--version-file", str(version_file),
                "--paths", str(ROOT / "backend"), "--distpath", str(dist),
                "--workpath", str(work), "--specpath", str(build),
@@ -122,7 +122,7 @@ def main():
         target = release / target_name
         shutil.copy2(ROOT / "data" / source_name, target)
         downloads.append(target)
-    all_assets = sorted(path for path in release.iterdir() if path.is_file() and path.name != "SHA256SUMS.txt")
+    all_assets = sorted(path for path in release.iterdir() if path.is_file() and f"-{__version__}" in path.name)
     (release / "SHA256SUMS.txt").write_text(
         "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in all_assets), encoding="utf-8")
     print(json.dumps({"version": __version__, "catalog": snapshot["counts"],

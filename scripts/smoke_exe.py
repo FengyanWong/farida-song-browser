@@ -6,7 +6,9 @@ import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -14,12 +16,18 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "backend"))
+from farida import __version__
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", type=Path)
     args = parser.parse_args()
+    binary = args.executable.read_bytes()
+    pe_offset = struct.unpack_from('<I', binary, 0x3c)[0]
+    assert binary[pe_offset:pe_offset + 4] == b'PE\0\0'
+    assert struct.unpack_from('<H', binary, pe_offset + 24 + 68)[0] == 2, 'EXE must use the Windows GUI subsystem'
     expected = json.loads((ROOT / "data/catalog.json").read_text(encoding="utf-8"))["counts"]
     output = ROOT / ".local" / "exe-smoke"
     output.mkdir(parents=True, exist_ok=True)
@@ -40,7 +48,7 @@ def main():
     environment["SYSTEMROOT"] = str(windows)
     environment["WINDIR"] = str(windows)
     environment["PATH"] = str(windows / "System32")
-    checks = []
+    checks = ['EXE uses the Windows GUI subsystem (no console window)']
 
     def request(path, body=None, method=None):
         headers = {}
@@ -68,12 +76,14 @@ def main():
                         if time.monotonic() > deadline:
                             raise RuntimeError(f"EXE did not start; see {workspace}")
                         time.sleep(0.25)
-                assert health["version"] == "0.0.1"
+                assert health["version"] == __version__
                 overview = request("/api/overview")
                 assert overview["entries"] == expected["active_clips"]
                 assert overview["included"] == expected["included_clips"]
                 assert overview["jobs"] == []
-                request.token = request("/api/session")["token"]
+                session = request("/api/session")
+                request.token = session["token"]
+                assert session["can_shutdown"] is True
                 auth = request("/api/auth")
                 assert auth["state"] == "signed_out" and auth["account"] is None
                 html = request("/").decode("utf-8")
@@ -98,14 +108,25 @@ def main():
                     checks += ["Standalone EXE starts without Python on PATH", "Chinese executable and data paths work",
                                "Bundled UI, covers layout, and Frida load", "Full public catalog and attribution are present",
                                "No inherited login, bookmarks, or jobs", "Signed-out collection is blocked"]
+                    second = subprocess.run([str(executable), '--no-browser', '--port', str(port), '--data-dir', str(data)],
+                                            cwd=program, env=environment, stdout=log, stderr=log, timeout=20)
+                    assert second.returncode == 0 and process.poll() is None
+                    assert request('/api/session')['token'] == request.token
+                    checks.append('Launching again reuses the running service without replacing it')
                 else:
                     assert overview["bookmarked"] == 1
                     assert clip["bookmarked"] == 1
                     checks.append("Restart preserves the existing catalog and bookmark without reseeding")
+                assert request('/api/shutdown', {}, method='POST') == {'status': 'stopping'}
+                assert process.wait(timeout=20) == 0
+                checks.append(f'Run {run}: quit endpoint gracefully stops the EXE while signed out')
             finally:
                 if process.poll() is None:
                     subprocess.run([str(windows / "System32/taskkill.exe"), "/PID", str(process.pid), "/T", "/F"], capture_output=True, check=False)
                 process.wait(timeout=15)
+    diagnostic = (data / 'launcher.log').read_text(encoding='utf-8')
+    assert '法里达' in diagnostic and 'Traceback' not in diagnostic
+    checks.append('Windowless output is retained in a UTF-8 local log')
     report = {"checks": checks, "catalog": expected, "executable_bytes": args.executable.stat().st_size}
     (output / "results.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))

@@ -1,9 +1,9 @@
-法里达 · 歌切收藏 v0.0.1
+法里达 · 歌切收藏 v0.0.2
 
 【打开应用】
-下载发行版后，双击 FaridaSongBrowser-0.0.1-windows-x64.exe。
+下载发行版后，双击 FaridaSongBrowser-0.0.2-windows-x64.exe。
 无需安装 Python，也无需安装本应用。浏览器会自动打开页面。
-使用期间请保持小启动窗口开启；关闭窗口即退出。
+应用在后台运行，不显示终端窗口。关闭网页不会退出；再次双击 EXE 可重新打开页面。
 源码开发版本仍可通过「Start Farida.cmd」运行，需要 Python 3.10 或更新版本。
 
 【随附目录】
@@ -77,13 +77,16 @@ v2：1536×2288，8 列 11 行。
 测试数据与正常目录分开，不会把演示数据当作真实歌切。
 
 【退出与备份】
-关闭终端窗口即退出。再次双击启动文件即可继续使用。
+点击右上角账号菜单中的「退出应用」即可停止后台运行；未登录时也可在登录界面点击「退出应用」。
+已保存的目录、收藏和登录信息会保留。再次双击启动文件即可继续使用。
+如从旧版升级，请先关闭旧版的启动窗口，再打开新 EXE。
+启动或运行遇到错误时，可在数据目录查看 launcher.log。
 Windows 数据保存在：%LOCALAPPDATA%\FaridaSongBrowser
 需要备份时，先退出应用，再复制整个数据文件夹。
 
 【开源与版本】
-v0.0.1，Windows x64。此版本尚未进行代码签名。
+v0.0.2，Windows x64。此版本尚未进行代码签名。
 源码：https://github.com/FengyanWong/farida-song-browser
-发行版：https://github.com/FengyanWong/farida-song-browser/releases/tag/v0.0.1
+发行版：https://github.com/FengyanWong/farida-song-browser/releases/tag/v0.0.2
 软件采用 GNU GPL 第 3 版，不提供担保。完整许可见 LICENSE。
 原视频、歌曲、封面及角色素材权利属于各自权利人，详见 THIRD_PARTY_NOTICES.md。

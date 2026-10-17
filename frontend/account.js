@@ -5,7 +5,7 @@ const activeStates=new Set(['waiting','scanned']);
 
 export class AccountLogin {
   constructor(api, changed) {
-    this.api=api;this.changed=changed;this.preview=true;this.busy=false;this.initialized=false;
+    this.api=api;this.changed=changed;this.preview=true;this.busy=false;this.initialized=false;this.stopped=false;
     this.generation=0;this.revision=0;this.attempt=null;this.operations=Promise.resolve();
     this.dialog=$('#login-dialog');
     $('#account-toggle').onclick=()=>this.toggleMenu();
@@ -20,6 +20,10 @@ export class AccountLogin {
     document.addEventListener('keydown',event=>{if(event.key==='Escape')this.toggleMenu(false);});
   }
   canCollect() {return this.initialized&&(this.preview||this.auth?.state==='connected');}
+  stop() {
+    this.stopped=true;++this.generation;++this.revision;clearTimeout(this.timer);
+    this.attempt=null;this.hideImage();this.toggleMenu(false);
+  }
   toggleMenu(open=$('#account-menu').hidden) {
     $('#account-menu').hidden=!open;$('#account-toggle').setAttribute('aria-expanded',String(open));
   }
@@ -36,7 +40,7 @@ export class AccountLogin {
     return this.operations;
   }
   async refresh() {
-    if(!this.initialized||this.busy)return;
+    if(this.stopped||!this.initialized||this.busy)return;
     const revision=++this.revision;
     try {
       const auth=await this.api('/api/auth');if(revision!==this.revision)return;
@@ -45,6 +49,7 @@ export class AccountLogin {
     }catch{ /* A local service outage is reported by the main connection status. */ }
   }
   render(auth) {
+    if(this.stopped)return;
     this.auth=auth;const preview=this.preview||auth.state==='preview',account=auth.account;
     const name=account?.name||(account?.uid?`UID ${account.uid}`:'哔哩哔哩账号');
     $('#account-name').textContent=name;$('#account-name').title=name;
@@ -62,6 +67,7 @@ export class AccountLogin {
     document.dispatchEvent(new Event('farida-auth-change'));
   }
   showDialog() {
+    if(this.stopped)return;
     this.toggleMenu(false);
     if(!this.dialog.open)this.dialog.showModal();
     $$('.login-dismiss').forEach(button=>button.hidden=!this.canCollect());
@@ -73,6 +79,7 @@ export class AccountLogin {
     $('#login-expiry').textContent='';$('#login-retry').hidden=true;$('#login-check').hidden=true;
   }
   async settle(auth) {
+    if(this.stopped)return;
     if(auth.state==='connected') {
       if(this.dialog.open)this.dialog.close();
       await this.changed();return;
@@ -87,36 +94,39 @@ export class AccountLogin {
     }
   }
   async accountAction(action) {
-    if(this.busy||this.preview)return;
+    if(this.stopped||this.busy||this.preview)return;
     this.busy=true;++this.revision;this.render(this.auth);this.toggleMenu(false);
     // Startup verification stays in the header. Open the login dialog only
     // after checking the saved session, so a valid login never flashes a QR box.
     if(action==='check'&&this.dialog.open&&!this.canCollect())this.showChecking();
     try {
       const auth=await this.api(`/api/auth/${action}`,{method:'POST'});
+      if(this.stopped)return;
       this.initialized=true;this.render(auth);
       if(action==='logout'){await this.changed();toast('已退出本机账号，采集任务已停止。');}
       await this.settle(auth);
     }catch(error){
+      if(this.stopped)return;
       this.initialized=true;$('#account-detail').textContent=error.message;
       if(!this.canCollect()){this.showDialog();this.failure(error.message);$('#login-check').hidden=false;}
       else toast(error.message);
     }finally{
-      this.busy=false;$('#login-button').disabled=this.preview;$('#check-login').disabled=false;$('#logout-button').disabled=false;$('#login-check').disabled=false;
+      this.busy=false;if(!this.stopped){$('#login-button').disabled=this.preview;$('#check-login').disabled=false;$('#logout-button').disabled=false;$('#login-check').disabled=false;}
     }
   }
   async requireLogin() {await this.accountAction('check');}
   openQR() {if(this.preview||this.busy)return;this.showDialog();this.generate();}
-  valid(generation) {return this.dialog.open&&generation===this.generation;}
+  valid(generation) {return !this.stopped&&this.dialog.open&&generation===this.generation;}
   hideImage() {$('#login-qr').hidden=true;$('#login-qr').removeAttribute('src');}
-  async cancel(id) {if(id)await this.api(`/api/auth/qr/${encodeURIComponent(id)}/cancel`,{method:'POST'}).catch(()=>{});}
+  async cancel(id) {if(id&&!this.stopped)await this.api(`/api/auth/qr/${encodeURIComponent(id)}/cancel`,{method:'POST'}).catch(()=>{});}
   closed() {
+    if(this.stopped)return;
     ++this.generation;clearTimeout(this.timer);this.hideImage();
     const id=this.attempt;this.attempt=null;this.queue(()=>this.cancel(id));
     if(!this.canCollect()){this.showDialog();this.generate();}
   }
   generate() {
-    if(this.preview)return;
+    if(this.stopped||this.preview)return;
     const generation=++this.generation,old=this.attempt;this.attempt=null;clearTimeout(this.timer);
     this.hideImage();$('#login-qr-box').hidden=false;$('#login-qr-placeholder').hidden=false;
     $('#login-title').textContent=this.canCollect()?'更换哔哩哔哩账号':'登录后开始收藏';

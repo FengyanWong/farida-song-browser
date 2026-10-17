@@ -52,7 +52,7 @@ def main():
                         "Application source and build instructions: https://github.com/FengyanWong/farida-song-browser/tree/v"
                         + __version__ + "\nThe Python runtime is distributed under the Python Software Foundation license; "
                         "the binary ZIP contains its full license notices.\n")
-    assets = sorted(path for path in destination.iterdir() if path.is_file() and path.name != "SHA256SUMS.txt")
+    assets = sorted(path for path in destination.iterdir() if path.is_file() and f"-{__version__}" in path.name)
     (destination / "SHA256SUMS.txt").write_text(
         "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in assets), encoding="utf-8")
     print(json.dumps({"source_distributions": len(sources), "archive": output.name,

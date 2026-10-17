@@ -4,13 +4,13 @@ import { AccountLogin } from './account.js';
 
 hydrateIcons();
 const pet = new Pet(); pet.initialize();
-const state = {view:'catalog',filter:'included',page:1,pageSize:40,overview:null,clips:null,token:null,preview:false,selected:new Set(),editSource:null,request:0};
+const state = {view:'catalog',filter:'included',page:1,pageSize:40,overview:null,clips:null,token:null,preview:false,stopping:false,selected:new Set(),editSource:null,request:0};
 const failedCovers = new Set();
 const clipFilters = {included:'已收录',bookmarked:'星标收藏',needs_review:'待确认',all:'全部候选',excluded:'已排除'};
 const labels = {queued:'等待采集',running:'采集中',paused:'访问受限',failed:'采集未完成',interrupted:'上次运行中断',cancelled:'已取消',completed:'已完成'};
 const sourceTypes = {uploader:'UP 主',season:'合集',series:'系列列表',favorites:'收藏夹',search:'标签发现',songlist:'整理歌单'};
 let pollTimer;
-function schedulePoll(delay) { clearTimeout(pollTimer); pollTimer=setTimeout(poll,delay); }
+function schedulePoll(delay) { clearTimeout(pollTimer); if(!state.stopping)pollTimer=setTimeout(poll,delay); }
 
 async function api(path, options={}) {
   const response=await fetch(path,{...options,headers:{'Content-Type':'application/json','X-Farida-Token':state.token || '',...options.headers}});
@@ -20,6 +20,25 @@ async function api(path, options={}) {
 }
 function notice(message, error=false) { const el=$('#notice');el.textContent=message;el.hidden=!message;el.classList.toggle('error',error); }
 const accountLogin = new AccountLogin(api, async()=>{notice('');await refresh();});
+async function quitApp() {
+  if(state.stopping)return;
+  state.stopping=true;clearTimeout(pollTimer);
+  $$('[data-quit-app]').forEach(button=>button.disabled=true);
+  try {
+    await api('/api/shutdown',{method:'POST'});
+    accountLogin.stop();
+    $$('dialog[open]').forEach(dialog=>dialog.close());
+    $('#shutdown-dialog').showModal();
+    $('#connection-label').textContent='应用已退出';
+    $('.status-dot').style.background='var(--muted)';
+  } catch(error) {
+    state.stopping=false;schedulePoll(10000);
+    $$('[data-quit-app]').forEach(button=>button.disabled=false);
+    toast(error.message);
+  }
+}
+$$('[data-quit-app]').forEach(button=>button.onclick=quitApp);
+$('#shutdown-dialog').addEventListener('cancel',event=>event.preventDefault());
 document.addEventListener('farida-auth-change',()=>{renderJob();if(state.view==='sources')renderSources();});
 function parameters() {
   const result=new URLSearchParams({status:state.filter==='bookmarked'?'all':state.filter,sort:$('#sort').value,page:state.page,page_size:state.pageSize});
@@ -128,7 +147,7 @@ function errorText(error) {
   if(error.category==='schema')return '哔哩哔哩返回的数据格式有变化，已停止此次采集并保留已有内容。';
   if(error.category==='server')return '哔哩哔哩服务暂时不可用，请稍后继续任务。';
   if(error.category==='retry_later')return '哔哩哔哩要求稍后重试，已暂停采集。';
-  if(error.category==='internal')return '本地采集出现错误，已提交的数据不受影响。请查看终端或 README 排查。';
+  if(error.category==='internal')return '本地采集出现错误，已保存进度。可重新启动应用，或查看使用说明中的排查方法。';
   return error.message || '采集未完成，已保存进度。';
 }
 function renderJob() {
@@ -235,5 +254,5 @@ $('#source-form').onsubmit=async event=>{
 };
 document.addEventListener('keydown',event=>{if(event.key==='/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName) && !document.querySelector('dialog[open]')){event.preventDefault();if(state.view==='sources')setView('catalog');$('#search').focus();}});
 window.addEventListener('hashchange',readRoute);
-async function poll(){if(document.hidden){schedulePoll(10000);return;}try{const active=state.overview?.jobs.some(j=>['running','queued'].includes(j.state));await loadOverview();await accountLogin.refresh();if(active && state.view!=='sources')await loadClips();}catch{$('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';schedulePoll(10000);}}
-try {const session=await api('/api/session');state.token=session.token;state.preview=!!session.preview_mode;$('#preview-notice').hidden=!state.preview;accountLogin.initialize(state.preview);await loadOverview();readRoute();}catch(error){notice('无法连接本地服务，请先运行 Start Farida.cmd。'+error.message,true);}
+async function poll(){if(state.stopping)return;if(document.hidden){schedulePoll(10000);return;}try{const active=state.overview?.jobs.some(j=>['running','queued'].includes(j.state));await loadOverview();await accountLogin.refresh();if(active && state.view!=='sources')await loadClips();}catch{if(state.stopping)return;$('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';schedulePoll(10000);}}
+try {const session=await api('/api/session');state.token=session.token;state.preview=!!session.preview_mode;$('#preview-notice').hidden=!state.preview;$$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);accountLogin.initialize(state.preview);await loadOverview();readRoute();}catch(error){notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);}
