@@ -11,3 +11,5 @@
 .unavailable-videos{width:100%;font-size:11px;color:var(--muted);overflow-wrap:anywhere}.unavailable-videos summary{color:#d8bd90;margin:10px 0}.unavailable-videos ul{margin:8px 0;padding-left:18px;max-height:160px;overflow:auto}.unavailable-videos li{margin:5px 0}.unavailable-videos p{font-size:10px;color:var(--faint);margin:8px 0}
 
 .account-menu .quit-app{display:block;width:100%;text-align:left;border-top:1px solid var(--line);padding-top:12px;margin-top:14px}#login-dialog [data-quit-app]{margin-right:auto}
+
+.github-link{display:flex;align-items:center;gap:7px;width:max-content;padding:10px 6px 0;font-size:11px;color:var(--muted);text-decoration:none}.github-link:hover,.github-link:focus-visible{color:var(--text);text-decoration:underline}.github-link svg{display:block;width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}@media(max-width:800px){.github-link{justify-content:center;width:100%;gap:4px;padding:10px 0 0;font-size:9px}.github-link svg{width:11px;height:11px}}
