@@ -1,0 +1,78 @@
+from fastapi.testclient import TestClient
+
+from farida.app import create_app
+
+
+def client_app(settings,video=None):
+    opened=[]
+    app=create_app(settings,browser_opener=lambda url:opened.append(url) or True,scan_on_start=False)
+    return app,opened
+
+
+def authorize(client):
+    client.headers['X-Farida-Token']=client.get('/api/session').json()['token']
+
+
+def test_local_ui_defaults_and_csrf(settings):
+    app,_=client_app(settings)
+    with TestClient(app) as client:
+        assert client.get('/').status_code==200
+        assert 'color-scheme' in client.get('/').text
+        assert client.get('/api/overview').json()['entries']==0
+        assert client.get('/api/session').json()['preview_mode'] is False
+        assert client.post('/api/sync',json={}).status_code==403
+        authorize(client)
+        assert client.post('/api/sources',json={'url':'123'},headers={'Origin':'https://evil.example'}).status_code==403
+        assert client.get('/api/overview',headers={'Host':'evil.example'}).status_code==400
+        assert client.get('/api/clips?page_size=10000').status_code==400
+        assert client.get('/api/clips?after=2024-02-01&before=2024-01-01').status_code==400
+
+
+def test_real_target_opening_and_export(settings,video):
+    app,opened=client_app(settings)
+    with TestClient(app) as client:
+        authorize(client)
+        db=app.state.db;source=db.source(1);db.save_video(source,video,[])
+        rows=client.get('/api/clips').json()['items']
+        target=next(row for row in rows if row['part_number']==2)
+        assert target['thumbnail_url']==video['pic']
+        result=client.post('/api/clips/'+target['id']+'/open')
+        assert result.json()['opened']
+        assert opened==['https://www.bilibili.com/video/BV1br4y1R7BP/?p=2']
+        assert client.post('/api/clips/https%3A%2F%2Fevil.example/open').status_code in {404,405}
+        assert len(opened)==1
+        client.patch('/api/clips/'+target['id']+'/bookmark',json={'bookmarked':True})
+        assert len(client.get('/api/export?format=json&bookmarked=true').json())==1
+        assert '夜に駆ける' in client.get('/api/export').text
+        assert client.get('/api/clips/'+target['id']).json()['statistics']['favorite'] is None
+
+
+def test_source_settings_and_unknown_fields(settings):
+    app,_=client_app(settings)
+    with TestClient(app) as client:
+        authorize(client)
+        source=client.post('/api/sources',json={'display_name':'new','url':'123'}).json()
+        assert source['verification_status']=='pending'
+        assert client.patch('/api/sources/'+str(source['id']),json={'enabled':False}).json()['enabled']==0
+        assert client.patch('/api/sources/'+str(source['id']),json={'verified_uid':'1'}).status_code==422
+        assert client.post('/api/sources',json={'url':'123'}).status_code==409
+        assert client.post('/api/sources',json={'url':'http://127.0.0.1/secret'}).status_code==400
+
+
+def test_csv_formula_safety_and_raw_data_preserved(settings,video):
+    app,_=client_app(settings)
+    with TestClient(app) as client:
+        authorize(client);db=app.state.db;db.save_video(db.source(1),video,[])
+        identity=video['bvid']+':100'
+        client.patch('/api/clips/'+identity+'/annotation',json={'display_song_title':'=1+1'})
+        assert "'=1+1" in client.get('/api/export').text
+        assert client.get('/api/clips/'+identity).json()['display_song_title']=='=1+1'
+
+
+def test_bulk_validation_is_atomic(settings,video):
+    app,_=client_app(settings)
+    with TestClient(app) as client:
+        authorize(client);db=app.state.db;db.save_video(db.source(1),video,[])
+        result=client.patch('/api/review/bulk',json={'ids':[video['bvid']+':100','missing'],'inclusion_status':'excluded'})
+        assert result.status_code==404
+        assert db.clips()['total']==2

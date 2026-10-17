@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="本地收藏法里达的歌唱片段，点击标题打开哔哩哔哩原视频。">
+  <title>法里达 · 歌切收藏</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#catalog" aria-label="法里达 片段收藏"><span class="brand-mark" aria-hidden="true">法.</span><span>法里达<small>歌切收藏</small></span></a>
+    <div class="nav-label">我的资料库</div>
+    <nav aria-label="主导航">
+      <button class="nav-item active" data-view="catalog" aria-label="片段收藏" title="片段收藏"><span data-icon="music"></span>片段收藏<span class="nav-count" id="nav-included">0</span></button>
+      <button class="nav-item" data-view="sources" aria-label="采集来源" title="采集来源"><span data-icon="layers"></span>采集来源<span class="source-dot"></span></button>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="pet-area" id="pet-area">
+        <button id="pet-sprite" class="pet-sprite" aria-label="和 Frida 打招呼" title="点击和 Frida 打招呼"></button>
+        <div class="pet-caption"><span><b id="pet-name">Frida</b><small id="pet-status">陪你收集喜欢的歌声</small></span><button class="icon-button" id="pet-settings" title="宠物设置" aria-label="宠物设置"><span data-icon="settings"></span></button></div>
+      </div>
+      <div class="local-note"><span class="status-dot"></span><span id="connection-label">本地运行 · 自动保存</span></div>
+    </div>
+  </aside>
+  <main>
+    <header class="topbar"><span class="topbar-caption"><span class="tiny-dot"></span> YOUR PERSONAL COLLECTION</span>
+      <div class="account-menu-wrap" id="account-menu-wrap">
+        <button id="account-toggle" class="account-toggle" aria-label="哔哩哔哩账号" aria-expanded="false" aria-controls="account-menu"><span class="account-avatar" id="account-avatar"><span data-icon="user"></span></span><span class="account-summary"><b id="account-name">哔哩哔哩账号</b><small id="account-status" role="status">正在读取</small></span><span data-icon="chevron-down"></span></button>
+        <section id="account-menu" class="account-menu" aria-label="账号设置" hidden><div class="account-menu-heading"><b>哔哩哔哩账号</b><span id="account-uid"></span></div><p id="account-detail">登录后开始收集喜欢的片段。</p><small class="account-note">登录信息仅保存在本机。</small><div class="account-actions"><button id="login-button" class="button primary small" disabled>扫码登录</button><button id="check-login" class="button secondary small" hidden>检查登录</button><button id="logout-button" class="text-button" hidden>退出登录</button></div></section>
+      </div>
+    </header>
+    <div class="page">
+      <section class="page-heading"><h1 id="page-title">片段收藏<span class="title-dot">.</span></h1><div class="heading-actions"><button class="button secondary" id="export-button"><span data-icon="download"></span>导出</button><button class="button primary" id="sync-button"><span data-icon="refresh"></span>采集更新</button></div></section>
+      <div id="preview-notice" class="notice preview-notice" role="note" hidden><strong>预览模式</strong> · 片段和封面均为演示数据，并非真实采集结果。可试用搜索、收藏与来源设置；采集和播放仅作演示。</div>
+      <div id="notice" role="status" class="notice" hidden></div>
+      <section id="job-banner" class="job-banner" aria-live="polite" hidden></section>
+      <section id="catalog-view">
+        <div class="collection-summary"><span><strong id="count-included">0</strong> 个歌唱片段</span><span class="summary-divider"></span><span><strong id="count-submissions">0</strong> 个原视频</span><span class="summary-divider"></span><span id="coverage-summary">尚未完成完整扫描</span><span class="saved-label"><span data-icon="database"></span>保存在此电脑</span></div>
+        <div class="catalog-panel">
+          <div class="toolbar"><label class="search-box"><span data-icon="search"></span><input id="search" type="search" placeholder="搜索歌名、片段标题或 UP 主…" aria-label="搜索歌名、片段标题或 UP 主" maxlength="500"><kbd>/</kbd></label><select id="clip-filter" aria-label="片段范围"><option value="included">已收录</option><option value="bookmarked">星标收藏</option><option value="needs_review">待确认</option><option value="all">全部候选</option><option value="excluded">已排除</option></select><select id="source-filter" aria-label="按来源筛选"><option value="">全部来源</option></select><button class="button filter-button" id="filter-button" aria-expanded="false"><span data-icon="sliders"></span>筛选</button></div>
+          <div class="extra-filters" id="extra-filters" hidden><label>上传日期（UTC）<span class="date-range"><input type="date" id="after" aria-label="起始上传日期"><span>—</span><input type="date" id="before" aria-label="结束上传日期"></span></label><label>UP 主<select id="uploader-filter"><option value="">全部 UP 主</option></select></label><label>排序<select id="sort"><option value="newest">最新上传</option><option value="oldest">最早上传</option><option value="title">标题顺序</option><option value="uploader">UP 主顺序</option></select></label><button class="text-button" id="reset-filters">重置筛选</button></div>
+          <div class="bulk-bar" id="bulk-bar" hidden><span id="selected-count">已选择 0 项</span><button class="button small" data-bulk="included">收录选中</button><button class="button small" data-bulk="excluded">排除选中</button><button class="text-button" id="clear-selection">取消选择</button></div>
+          <div class="table-scroll"><table><thead><tr><th class="check-col"><input type="checkbox" id="select-page" aria-label="选择当前页所有片段"></th><th>片段标题</th><th class="uploader-col">UP 主</th><th class="date-col">上传时间 <span data-icon="arrow-down"></span></th><th class="actions-col"><span class="sr-only">操作</span></th></tr></thead><tbody id="clip-rows"></tbody></table></div>
+          <div id="empty-state" class="empty-state"><div class="empty-art"><span data-icon="music"></span><i></i><i></i><i></i></div><h2>等待歌声汇聚</h2><p>启动并验证登录后，会自动检查所有已启用来源。<br>采集到的片段会逐条出现在这里。</p><button class="button primary" id="first-scan"><span data-icon="refresh"></span>采集更新</button><small>只保存视频信息，播放时前往哔哩哔哩</small></div>
+          <footer class="table-footer"><span id="result-count">0 个片段</span><div class="pagination"><button class="icon-button" id="prev-page" aria-label="上一页" disabled><span data-icon="chevron-left"></span></button><span id="page-number">第 1 页</span><button class="icon-button" id="next-page" aria-label="下一页" disabled><span data-icon="chevron-right"></span></button></div></footer>
+        </div>
+        <p class="footnote"><span data-icon="external"></span>音视频由哔哩哔哩提供。标题、上传时间、原视频链接和收藏保存在此电脑。</p>
+      </section>
+      <section id="sources-view" hidden>
+        <div class="section-intro"><p>每次启动验证登录后，自动更新所有已启用来源。</p><button class="button secondary" id="add-source"><span data-icon="plus"></span>添加来源</button></div><div class="source-list" id="source-list"></div><div class="section-title"><h2>采集记录</h2><button class="button secondary small" id="full-scan"><span data-icon="refresh"></span>完整重新扫描</button></div><p class="muted">启动更新检查近期投稿并刷新歌单，刷新页面不会重复采集。完整扫描遍历来源历史投稿；标签发现是有限搜索，不能代表全站覆盖。</p><div id="job-history" class="job-history"></div>
+      </section>
+    </div>
+  </main>
+  <dialog id="source-dialog"><form id="source-form"><div class="dialog-heading"><h2 id="source-dialog-title">添加来源</h2><button type="button" class="icon-button close-dialog" aria-label="关闭"><span data-icon="x"></span></button></div><label>名称<input id="source-name" maxlength="120" placeholder="例如：离落"></label><label>个人空间 UID 或链接<input id="source-url" required maxlength="1000" placeholder="394803911 或 https://space.bilibili.com/…"></label><p class="field-help">支持 UP 主、合集、系列列表与收藏夹。首次采集时核对身份。</p><label class="checkbox-label"><input type="checkbox" id="singing-collection">这是已确认的法里达歌唱合集（仅适用于合集／收藏夹）</label><p id="source-form-error" class="form-error" role="alert"></p><div class="dialog-actions"><button type="button" class="button secondary close-dialog">取消</button><button type="submit" class="button primary">保存来源</button></div></form></dialog>
+  <dialog id="login-dialog" aria-labelledby="login-title">
+    <div class="dialog-heading"><h2 id="login-title">登录后开始收藏</h2><button class="icon-button close-dialog login-dismiss" aria-label="关闭登录" hidden><span data-icon="x"></span></button></div>
+    <p class="login-instructions" id="login-instructions">打开哔哩哔哩手机 App，使用「扫一扫」，然后在手机上确认登录。</p>
+    <div id="login-qr-box" class="login-qr-box"><img id="login-qr" alt="哔哩哔哩登录二维码" width="220" height="220" hidden><span id="login-qr-placeholder" class="spinner" aria-label="正在获取二维码"></span></div>
+    <p id="login-message" class="login-message" role="status" aria-live="polite">正在获取二维码…</p><p id="login-expiry" class="login-expiry"></p>
+    <p class="field-help">验证登录后自动更新全部已启用来源。有效登录会保存在本机，下次打开时自动验证，无需每次扫码。</p>
+    <div class="dialog-actions"><button id="login-retry" class="button secondary" hidden>刷新二维码</button><button id="login-check" class="button primary" hidden>检查登录</button><button class="button secondary close-dialog login-dismiss" hidden>关闭</button></div>
+  </dialog>
+  <dialog id="detail-dialog"><div id="detail-content"></div></dialog>
+  <dialog id="pet-dialog"><div class="dialog-heading"><h2>桌面小伙伴</h2><button class="icon-button close-dialog" aria-label="关闭"><span data-icon="x"></span></button></div><p class="muted">Frida 已陪你就位。也可以导入自己的标准精灵图。</p><div class="pet-format-note"><b>自动识别 v1 / v2</b><span>v1 · 1536 × 1872 · 9 个动画状态</span><span>v2 · 1536 × 2288 · 加上 16 个注视方向</span><small>PNG / WebP，最大 20 MB。可同时选择 pet.json 读取名称。</small></div><label class="import-pet-label button primary"><span data-icon="upload"></span>选择宠物文件<input id="pet-files" type="file" multiple accept=".png,.webp,.json" hidden></label><p id="pet-message" class="field-help" aria-live="polite"></p><label class="checkbox-label"><input id="pet-visible" type="checkbox" checked>显示小伙伴</label><label class="checkbox-label"><input id="pet-motion" type="checkbox" checked>播放动画</label><div class="dialog-actions"><button class="button secondary" id="pet-reset">恢复默认 Frida</button><button class="button secondary close-dialog">完成</button></div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
