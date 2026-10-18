@@ -2,6 +2,7 @@ import { $, $$, escape as e, icon, hydrateIcons, toast, dateTime } from './ui.js
 import { Pet } from './pet.js';
 import { AccountLogin } from './account.js';
 import { AppLifetime } from './lifetime.js';
+import { PlaylistPlayer } from './player.js';
 
 hydrateIcons();
 const pet = new Pet(); pet.initialize();
@@ -22,6 +23,7 @@ async function api(path, options={}) {
 }
 function notice(message, error=false) { const el=$('#notice');el.textContent=message;el.hidden=!message;el.classList.toggle('error',error); }
 const accountLogin = new AccountLogin(api, async()=>{notice('');await refresh();});
+const playlistPlayer = new PlaylistPlayer(api, parameters, ()=>state.clips?.items.filter(clip=>state.selected.has(clip.id))||[]);
 async function quitApp() {
   if(state.stopping)return;
   state.stopping=true;clearTimeout(pollTimer);
@@ -29,6 +31,7 @@ async function quitApp() {
   try {
     await api('/api/shutdown',{method:'POST'});
     appLifetime.stop();
+    playlistPlayer.stop();
     accountLogin.stop();
     $$('dialog[open]').forEach(dialog=>dialog.close());
     $('#shutdown-dialog').showModal();
@@ -42,7 +45,7 @@ async function quitApp() {
 }
 $$('[data-quit-app]').forEach(button=>button.onclick=quitApp);
 $('#shutdown-dialog').addEventListener('cancel',event=>event.preventDefault());
-document.addEventListener('farida-auth-change',()=>{renderJob();if(state.view==='sources')renderSources();});
+document.addEventListener('farida-auth-change',()=>{renderJob();if(!accountLogin.canCollect())playlistPlayer.stop();if(state.view==='sources')renderSources();});
 function parameters() {
   const result=new URLSearchParams({status:state.filter==='bookmarked'?'all':state.filter,sort:$('#sort').value,page:state.page,page_size:state.pageSize});
   const inputs={q:'#search',source_id:'#source-filter',uploader:'#uploader-filter',after:'#after',before:'#before'};
@@ -122,7 +125,7 @@ function renderClips() {
   $('#clip-rows').innerHTML=result.items.map(clip=>{
     const dates=dateTime(clip.published_at).split(' ');
     const target=clip.playback_url;
-    const title=target?`<a class="row-title" href="${e(target)}" target="_blank" rel="noopener noreferrer" data-open="${e(clip.id)}">${e(clip.display_song_title)}</a>`:`<span class="row-title">${e(clip.display_song_title)}</span>`;
+    const title=target?`<a class="row-title" href="${e(target)}" target="_blank" rel="noopener noreferrer" data-play="${e(clip.id)}" title="在此页面播放">${e(clip.display_song_title)}</a>`:`<span class="row-title">${e(clip.display_song_title)}</span>`;
     const status=clip.inclusion_status!=='included'?`<span class="badge ${clip.inclusion_status==='needs_review'?'warn':'muted'}">${clip.inclusion_status==='needs_review'?'待确认':'已排除'}</span>`:'';
     return `<tr><td class="check-col"><input type="checkbox" data-select="${e(clip.id)}" aria-label="选择 ${e(clip.display_song_title)}" ${state.selected.has(clip.id)?'checked':''}></td><td><div class="clip-content">${coverImage(clip.thumbnail_url)}<div class="clip-text">${title}<div class="row-subtitle">${clip.part_count>1?`<span class="part-badge">P${clip.part_number}</span>`:''}<span class="original-title" title="${e(clip.raw_title)}">${clip.raw_title!==clip.display_song_title?e(clip.raw_title):''}</span>${status}${clip.has_curated_credit?'<span class="badge">歌单 · CLANNADOR</span>':''}${!target?'<span class="badge warn">当前不可用</span>':''}</div></div></div></td><td class="row-uploader-cell"><span class="row-uploader" title="UID ${e(clip.uploader_uid)}">${e(clip.uploader_name)}</span></td><td class="row-date">${e(dates[0])}<small>${e(dates.slice(1).join(' '))}</small></td><td><div class="row-actions"><button class="icon-button ${clip.bookmarked?'active':''}" data-bookmark="${e(clip.id)}" aria-label="${clip.bookmarked?'取消收藏':'收藏'} ${e(clip.display_song_title)}" title="${clip.bookmarked?'取消收藏':'收藏'}">${icon('star')}</button><button class="icon-button" data-detail="${e(clip.id)}" aria-label="查看 ${e(clip.display_song_title)} 的详情" title="详情与修正">${icon('more')}</button></div></td></tr>`;
   }).join('');
@@ -216,6 +219,9 @@ document.addEventListener('click',async event=>{
   try {
     if(button.matches('.close-dialog'))button.closest('dialog').close();
     if(button.dataset.view)setView(button.dataset.view);
+    if(button.dataset.play && !(event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)) {
+      event.preventDefault();await playlistPlayer.fromResults(button.dataset.play);
+    }
     if(button.dataset.open && !(event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)) {
       event.preventDefault();const result=await api(`/api/clips/${encodeURIComponent(button.dataset.open)}/open`,{method:'POST'});
       if(!result.opened)toast('无法启动默认浏览器，请使用原视频链接。',result.url);
@@ -258,4 +264,4 @@ $('#source-form').onsubmit=async event=>{
 document.addEventListener('keydown',event=>{if(event.key==='/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName) && !document.querySelector('dialog[open]')){event.preventDefault();if(state.view==='sources')setView('catalog');$('#search').focus();}});
 window.addEventListener('hashchange',readRoute);
 async function poll(){if(state.stopping)return;if(document.hidden){schedulePoll(10000);return;}try{const active=state.overview?.jobs.some(j=>['running','queued'].includes(j.state));await loadOverview();await accountLogin.refresh();if(active && state.view!=='sources')await loadClips();}catch{if(state.stopping)return;$('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';schedulePoll(10000);}}
-try {const session=await api('/api/session');state.token=session.token;state.preview=!!session.preview_mode;if(session.close_with_page)appLifetime.start(state.token);$('#preview-notice').hidden=!state.preview;$$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);accountLogin.initialize(state.preview);await loadOverview();readRoute();}catch(error){notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);}
+try {const session=await api('/api/session');state.token=session.token;state.preview=!!session.preview_mode;if(session.close_with_page)appLifetime.start(state.token);$('#preview-notice').hidden=!state.preview;$$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);accountLogin.initialize(state.preview);await loadOverview();await playlistPlayer.initialize();readRoute();}catch(error){notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);}

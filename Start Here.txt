@@ -1,15 +1,18 @@
-法里达 · 歌切收藏 / Farida Song Browser v0.0.4
+法里达 · 歌切收藏 / Farida Song Browser v0.0.5
 
-1. Double-click FaridaSongBrowser-0.0.4-windows-x64.exe. No Python installation is needed.
+1. Double-click FaridaSongBrowser-0.0.5-windows-x64.exe. No Python installation is needed.
 2. Your default browser opens the app. The EXE runs in the background without a console window.
 3. Scan the QR code with Bilibili's mobile app if a login is needed.
 4. The bundled catalog loads automatically on a new computer. Existing data is preserved.
-5. Click a song title to open the original Bilibili video and part.
+5. Click a song title to play it inside the app. 播放全部 queues every song matching the current filters.
 6. Choose 退出应用 in the upper-right account menu or login dialog to stop. Open the EXE again to return.
 
 Closing the last app tab stops the backend after about 5 seconds. Refreshing the page or switching tabs keeps it running.
 If several app tabs are open, close all of them to exit. Open the EXE again to restart.
 When upgrading from v0.0.1, close the old launcher window before opening this version.
+
+Select songs and choose 加入歌单 to save a playlist. Edit its name, order and songs through 编辑.
+Playback uses the saved Bilibili account. Media is streamed without saving video files; 打开原视频 opens Bilibili.
 
 The two tabs are 片段收藏 (clips) and 采集来源 (sources).
 The app checks every enabled source once after login on each launch.
@@ -18,7 +21,7 @@ Refreshing the browser page does not repeat the collection job.
 Includes 1,286 clip records from 1,075 loaded videos. The separate TXT lists 1,077
 unique BV links, including two song-list references without video metadata.
 Song index credit: CLANNADOR — https://fareeda.songlist.cc/
-Personal logins, bookmarks, notes, and job logs are not included.
+Personal logins, playlists, bookmarks, notes, and job logs are not included.
 
 Your data: %LOCALAPPDATA%\FaridaSongBrowser
 Source: https://github.com/FengyanWong/farida-song-browser

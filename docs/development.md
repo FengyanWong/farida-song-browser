@@ -27,6 +27,20 @@ Linux / macOS 使用 `python3` 和 `.venv/bin/python`。测试使用离线数据
 `$XDG_DATA_HOME/farida-song-browser`（未设置时为 `~/.local/share/farida-song-browser`）。
 EXE 的诊断输出保存在数据目录下的 `launcher.log`。备份前先退出应用，再复制整个数据目录。
 
+## 播放与本地歌单
+
+`/api/play-queue` 按当前筛选与排序返回完整本地目录，不受界面分页限制。自建歌单及歌曲顺序保存在 SQLite 的
+`playlists` / `playlist_items` 表；它们不包含在公开目录导出或发行包中。
+
+播放器使用原生 `<video>`，在实际 `ended` 事件后切换下一段或下一首，不按歌曲时长倒计时。
+只有当前歌曲会请求播放信息；取消过时请求，遇到限流暂停队列。暂不支持的格式保留打开原视频入口。
+`backend/farida/playback.py` 通过已登录账号获取 MP4 播放信息；Cookie 只发送给 Bilibili API。
+浏览器只接收临时本机媒体地址。后端验证 CDN 主机、转发单段 Range 请求，并在内存中流式传输，
+不保存视频文件、不向 CDN 发送账号 Cookie。退出或切换账号会撤销本机播放地址。
+
+`scripts/playback_browser_qa.cjs` 使用 Playwright 与 Edge，在独立数据目录中生成短测试视频，模拟播放接口并验证真实结束事件。
+第一个参数可指定 Playwright 包路径，第二个参数可指定最终 EXE；不传 EXE 时测试源码启动器。
+
 ## 构建 Windows EXE
 
 使用 Windows x64、Python 3.12。运行时依赖锁定在 `requirements-lock.txt`，构建依赖锁定在 `requirements-build.txt`。
@@ -36,7 +50,7 @@ py -3.12 -m venv .build-venv
 .\.build-venv\Scripts\python.exe -m pip install -r requirements-build.txt
 .\.build-venv\Scripts\python.exe -X utf8 scripts\build_windows.py
 .\.build-venv\Scripts\python.exe -X utf8 scripts\download_dependency_sources.py
-.\.build-venv\Scripts\python.exe -X utf8 scripts\smoke_exe.py release\FaridaSongBrowser-0.0.4-windows-x64.exe
+.\.build-venv\Scripts\python.exe -X utf8 scripts\smoke_exe.py release\FaridaSongBrowser-0.0.5-windows-x64.exe
 ```
 
 产物在 `release/`：单文件 EXE、ZIP、公开目录与链接清单、依赖源码包及 SHA-256 校验值。
@@ -61,4 +75,4 @@ EXE 包含 Python 运行时、界面、Frida 精灵图、公开目录和许可�
 .\.venv\Scripts\python.exe -X utf8 scripts\diagnose.py --uid 210887872 --bvid BV1br4y1R7BP
 ```
 
-[v0.0.4 验证记录](release-0.0.4-verification.md) · [v0.0.2 验证记录](release-0.0.2-verification.md)
+[v0.0.5 验证记录](release-0.0.5-verification.md) · [v0.0.4 验证记录](release-0.0.4-verification.md) · [v0.0.2 验证记录](release-0.0.2-verification.md)

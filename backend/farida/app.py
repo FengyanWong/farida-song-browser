@@ -23,6 +23,7 @@ from .auth import BilibiliLogin
 from .db import Database
 from .sync import Collector
 from .lifetime import WindowLifetime
+from .playback import Playback
 
 
 class Model(BaseModel):
@@ -58,16 +59,30 @@ class Bookmark(Model):
     bookmarked: bool
 
 
+class PlaylistCreate(Model):
+    name: str = Field(min_length=1, max_length=80)
+    clip_ids: list[str] = Field(default_factory=list, max_length=20000)
+
+
+class PlaylistUpdate(Model):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    clip_ids: list[str] | None = Field(default=None, max_length=20000)
+
+
 class SyncRequest(Model):
     source_ids: list[int] = Field(default_factory=list,max_length=100)
     mode: Literal["full","incremental"] = "incremental"
 
 
-def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan_on_start=True, preview_mode=False, auth_transport=None, shutdown_callback=None, window_grace_seconds=5.0, browser_start_timeout=None):
+def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan_on_start=True, preview_mode=False, auth_transport=None, playback_transport=None, shutdown_callback=None, window_grace_seconds=5.0, browser_start_timeout=None):
     settings = settings or Settings.from_env()
     db = Database(settings.db_path)
     collector = Collector(db,settings,adapter_factory) if adapter_factory else Collector(db,settings)
-    login = BilibiliLogin(settings, transport=auth_transport, before_change=collector.stop)
+    playback = Playback(settings, transport=playback_transport)
+    async def before_account_change():
+        await playback.clear()
+        await collector.stop()
+    login = BilibiliLogin(settings, transport=auth_transport, before_change=before_account_change)
     token = secrets.token_urlsafe(32)
     startup_pending = scan_on_start
     lifetime = WindowLifetime(shutdown_callback, grace_seconds=window_grace_seconds,
@@ -108,6 +123,7 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         try:
             yield
         finally:
+            await playback.clear()
             if lifetime:
                 await lifetime.close()
             startup.cancel()
@@ -121,6 +137,7 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     app = FastAPI(title="法里达 · 歌切收藏", version=__version__, lifespan=lifespan)
     app.state.db,app.state.collector = db,collector
     app.state.login = login
+    app.state.playback = playback
     app.state.window_lifetime = lifetime
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=["127.0.0.1","localhost","[::1]","testserver"])
 
@@ -251,6 +268,57 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         if page < 1 or not 1 <= page_size <= 100 or len(q)>500 or (after and before and after>before):
             raise ValueError("分页、日期范围或搜索参数无效")
         return db.clips(q=q,status=status,source_id=source_id,uploader=uploader,after=after,before=before,bookmarked=bookmarked,sort=sort,page=page,page_size=page_size)
+
+    @app.get('/api/play-queue')
+    def play_queue(q: str='', status: Literal['included','excluded','needs_review','all']='included', source_id: int | None=None,
+                   uploader: str | None=None, after: date | None=None, before: date | None=None, bookmarked: bool=False,
+                   sort: Literal['newest','oldest','title','uploader']='newest'):
+        if len(q) > 500 or (after and before and after > before):
+            raise ValueError('日期范围或搜索参数无效')
+        return {'items': db.playback_queue(q=q, status=status, source_id=source_id, uploader=uploader,
+                                          after=after, before=before, bookmarked=bookmarked, sort=sort)}
+
+    @app.get('/api/playlists')
+    def playlists():
+        return {'items': db.playlists()}
+
+    @app.post('/api/playlists', status_code=201)
+    def create_playlist(body: PlaylistCreate):
+        return db.save_playlist(body.name, body.clip_ids)
+
+    @app.get('/api/playlists/{playlist_id}')
+    def get_playlist(playlist_id: int):
+        return db.playlist(playlist_id)
+
+    @app.patch('/api/playlists/{playlist_id}')
+    def edit_playlist(playlist_id: int, body: PlaylistUpdate):
+        return db.save_playlist(body.name, body.clip_ids, playlist_id)
+
+    @app.delete('/api/playlists/{playlist_id}')
+    def remove_playlist(playlist_id: int):
+        db.delete_playlist(playlist_id)
+        return {'deleted': True}
+
+    @app.post('/api/clips/{clip_id}/play')
+    async def play_clip(clip_id: str, request: Request):
+        if preview_mode:
+            raise HTTPException(409, '预览数据仅作演示，请打开正式应用播放已采集的视频。')
+        async with login.lock:
+            if await request.is_disconnected():
+                return Response(status_code=499)
+            if login.status()['state'] != 'connected':
+                raise HTTPException(401, '请先验证哔哩哔哩登录后播放。')
+            clip = db.clip(clip_id)
+            if not clip:
+                raise KeyError(clip_id)
+            return await playback.prepare(clip)
+
+    @app.get('/api/playback/media/{key}')
+    async def play_media(key: str, request: Request):
+        origin = request.headers.get('origin')
+        if request.headers.get('sec-fetch-site') == 'cross-site' or (origin and origin != str(request.base_url).rstrip('/')):
+            raise HTTPException(403, '请在应用页面内播放。')
+        return await playback.stream(key, request.headers.get('range'))
 
     @app.get("/api/clips/{clip_id}")
     def clip(clip_id: str):

@@ -55,6 +55,14 @@ CREATE TABLE IF NOT EXISTS user_state (
  clip_id TEXT PRIMARY KEY REFERENCES parts(id), bookmarked INTEGER NOT NULL DEFAULT 0,
  notes TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS playlists (
+ id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS playlist_items (
+ playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+ clip_id TEXT NOT NULL REFERENCES parts(id), position INTEGER NOT NULL,
+ PRIMARY KEY(playlist_id,clip_id)
+);
 CREATE TABLE IF NOT EXISTS sync_jobs (
  id TEXT PRIMARY KEY, source_ids TEXT NOT NULL, mode TEXT NOT NULL,
  state TEXT NOT NULL, checkpoints TEXT NOT NULL DEFAULT '{}', processed INTEGER NOT NULL DEFAULT 0,
@@ -278,6 +286,63 @@ class Database:
         row["sources"] = self.all("SELECT s.id,s.display_name,s.source_type,s.canonical_url FROM sources s JOIN memberships m ON m.source_id=s.id WHERE m.video_bvid=?", (row["video_bvid"],))
         row['songlist_credits'] = self.all('SELECT cs.song_title,cs.original_artist,cs.language,cs.style,cs.fetched_at,s.canonical_url FROM curated_songs cs JOIN sources s ON s.id=cs.source_id WHERE cs.bvid=?', (row['video_bvid'],))
         return row
+
+    @staticmethod
+    def queue_row(row):
+        clip = Database.clip_row(dict(row))
+        return {key: clip[key] for key in ('id', 'video_bvid', 'cid', 'part_number', 'display_song_title',
+                                          'uploader_name', 'duration_seconds', 'playback_url')}
+
+    def playback_queue(self, sort='newest', **filters):
+        where, args = self.filters(**filters)
+        order = {'newest': 'v.published_at DESC', 'oldest': 'v.published_at ASC',
+                 'title': 'fold(a.display_song_title) ASC', 'uploader': 'fold(v.uploader_name) ASC'}[sort]
+        return [self.queue_row(row) for row in self.all(CLIP_SELECT + where +
+                f' ORDER BY {order},p.video_bvid,p.part_number', args)]
+
+    def playlists(self):
+        return self.all('SELECT l.*,COUNT(i.clip_id) AS count FROM playlists l LEFT JOIN playlist_items i '
+                        'ON i.playlist_id=l.id GROUP BY l.id ORDER BY l.updated_at DESC,l.id DESC')
+
+    def playlist(self, playlist_id):
+        result = self.one('SELECT * FROM playlists WHERE id=?', (playlist_id,))
+        if not result:
+            raise KeyError(playlist_id)
+        result['items'] = [self.queue_row(row) for row in self.all(CLIP_SELECT +
+            ' JOIN playlist_items pi ON pi.clip_id=p.id WHERE pi.playlist_id=? ORDER BY pi.position', (playlist_id,))]
+        return result
+
+    def save_playlist(self, name=None, clip_ids=None, playlist_id=None):
+        if name is not None:
+            name = name.strip()
+            if not 1 <= len(name) <= 80:
+                raise ValueError('歌单名称需要 1–80 个字符。')
+        with self.connect() as con:
+            if playlist_id is None:
+                if not name:
+                    raise ValueError('请输入歌单名称。')
+                playlist_id = con.execute('INSERT INTO playlists(name,created_at,updated_at) VALUES(?,?,?)',
+                                          (name, now(), now())).lastrowid
+            elif not con.execute('SELECT 1 FROM playlists WHERE id=?', (playlist_id,)).fetchone():
+                raise KeyError(playlist_id)
+            if name is not None:
+                con.execute('UPDATE playlists SET name=? WHERE id=?', (name, playlist_id))
+            if clip_ids is not None:
+                ids = list(dict.fromkeys(clip_ids))
+                # Validate first; one unknown clip rolls back the entire edit.
+                for clip_id in ids:
+                    if not con.execute('SELECT 1 FROM parts WHERE id=?', (clip_id,)).fetchone():
+                        raise ValueError('歌单包含不存在的片段，请刷新列表。')
+                con.execute('DELETE FROM playlist_items WHERE playlist_id=?', (playlist_id,))
+                con.executemany('INSERT INTO playlist_items(playlist_id,clip_id,position) VALUES(?,?,?)',
+                                [(playlist_id, clip_id, position) for position, clip_id in enumerate(ids)])
+            con.execute('UPDATE playlists SET updated_at=? WHERE id=?', (now(), playlist_id))
+        return self.playlist(playlist_id)
+
+    def delete_playlist(self, playlist_id):
+        with self.connect() as con:
+            if not con.execute('DELETE FROM playlists WHERE id=?', (playlist_id,)).rowcount:
+                raise KeyError(playlist_id)
 
     def annotate(self, ids, patch):
         with self.connect() as con:
