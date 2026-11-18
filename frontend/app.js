@@ -9,7 +9,7 @@ import { connectMediaControls } from './media-controls.js';
 hydrateIcons();
 const pet = new Pet(); pet.initialize();
 const appLifetime = new AppLifetime();
-const state = {view:'catalog',filter:'included',page:1,pageSize:40,overview:null,clips:null,token:null,preview:false,stopping:false,selected:new Set(),expandedGroups:new Set(),grouped:false,editSource:null,request:0};
+const state = {view:'catalog',filter:'included',page:1,pageSize:40,overview:null,clips:null,token:null,preview:false,stopping:false,selected:new Map(),expandedGroups:new Set(),grouped:false,editSource:null,request:0};
 const failedCovers = new Set();
 const clipFilters = {included:'已收录',bookmarked:'星标收藏',needs_review:'待确认',all:'全部候选',excluded:'已排除'};
 const labels = {queued:'等待采集',running:'采集中',paused:'访问受限',failed:'采集未完成',interrupted:'上次运行中断',cancelled:'已取消',completed:'已完成'};
@@ -27,15 +27,16 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-async function api(path, options={}) {
+async function api(path, {asBlob=false, ...options}={}) {
   const response=await fetch(path,{...options,headers:{'Content-Type':'application/json','X-Farida-Token':state.token || '',...options.headers}});
+  if (asBlob && response.ok) return response.blob();
   let data;try {data=await response.json();}catch {throw new Error('本地服务返回异常，请重新启动应用。');}
   if (!response.ok) {const error=new Error(typeof data.detail==='string'?data.detail:'请检查输入内容后重试。');error.status=response.status;error.category=response.headers.get('X-Farida-Error');throw error;}
   return data;
 }
 function notice(message, error=false) { const el=$('#notice');el.textContent=message;el.hidden=!message;el.classList.toggle('error',error); }
 const accountLogin = new AccountLogin(api, async()=>{notice('');await refresh();});
-const playlistPlayer = new PlaylistPlayer(api, parameters, ()=>state.clips?.items.filter(clip=>state.selected.has(clip.id))||[]);
+const playlistPlayer = new PlaylistPlayer(api, parameters, selectedClips);
 const miniPlayer = new MiniPlayer(playlistPlayer);
 connectMediaControls(playlistPlayer);
 async function quitApp() {
@@ -118,9 +119,19 @@ async function loadClips() {
   try {
     const result=await api('/api/clips?'+parameters());
     if(request!==state.request)return;
-    if(result.total>0 && state.page>Math.ceil(result.total/state.pageSize)) {state.page=Math.ceil(result.total/state.pageSize);return loadClips();}
-    state.clips=result;renderClips();
-  } catch(error) {notice(error.message,true);}
+    const lastPage = Math.max(1, Math.ceil(result.total/state.pageSize));
+    if (state.page > lastPage) {
+      state.page = lastPage;
+      if (result.total) return loadClips();
+    }
+    state.clips=result;
+    if (state.selected.size) {
+      result.items.forEach((clip, index) => {
+        if (state.selected.has(clip.id)) selectClip(clip, index, true);
+      });
+    }
+    renderClips();
+  } catch(error) {if(request===state.request)notice(error.message,true);}
 }
 function coverImage(raw) {
   let src='';
@@ -151,8 +162,6 @@ function clipRow(clip) {
 }
 function renderClips() {
   const result=state.clips;
-  const currentIds=new Set(result.items.map(clip=>clip.id));
-  for(const id of state.selected)if(!currentIds.has(id))state.selected.delete(id);
   const byId=new Map(result.items.map(clip=>[clip.id,clip]));
   $('#clip-rows').innerHTML=state.grouped?(result.groups||[]).map((group,index)=>{
     const members=group.clip_ids.map(id=>byId.get(id)).filter(Boolean),expanded=state.expandedGroups.has(group.key);
@@ -242,10 +251,25 @@ async function startSync(mode='incremental',sourceIds=[]) {
   catch(error){notice(error.message,true);if(error.status===401)await accountLogin.requireLogin();}
 }
 async function refresh() {try {await loadOverview();if(state.view!=='sources')await loadClips();}catch(error){notice(error.message,true);$('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';}}
+function selectClip(clip, index, checked) {
+  if (!checked) {
+    state.selected.delete(clip.id);
+    return;
+  }
+  const {id, display_song_title, uploader_name, raw_title, raw_part_title, playback_url} = clip;
+  state.selected.set(id, {
+    page: state.clips.page, index,
+    clip: {id, display_song_title, uploader_name, raw_title, raw_part_title, playback_url}
+  });
+}
+function selectedClips() {
+  return [...state.selected.values()].sort((a,b)=>a.page-b.page || a.index-b.index).map(row=>row.clip);
+}
 function clearSelection() {state.selected.clear();updateSelection();}
 function updateSelection() {
-  $('#bulk-bar').hidden=!state.selected.size;$('#selected-count').textContent=`已选择 ${state.selected.size} 项`;
+  $('#bulk-bar').hidden=!state.selected.size;
   const items=state.clips?.items || [],selected=items.filter(i=>state.selected.has(i.id)).length;
+  $('#selected-count').textContent = `已选择 ${state.selected.size} 项` + (selected < state.selected.size ? `（本页 ${selected} 项）` : '');
   $('#select-page').checked=items.length>0 && selected===items.length;
   $('#select-page').indeterminate=selected>0 && selected<items.length;
   $$('[data-select-group]').forEach(input=>{
@@ -254,7 +278,7 @@ function updateSelection() {
   });
   $$('[data-select]').forEach(el=>el.checked=state.selected.has(el.dataset.select));
 }
-function filtersChanged() {state.page=1;state.expandedGroups.clear();clearSelection();loadClips();}
+function filtersChanged() {clearTimeout(searchTimer);state.page=1;state.expandedGroups.clear();clearSelection();loadClips();}
 function showSource(source) {
   state.editSource=source || null;$('#source-name').value=source?.display_name || '';$('#source-url').value=source?.canonical_url || '';
   $('#singing-collection').checked=!!source?.singing_collection;$('#source-form-error').textContent='';$('#source-dialog-title').textContent=source?'编辑来源':'添加来源';$('#source-dialog').showModal();
@@ -296,7 +320,7 @@ document.addEventListener('click',async event=>{
     if(button.dataset.detail)await showDetail(button.dataset.detail);
     if(button.dataset.classify){await api(`/api/clips/${encodeURIComponent(button.dataset.id)}/annotation`,{method:'PATCH',body:JSON.stringify({inclusion_status:button.dataset.classify})});$('#detail-dialog').close();clearSelection();await refresh();toast('已保存你的决定，后续采集会保留。');}
     if(button.dataset.bulk){
-      const ids=[...state.selected];$$('[data-bulk]').forEach(el=>el.disabled=true);let saved=0;
+      const ids=[...state.selected.keys()];$$('[data-bulk]').forEach(el=>el.disabled=true);let saved=0;
       try {
         for(let offset=0;offset<ids.length;offset+=100){
           const batch=ids.slice(offset,offset+100);
@@ -320,11 +344,17 @@ document.addEventListener('submit',async event=>{
   try{await api(`/api/clips/${encodeURIComponent(event.target.dataset.id)}/annotation`,{method:'PATCH',body:JSON.stringify(Object.fromEntries(new FormData(event.target)))});$('#detail-dialog').close();await refresh();toast('修正已保存。');}catch(error){toast(error.message);}
 });
 document.addEventListener('change',event=>{
-  if(event.target.dataset.selectGroup!==undefined){
-    state.clips.groups[Number(event.target.dataset.selectGroup)].clip_ids.forEach(id=>event.target.checked?state.selected.add(id):state.selected.delete(id));updateSelection();
-  }
-  if(event.target.dataset.select){event.target.checked?state.selected.add(event.target.dataset.select):state.selected.delete(event.target.dataset.select);updateSelection();}});
-$('#select-page').onchange=event=>{state.clips?.items.forEach(clip=>event.target.checked?state.selected.add(clip.id):state.selected.delete(clip.id));updateSelection();};
+  const input=event.target;
+  if (!input.matches('[data-select-group],[data-select],#select-page')) return;
+  const group=input.dataset.selectGroup;
+  const ids=group===undefined ? null : new Set(state.clips.groups[Number(group)].clip_ids);
+  state.clips?.items.forEach((clip,index)=>{
+    if (input.id==='select-page' || clip.id===input.dataset.select || ids?.has(clip.id)) {
+      selectClip(clip,index,input.checked);
+    }
+  });
+  updateSelection();
+});
 $('#clear-selection').onclick=clearSelection;
 try{state.grouped=localStorage.getItem('farida-grouped')==='true';}catch{}
 $('#group-songs').checked=state.grouped;
@@ -332,9 +362,25 @@ $('#group-songs').onchange=()=>{state.grouped=$('#group-songs').checked;try{loca
 $('#filter-button').onclick=()=>{const panel=$('#extra-filters');panel.hidden=!panel.hidden;$('#filter-button').setAttribute('aria-expanded',String(!panel.hidden));};
 $('#reset-filters').onclick=()=>{['#search','#source-filter','#uploader-filter','#after','#before'].forEach(s=>$(s).value='');$('#sort').value='newest';$('#clip-filter').value=state.filter='included';saveRoute();renderJob();filtersChanged();};
 $('#clip-filter').onchange=()=>{state.filter=$('#clip-filter').value;saveRoute();renderJob();filtersChanged();};
-let debounce;$('#search').oninput=()=>{clearTimeout(debounce);debounce=setTimeout(filtersChanged,250);};
+const searchInput = $('#search');
+let searchTimer, composingSearch = false;
+function scheduleSearch() {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(filtersChanged, 250);
+}
+searchInput.addEventListener('compositionstart', () => {
+  composingSearch = true;
+  clearTimeout(searchTimer);
+});
+searchInput.addEventListener('compositionend', () => {
+  composingSearch = false;
+  scheduleSearch();
+});
+searchInput.addEventListener('input', event => {
+  if (!composingSearch && !event.isComposing) scheduleSearch();
+});
 ['#source-filter','#uploader-filter','#after','#before','#sort'].forEach(s=>$(s).onchange=filtersChanged);
-$('#prev-page').onclick=()=>{state.page--;clearSelection();loadClips();};$('#next-page').onclick=()=>{state.page++;clearSelection();loadClips();};
+$('#prev-page').onclick=()=>{state.page--;loadClips();};$('#next-page').onclick=()=>{state.page++;loadClips();};
 $('#sync-button').onclick=()=>startSync();$('#first-scan').onclick=()=>startSync();$('#full-scan').onclick=()=>startSync('full');
 $('#export-button').onclick=()=>{const params=parameters();params.delete('page');params.delete('page_size');location.href='/api/export?'+params;};
 $('#add-source').onclick=()=>showSource();
@@ -350,14 +396,16 @@ window.addEventListener('hashchange',readRoute);
 async function poll() {
   if (state.stopping || document.hidden || polling) return;
   polling = true;
-  const wasCollecting = state.overview?.jobs.some(job=>['running','queued'].includes(job.state));
+  const previousOverview = state.overview;
   try {
     await loadOverview();
     if (document.hidden || state.stopping) return;
     await accountLogin.refresh();
     if (document.hidden || state.stopping) return;
-    if ((wasCollecting || refreshOnReturn) && state.view !== 'sources') await loadClips();
-    refreshOnReturn = false;
+    if (!composingSearch) {
+      if ((previousOverview !== state.overview || refreshOnReturn) && state.view === 'catalog') await loadClips();
+      refreshOnReturn = false;
+    }
   } catch {
     if (state.stopping) return;
     $('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';
@@ -373,8 +421,8 @@ $('#backup-download').onclick=async()=>{
   try {
     await playlistPlayer.persistPreferences();
     await playlistPlayer.remember();
-    const data=await api('/api/backup');
-    const url=URL.createObjectURL(new Blob([JSON.stringify(data)],{type:'application/json'}));
+    const file=await api('/api/backup',{asBlob:true});
+    const url=URL.createObjectURL(file);
     const link=document.createElement('a');link.href=url;link.download='farida-backup-'+new Date().toISOString().slice(0,10)+'.json';link.click();
     setTimeout(()=>URL.revokeObjectURL(url),1000);toast('备份已下载，不含登录凭据。');
   }catch(error){toast(error.message);}
@@ -386,15 +434,25 @@ $('#backup-file').onchange=async event=>{
   if(!confirm('恢复将替换本机的歌曲目录、来源、收藏、备注和歌单。应用会先保存一份恢复前备份；登录信息不变。继续？'))return;
   $('#backup-restore').disabled=true;
   try {
-    playlistPlayer.stop();await playlistPlayer.saveChain;
-    const body=await file.text();
-    const result=await api('/api/restore',{method:'POST',body});
-    // Reload must not write the pre-restore volume/layout over the restored settings.
-    playlistPlayer.persistenceSuspended=true;playlistPlayer.preferencesReady=false;clearTimeout(playlistPlayer.preferencesTimer);
+    await playlistPlayer.persistPreferences();
+    await playlistPlayer.remember();
+    // Keep the current player intact while validating the file. Once replaced,
+    // stale saves from this page must never reach the restored catalog.
+    playlistPlayer.persistenceSuspended=true;
+    await playlistPlayer.saveChain;
+    const result=await api('/api/restore',{method:'POST',body:file});
+    playlistPlayer.preferencesReady=false;
+    clearTimeout(playlistPlayer.preferencesTimer);
+    playlistPlayer.stop();
     alert('恢复完成。恢复前备份已保存到本机 backups 文件夹：'+result.safety_backup);
     location.reload();
-  } catch(error){toast(error.message);}
-  finally{$('#backup-restore').disabled=false;}
+  } catch(error){
+    playlistPlayer.persistenceSuspended=false;
+    playlistPlayer.persistPreferences();
+    playlistPlayer.remember();
+    if(!playlistPlayer.video.paused)playlistPlayer.recordHistory();
+    toast(error.message);
+  } finally{$('#backup-restore').disabled=false;}
 };
 
 

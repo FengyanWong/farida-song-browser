@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "farida-song-browser"
-version = "0.0.5"
 description = "A local, persistent Bilibili singing-clip metadata collector"
 requires-python = ">=3.10"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
-dynamic = ["dependencies"]
+dynamic = ["version", "dependencies"]
 
 [tool.setuptools.dynamic]
+version = {attr = "farida.__version__"}
 dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]

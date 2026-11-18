@@ -27,7 +27,7 @@ from .db import Database, PLAYER_STATE_SQL
 from .sync import Collector
 from .lifetime import WindowLifetime
 from .playback import Playback
-from .backup import export_backup, restore_backup, LIMIT
+from .backup import export_backup, restore_validated_backup, validate_backup, LIMIT
 
 
 CatalogSort = Literal["newest", "oldest", "title", "uploader", "discovered"]
@@ -569,22 +569,25 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         nonlocal startup_pending
         raw = bytearray()
         async for chunk in request.stream():
-            raw.extend(chunk)
-            if len(raw) > LIMIT:
+            if len(raw) + len(chunk) > LIMIT:
                 raise HTTPException(413, "备份超过 64 MB。")
+            raw.extend(chunk)
         try:
             data = json.loads(raw)
+            del raw
             for row in data.get("tables", {}).get("playback_state", []):
                 PlayerState.model_validate_json(row["value"])
+            # Keep the current collection and playback active during the offline import check.
+            data = await asyncio.to_thread(validate_backup, data)
             async with login.lock:
                 startup_pending = False
                 await collector.stop()
                 await playback.clear()
                 with preference_lock:
-                    safety = restore_backup(db, data)
+                    safety = restore_validated_backup(db, data)
                     preference_writers.clear()
             return {"restored": True, "safety_backup": safety}
-        except (ValueError, TypeError, KeyError, AttributeError, sqlite3.DatabaseError) as error:
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError, sqlite3.DatabaseError) as error:
             raise HTTPException(400, "备份无效，未恢复数据。请检查文件格式。") from error
 
     frontend = resource_root() / "frontend"

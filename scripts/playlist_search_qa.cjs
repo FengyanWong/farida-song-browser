@@ -141,6 +141,59 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.ok(await page.locator('#playlist-search').isVisible());
     await page.screenshot({path:path.join(output,'editor-mobile.png'),fullPage:false});
     assert.deepEqual(errors,[]);pass('Queue and editor search fit 390px mobile width without JavaScript errors');
+    const editor = page.locator('#playlist-dialog'), nameInput = page.locator('#playlist-name');
+    const originalName = await nameInput.inputValue();
+    const unloadGuarded = () => page.evaluate(() => {
+      const event = new Event('beforeunload', {cancelable:true});
+      window.dispatchEvent(event);
+      return event.defaultPrevented;
+    });
+    assert.equal(await unloadGuarded(),false);
+    await page.locator('#playlist-search-clear').click();
+    await editor.locator('[data-item="0"][data-move="1"]').click();
+    assert.equal(await unloadGuarded(),true);
+    await editor.locator('[data-item="1"][data-move="-1"]').click();
+    assert.equal(await unloadGuarded(),false);
+    await nameInput.fill(originalName+'草稿');
+    function respond(type, accept) {
+      const seen = page.waitForEvent('dialog');
+      page.once('dialog', dialog => accept ? dialog.accept() : dialog.dismiss());
+      return seen.then(dialog => assert.equal(dialog.type(),type));
+    }
+    const close = editor.locator('.close-dialog');
+    await Promise.all([respond('confirm',false),close.first().click()]);
+    await Promise.all([respond('confirm',false),nameInput.press('Escape')]);
+    await Promise.all([respond('beforeunload',false),page.evaluate(() => {setTimeout(()=>location.reload(),0);})]);
+    assert.equal(await nameInput.inputValue(),originalName+'草稿');
+    await Promise.all([respond('confirm',true),close.last().click()]);
+    await editor.waitFor({state:'hidden'});
+    assert.equal(await unloadGuarded(),false);
+    assert.equal((await(await fetch(base+'/api/playlists/'+savedId)).json()).name,originalName);
+    pass('Changed playlist name/order guards close and reload; search and undo-to-original stay clean, and explicit discard preserves the stored playlist');
+
+    await page.locator('#playlist-edit').click();await editor.waitFor({state:'visible'});
+    const target = '**/api/playlists/'+savedId;
+    let releaseSave, announceSave;
+    const hold = new Promise(resolve=>{releaseSave=resolve;});
+    const submitted = new Promise(resolve=>{announceSave=resolve;});
+    await page.route(target, async route=>{
+      if(route.request().method()==='PATCH'){announceSave();await hold;}
+      await route.continue();
+    });
+    try {
+      await nameInput.fill('第一版');
+      await page.locator('#playlist-save-button').click();await submitted;
+      await nameInput.fill('第二版');
+    } finally {releaseSave();}
+    await page.waitForFunction(()=>!document.querySelector('#playlist-save-button').disabled);
+    await page.unroute(target);
+    assert.equal(await editor.isVisible(),true);
+    assert.equal(await unloadGuarded(),true);
+    assert.equal((await(await fetch(base+'/api/playlists/'+savedId)).json()).name,'第一版');
+    await page.locator('#playlist-save-button').click();await editor.waitFor({state:'hidden'});
+    assert.equal((await(await fetch(base+'/api/playlists/'+savedId)).json()).name,'第二版');
+    assert.equal(await unloadGuarded(),false);
+    pass('Edits made while saving remain open for a second save; both submissions retain the same playlist ID');
     await page.close();await until(()=>service.exitCode!==null);assert.equal(service.exitCode,0);
     fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({checks,errors,output},null,2));
   }finally{await browser.close();if(service.exitCode===null)spawnSync('taskkill',['/PID',String(service.pid),'/T','/F'],{stdio:'ignore'});}

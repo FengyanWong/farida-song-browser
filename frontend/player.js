@@ -26,6 +26,30 @@ export class PlaylistPlayer {
     $('#playlist-copy-links').onclick=()=>this.copyPlaylistLinks();
     $('#playlist-save').onsubmit=event=>{event.preventDefault();this.save();};
     $('#playlist-delete').onclick=()=>this.remove();
+    const editor = $('#playlist-dialog');
+    this.warnBeforeUnload = event => {
+      if (editor.open && this.hasPlaylistChanges()) {
+        event.preventDefault();
+        event.returnValue = true;
+      }
+    };
+    const discard = () => {
+      if (this.editing?.saving) return confirm('歌单正在保存，关闭编辑器？');
+      return !this.hasPlaylistChanges() || confirm('放弃未保存的歌单修改？');
+    };
+    editor.addEventListener('cancel', event => { if (!discard()) event.preventDefault(); });
+    editor.addEventListener('click', event => {
+      if (event.target.closest('.close-dialog') && !discard()) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
+    editor.addEventListener('close', () => {
+      if (!editor.open) {
+        window.removeEventListener('beforeunload', this.warnBeforeUnload);
+        this.editing = null;
+      }
+    });
     $('#player-save').onclick=()=>this.edit({name:this.name,items:this.queue});
     $('#player-close').onclick=()=>this.stop();
     $('#player-prev').onclick=()=>this.previous();
@@ -169,7 +193,7 @@ export class PlaylistPlayer {
   }
   async recordHistory() {
     const logical=this.logicalPlay;
-    if(!logical||logical.recorded||logical.pending)return;
+    if(this.persistenceSuspended||!logical||logical.recorded||logical.pending)return;
     logical.pending=true;logical.recorded=true;
     try {
       await this.api('/api/listening-history',{method:'POST',body:JSON.stringify({clip_id:logical.id})});
@@ -374,14 +398,26 @@ export class PlaylistPlayer {
       this.edit(result,add);
     } catch(error) {toast(error.message);}
   }
+  hasPlaylistChanges() {
+    const edit = this.editing;
+    if (!edit) return false;
+    return $('#playlist-name').value.trim() !== edit.savedName ||
+      edit.items.length !== edit.savedIds.length ||
+      edit.items.some((item, index) => item.id !== edit.savedIds[index]);
+  }
   edit(list=null,add=[]) {
-    this.editing={id:list?.id??null,name:list?.name??'',items:[...(list?.items??[])]};
+    if ($('#playlist-dialog').open) return;
+    const items = list?.items ?? [];
+    this.editing = {id:list?.id ?? null, savedName:list?.name ?? '',
+                    savedIds:items.map(item=>item.id), items:[...items]};
     this.addItems(add);
+    $('#playlist-save-button').disabled=false;$('#playlist-delete').disabled=false;
     $('#playlist-search').value='';$('#playlist-search-clear').hidden=true;
-    $('#playlist-name').value=this.editing.name;
+    $('#playlist-name').value=this.editing.savedName;
     $('#playlist-error').textContent='';$('#playlist-delete').hidden=!this.editing.id;
     $('#playlist-dialog-title').textContent=this.editing.id?'编辑歌单':'新建歌单';
     this.renderEditing();$('#playlist-dialog').showModal();$('#playlist-name').focus();
+    window.addEventListener('beforeunload', this.warnBeforeUnload);
   }
   addItems(items) {
     const ids=new Set(this.editing.items.map(item=>item.id));
@@ -443,17 +479,35 @@ export class PlaylistPlayer {
   }
   async save() {
     const edit=this.editing,name=$('#playlist-name').value.trim();
+    if (!edit || edit.saving) return;
     if(!name){$('#playlist-error').textContent='请输入歌单名称。';return;}
-    $('#playlist-save-button').disabled=true;
+    const ids = edit.items.map(item=>item.id);
+    edit.saving=true;
+    $('#playlist-save-button').disabled=true;$('#playlist-delete').disabled=true;
     try {
       const result=await this.api('/api/playlists'+(edit.id?'/'+edit.id:''),{
-        method:edit.id?'PATCH':'POST',body:JSON.stringify({name,clip_ids:edit.items.map(item=>item.id)})});
+        method:edit.id?'PATCH':'POST',body:JSON.stringify({name,clip_ids:ids})});
       edit.id=result.id;
+      edit.savedName=name;
+      edit.savedIds=ids;
       await this.loadPlaylists(result.id);
-      if(this.editing===edit)$('#playlist-dialog').close();
-      toast('歌单已保存在此电脑。');
-    } catch(error) {$('#playlist-error').textContent=error.message;}
-    finally {$('#playlist-save-button').disabled=false;}
+      const stillEditing = this.editing === edit && $('#playlist-dialog').open;
+      if (stillEditing) {
+        $('#playlist-dialog-title').textContent='编辑歌单';
+        $('#playlist-delete').hidden=false;
+        if (!this.hasPlaylistChanges()) $('#playlist-dialog').close();
+      }
+      toast(stillEditing && this.hasPlaylistChanges() ? '已保存。之后的修改请再次保存。' : '歌单已保存在此电脑。');
+    } catch(error) {
+      if (this.editing === edit && $('#playlist-dialog').open) $('#playlist-error').textContent=error.message;
+      else toast(error.message);
+    } finally {
+      edit.saving=false;
+      if (this.editing === edit) {
+        $('#playlist-save-button').disabled=false;
+        $('#playlist-delete').disabled=false;
+      }
+    }
   }
   async remove() {
     if(!this.editing.id||!confirm('删除这个歌单？已采集的片段和收藏会保留。'))return;

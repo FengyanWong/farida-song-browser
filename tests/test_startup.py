@@ -147,6 +147,10 @@ async def test_qr_login_releases_one_startup_scan_even_with_repeated_tab_polls(s
         assert not app.state.db.jobs() and not server.calls
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://testserver') as client:
             client.headers['X-Farida-Token'] = (await client.get('/api/session')).json()['token']
+            # A rejected restore cannot consume the deferred scan while the user is signed out.
+            invalid_backup = (await client.get('/api/backup')).json()
+            del invalid_backup['tables']['sources']
+            assert (await client.post('/api/restore', json=invalid_backup)).status_code == 400
             qr = (await client.post('/api/auth/qr')).json()
             server.time += 3
             for _ in range(3):

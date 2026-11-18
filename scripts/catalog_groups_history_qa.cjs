@@ -87,6 +87,27 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     });
     await page.goto(base+'/#catalog');await page.locator('#clip-rows tr').first().waitFor();
     assert.equal(await page.locator('nav [data-view]').count(),2);
+    const queries=[];
+    page.on('request',req=>{
+      const target=new URL(req.url());
+      if(target.pathname==='/api/clips')queries.push(target.searchParams.get('q'));
+    });
+    const search=page.locator('#search');
+    await search.evaluate(el=>{
+      el.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));
+      el.value='ton';
+      el.dispatchEvent(new InputEvent('input',{bubbles:true,isComposing:true}));
+    });
+    await delay(400);
+    assert.ok(!queries.includes('ton'));
+    await search.evaluate(el=>{
+      el.value='同一首歌';
+      el.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true,data:el.value}));
+      el.dispatchEvent(new InputEvent('input',{bubbles:true}));
+    });
+    await until(()=>queries.includes('同一首歌'));
+    assert.equal(queries.filter(q=>q==='同一首歌').length,1);
+    pass('Chinese input composition issues a single search for the confirmed text');
     const wanted=fixture.ids[0],bvid=wanted.split(':')[0];
     const canonical='https://www.bilibili.com/video/'+bvid+'/?p=1';
     await page.locator('#search').fill(canonical+'&share_source=copy');
@@ -101,7 +122,39 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await page.locator('#search').fill('');
     await until(async()=>await page.locator('#clip-rows [data-play]').count()===40);
     pass('Pasting a shared Bilibili link selects the saved clip and Copy Link returns its clean original URL');
+    // Pick in reverse page order. Playback and the saved playlist follow catalog order.
+    await page.locator('#next-page').click();
+    await until(async()=>await page.locator('#page-number').textContent()==='2 / 3');
+    const pageTwoBox=page.locator('#clip-rows [data-select]').first();
+    const secondId=await pageTwoBox.getAttribute('data-select');
+    await pageTwoBox.check();
+    await page.locator('#prev-page').click();
+    await until(async()=>await page.locator('#page-number').textContent()==='1 / 3');
+    assert.match(await page.locator('#selected-count').textContent(),/1 项（本页 0 项）/);
+    await page.locator('#select-page').check();
+    assert.match(await page.locator('#selected-count').textContent(),/41 项（本页 40 项）/);
+    await page.locator('#select-page').uncheck();
+    const pageOneBox=page.locator('#clip-rows [data-select]').nth(1);
+    const firstId=await pageOneBox.getAttribute('data-select');
+    await pageOneBox.check();
+    await page.locator('#playlist-add-selected').click();
+    await page.locator('#playlist-name').fill('跨页选歌');
+    await page.locator('#playlist-save-button').click();
+    await page.locator('#playlist-dialog').waitFor({state:'hidden'});
+    const multiId=await page.locator('#playlist-select').inputValue();
+    assert.deepEqual((await api('/api/playlists/'+multiId)).items.map(item=>item.id),[firstId,secondId]);
+    await page.locator('#playlist-select').selectOption('');
+    await page.locator('#next-page').click();
+    await until(async()=>await page.locator('#page-number').textContent()==='2 / 3');
+    assert.equal(await pageTwoBox.isChecked(),true);
+    const bulkRequest=page.waitForRequest(req=>new URL(req.url()).pathname==='/api/review/bulk' && req.method()==='PATCH');
+    await page.locator('[data-bulk=included]').click();
+    assert.deepEqual((await bulkRequest).postDataJSON().ids.sort(),[firstId,secondId].sort());
+    await page.locator('#bulk-bar').waitFor({state:'hidden'});
+    await pageTwoBox.check();
     await page.locator('#group-songs').check();await until(async()=>await page.locator('.song-group-row').count()===40);
+    assert.equal(await page.locator('#bulk-bar').isVisible(),false);
+    pass('Across pages, selecting and deselecting the current page preserves other choices, orders the saved playlist, and applies bulk review to the chosen clips');
     const first=await api('/api/clips?grouped=true&page=1&page_size=40');
     const second=await api('/api/clips?grouped=true&page=2&page_size=40');
     assert.equal(first.total,44);assert.equal(first.total_clips,94);assert.equal(first.groups[0].count,50);
@@ -135,6 +188,15 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     assert.equal(plays[0],first.groups[0].clip_ids[0]);
     await until(async()=>(await api('/api/listening-history')).items.length===1);
     assert.equal(await page.locator('#player-position').textContent(),'1 / 50');
+    const beforeInvalidRestore = await page.locator('#song-video').getAttribute('src');
+    const rejected=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/restore');
+    await page.locator('#backup-file').setInputFiles({name:'invalid.json',mimeType:'application/json',buffer:Buffer.from('{}')});
+    assert.equal((await rejected).status(),400);
+    await until(async()=>await page.locator('#backup-restore').isEnabled());
+    assert.equal(await page.locator('#music-player').isVisible(),true);
+    assert.equal(await page.locator('#song-video').getAttribute('src'),beforeInvalidRestore);
+    assert.equal(await page.locator('#player-position').textContent(),'1 / 50');
+    pass('A rejected backup preserves the current player, video, and queue position');
     await page.locator('#player-close').click();
     pass('Collapsed group selection includes hidden recordings; indeterminate selection stays correct; saved playlist and group playback use all 50 real queue IDs');
 
@@ -164,7 +226,8 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await page.locator('#listening-history-dialog .close-dialog').first().click();
     await page.locator('#account-toggle').click();
     const downloadPromise=page.waitForEvent('download');await page.locator('#backup-download').click();
-    const download=await downloadPromise,backupFile=path.join(output,'manual-history-backup.json');await download.saveAs(backupFile);
+    const download=await downloadPromise;assert.match(download.suggestedFilename(),/^farida-backup-\d{4}-\d{2}-\d{2}\.json$/);
+    const backupFile=path.join(output,'manual-history-backup.json');await download.saveAs(backupFile);
     const snapshot=JSON.parse(fs.readFileSync(backupFile,'utf8'));
     assert.equal(snapshot.version,2);assert.equal(snapshot.tables.listening_history.length,3);
     await page.locator('#account-toggle').click();
@@ -210,6 +273,33 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     assert.ok(await page.locator('#listening-history-dialog').isVisible());
     await page.screenshot({path:path.join(output,'history-mobile.png'),fullPage:false});
     assert.deepEqual(errors,[]);pass('Grouped catalog and history fit a 390px viewport, retain two navigation tabs, and produce no JavaScript errors');
+    await page.locator('#listening-history-dialog .close-dialog').first().click();
+    await page.locator('#filter-button').click();
+    const range = page.getByRole('group',{name:'上传日期（UTC）'});
+    for (const width of [320,360,390]) {
+      await page.setViewportSize({width,height:844});
+      for (const label of ['起始上传日期','结束上传日期']) {
+        const input = range.getByLabel(label);
+        await input.scrollIntoViewIfNeeded();
+        assert.ok(await input.evaluate(element=>{
+          const rect=element.getBoundingClientRect();
+          const picker=document.elementFromPoint(rect.right-6,rect.top+rect.height/2);
+          return rect.left>=0 && rect.right<=innerWidth && picker===element;
+        }), width+'px: '+label+' calendar edge must be fully reachable');
+      }
+    }
+    await range.getByLabel('起始上传日期').focus();
+    for (let step=0;step<6 && !(await page.locator('#before').evaluate(el=>el===document.activeElement));step++)
+      await page.keyboard.press('Tab');
+    assert.equal(await page.locator('#before').evaluate(el=>el===document.activeElement),true);
+    await range.getByLabel('起始上传日期').fill('2020-01-01');
+    const filteredDates = page.waitForRequest(request=>{
+      const url=new URL(request.url());
+      return url.pathname==='/api/clips' && url.searchParams.get('after')==='2020-01-01' &&
+        url.searchParams.get('before')==='2030-01-01';
+    });
+    await range.getByLabel('结束上传日期').fill('2030-01-01');await filteredDates;
+    pass('Both upload dates and picker edges fit 320–390px widths; keyboard navigation and combined range requests work');
     await page.close();await until(()=>service.exitCode!==null);assert.equal(service.exitCode,0);
     fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({checks,errors,output,packaged:!!exe,blockedExternalRequests:blocked.length},null,2));
   }finally{await browser.close();if(service.exitCode===null)spawnSync('taskkill',['/PID',String(service.pid),'/T','/F'],{stdio:'ignore',windowsHide:true});}

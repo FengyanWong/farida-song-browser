@@ -1,7 +1,6 @@
 """Portable data-only backups. Login credentials and executable SQL are excluded."""
 import json
-import sqlite3
-import secrets
+import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -12,14 +11,18 @@ TABLES = LEGACY_TABLES + ("listening_history",)
 LIMIT = 64 * 1024 * 1024
 
 
+def _snapshot(con):
+    tables = {}
+    for table in TABLES:
+        query = PLAYER_STATE_SQL if table == "playback_state" else f"SELECT * FROM {table}"
+        tables[table] = [dict(row) for row in con.execute(query)]
+    return {"format": "farida-backup", "version": 2, "created_at": now(), "tables": tables}
+
+
 def export_backup(db):
     with db.connect() as con:
         con.execute("BEGIN")
-        tables = {}
-        for table in TABLES:
-            query = PLAYER_STATE_SQL if table == "playback_state" else f"SELECT * FROM {table}"
-            tables[table] = [dict(row) for row in con.execute(query)]
-    return {"format": "farida-backup", "version": 2, "created_at": now(), "tables": tables}
+        return _snapshot(con)
 
 
 def _normalized_backup(data):
@@ -67,28 +70,61 @@ def replace_tables(db, data):
     data = _normalized_backup(data)
     with db.connect() as con:
         con.execute("BEGIN IMMEDIATE")
-        con.execute("DELETE FROM sync_jobs")
-        for table in reversed(TABLES):
-            con.execute(f"DELETE FROM {table}")
-        for table in TABLES:
-            columns = [row[1] for row in con.execute(f"PRAGMA table_info({table})")]
-            rows = data["tables"][table]
-            if not isinstance(rows, list) or any(not isinstance(row, dict) or set(row) != set(columns) for row in rows):
-                raise ValueError("备份字段不完整或格式不兼容。")
-            if table == "listening_history":
-                _validate_history(rows)
-            con.executemany(f"INSERT INTO {table}({','.join(columns)}) VALUES({','.join('?' for _ in columns)})", [[row[c] for c in columns] for row in rows])
-        if con.execute("PRAGMA foreign_key_check").fetchone():
-            raise ValueError("备份包含无效的歌曲或歌单引用。")
+        _replace_tables(con, data)
+
+
+def _replace_tables(con, data):
+    con.execute("DELETE FROM sync_jobs")
+    for table in reversed(TABLES):
+        con.execute(f"DELETE FROM {table}")
+    for table in TABLES:
+        columns = [row[1] for row in con.execute(f"PRAGMA table_info({table})")]
+        expected_fields = set(columns)
+        rows = data["tables"][table]
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or row.keys() != expected_fields for row in rows):
+            raise ValueError("备份字段不完整或格式不兼容。")
+        if table == "listening_history":
+            _validate_history(rows)
+        placeholders = ",".join("?" for _ in columns)
+        con.executemany(
+            f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders})",
+            (tuple(row[column] for column in columns) for row in rows),
+        )
+    if con.execute("PRAGMA foreign_key_check").fetchone():
+        raise ValueError("备份包含无效的歌曲或歌单引用。")
+
+
+def _save_recovery(con, folder):
+    folder.mkdir(exist_ok=True)
+    pending = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=folder, prefix="before-restore-" + now().replace(":", "-") + "-",
+            suffix=".tmp", delete=False,
+        ) as stream:
+            pending = Path(stream.name)
+            json.dump(_snapshot(con), stream, ensure_ascii=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        ready = pending.with_suffix(".json")
+        if ready.exists():
+            raise FileExistsError(ready)
+        pending.rename(ready)
+        return ready.name
+    finally:
+        if pending is not None:
+            pending.unlink(missing_ok=True)
 
 
 def restore_backup(db, data):
-    data = validate_backup(data)
-    folder = db.path.parent / "backups"
-    folder.mkdir(exist_ok=True)
-    safety = folder / ("before-restore-" + now().replace(":", "-") + "-" + secrets.token_hex(4) + ".json")
-    # Exclusive creation prevents overwriting a previous recovery copy.
-    with safety.open("x", encoding="utf-8") as stream:
-        json.dump(export_backup(db), stream, ensure_ascii=False)
-    replace_tables(db, data)
-    return safety.name
+    return restore_validated_backup(db, validate_backup(data))
+
+
+def restore_validated_backup(db, data):
+    """Install a backup returned by validate_backup after the caller pauses live work."""
+    with db.connect() as con:
+        # Concurrent edits either enter the recovery copy or commit after the restore.
+        con.execute("BEGIN IMMEDIATE")
+        filename = _save_recovery(con, db.path.parent / "backups")
+        _replace_tables(con, data)
+    return filename

@@ -18,7 +18,7 @@ class Collector:
     def __init__(self, db, settings, adapter_factory=BilibiliAdapter):
         self.db, self.settings, self.adapter_factory = db, settings, adapter_factory
         self.task = None
-        self.wake = asyncio.Event()
+        self._interruptible_job = None
 
     def start(self, source_ids, mode):
         if self.task and not self.task.done():
@@ -40,8 +40,7 @@ class Collector:
             self.db.execute("INSERT INTO sync_jobs(id,source_ids,mode,state,checkpoints,started_at,heartbeat) VALUES(?,?,?,'queued',?,?,?)", (job_id,encode(source_ids),mode,encode(checkpoints),now(),now()))
         except sqlite3.IntegrityError:
             raise ValueError("已有采集任务正在运行") from None
-        self.task = asyncio.create_task(self.run(job_id))
-        return self.db.job(job_id)
+        return self._schedule(job_id)
 
     def resume(self, job_id):
         if self.task and not self.task.done():
@@ -64,38 +63,53 @@ class Collector:
         except sqlite3.IntegrityError:
             raise ValueError("已有采集任务正在运行") from None
         self.db.execute("UPDATE sync_jobs SET cancel_requested=0 WHERE id=?", (job_id,))
+        return self._schedule(job_id)
+
+    def _schedule(self, job_id):
+        self._interruptible_job = job_id
         self.task = asyncio.create_task(self.run(job_id))
         return self.db.job(job_id)
 
+    def _interrupt(self, job_id):
+        if self._interruptible_job == job_id:
+            self._interruptible_job = None
+            self.task.cancel()
+
     def cancel(self, job_id):
+        self.db.execute("""UPDATE sync_jobs SET cancel_requested=1 WHERE id=?
+            AND state IN ('queued','running')""", (job_id,))
         job = self.db.job(job_id)
         if not job:
             raise KeyError(job_id)
-        if job["state"] in {"queued","running"}:
-            self.db.execute("UPDATE sync_jobs SET cancel_requested=1 WHERE id=?", (job_id,))
-        return self.db.job(job_id)
+        # A queued task observes the flag before its first upstream request.
+        if job["state"] == "running":
+            self._interrupt(job_id)
+        return job
 
     def check_cancel(self, job):
-        if self.db.job(job["id"])["cancel_requested"]:
+        if self.db.one("SELECT cancel_requested FROM sync_jobs WHERE id=?", (job["id"],))["cancel_requested"]:
             raise Cancelled()
 
     async def close(self):
         if self.task and not self.task.done():
-            self.task.cancel()
+            job_id = self._interruptible_job
+            if job_id is not None:
+                self._interrupt(job_id)
             try:
                 await self.task
             except asyncio.CancelledError:
-                pass
+                # A task cancelled before its coroutine starts has no finally block.
+                if job_id is not None:
+                    self.db.execute("""UPDATE sync_jobs SET state=CASE WHEN cancel_requested=1
+                        THEN 'cancelled' ELSE 'interrupted' END,finished_at=?,heartbeat=?
+                        WHERE id=? AND state='queued'""", (now(), now(), job_id))
 
     async def stop(self):
         """Finish active work before replacing or forgetting login credentials."""
-        active = [job for job in self.db.jobs() if job['state'] in {'queued', 'running'}]
+        active = self.db.all("SELECT id FROM sync_jobs WHERE state IN ('queued','running')")
         for job in active:
             self.cancel(job['id'])
         await self.close()
-        for job in active:
-            # A task cancelled before its coroutine starts cannot run its finally.
-            self.db.execute("UPDATE sync_jobs SET state='cancelled',finished_at=?,heartbeat=? WHERE id=? AND state IN ('queued','running')", (now(), now(), job['id']))
 
     async def heartbeat(self, job_id):
         while True:
@@ -154,6 +168,8 @@ class Collector:
             # Exception details may contain local paths/credentials; retain only a category.
             job["errors"].append({"category":"internal", "message":f"Local collector error ({type(exc).__name__}); committed data is preserved"})
         finally:
+            # Repeated cancel, shutdown or logout must allow cleanup to finish.
+            self._interruptible_job = None
             pulse.cancel()
             try:
                 await pulse
@@ -178,18 +194,19 @@ class Collector:
             cp["total"] = page.total
             cp["current_page"] = page_number
             cp["scope"] = "discovery" if kind == "search" else job["mode"]
-            fingerprint = hashlib.sha256(encode(page.bvids).encode()).hexdigest()
+            resource_ids = page.resource_ids if page.resource_ids is not None else page.bvids
+            fingerprint = hashlib.sha256(encode(resource_ids).encode()).hexdigest()
             previous_page = cp["page_hashes"].get(fingerprint)
-            if page.bvids and previous_page is not None and previous_page != page_number:
+            if resource_ids and previous_page is not None and previous_page != page_number:
                 raise UpstreamError("pagination", "Repeated page detected; source coverage remains incomplete")
             # Seen clips from an earlier attempt are valid resume overlap.
             # Only pages that repeat within this pass indicate no progress.
-            if page.bvids and page.has_more and previous_page != page_number and all(bvid in enumerated for bvid in page.bvids):
+            if resource_ids and page.has_more and previous_page != page_number and all(key in enumerated for key in resource_ids):
                 raise UpstreamError("pagination", "Pagination made no progress; source coverage remains incomplete")
-            if not page.bvids and page.has_more:
+            if not resource_ids and page.has_more:
                 raise UpstreamError("pagination", "Empty page with more results; source coverage remains incomplete")
             cp["page_hashes"][fingerprint] = page_number
-            enumerated.update(page.bvids)
+            enumerated.update(resource_ids)
             self.db.save_job(job)
             for bvid in page.bvids:
                 self.check_cancel(job)

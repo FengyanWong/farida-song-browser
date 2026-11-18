@@ -1,7 +1,10 @@
 import asyncio
 from copy import deepcopy
 
-from farida.adapter import Page, UpstreamError
+import httpx
+import pytest
+
+from farida.adapter import BilibiliAdapter, Page, UpstreamError
 from farida.db import Database, encode, now
 from farida.sync import Collector
 
@@ -156,7 +159,6 @@ async def test_cancel_then_resume_without_losing_progress(db,settings,video):
 
 
 async def test_one_job_at_a_time(db,settings,video):
-    import pytest
     worker=Collector(db,settings,lambda _:FakeAdapter(video))
     worker.start([1],"full")
     with pytest.raises(ValueError):worker.start([2],"full")
@@ -224,3 +226,111 @@ async def test_tag_failure_does_not_mark_available_video_deleted(db,settings,vid
     assert db.job(job['id'])['state']=='failed'
     assert db.clip(video['bvid']+':100')['availability_status']=='available'
     assert db.source(1)['last_complete_scan_at'] is None
+
+
+async def test_cancel_interrupts_inflight_request_and_resume_keeps_saved_clips(db, settings, video):
+    first, second = video['bvid'], 'BV0000000002'
+    adapter = FakeAdapter(video, {1: Page([first, second], False, 2)})
+    started = asyncio.Event()
+    closing = asyncio.Event()
+    release = asyncio.Event()
+    interrupted = asyncio.Event()
+    original_details = adapter.get_video_details
+
+    async def delayed_details(bvid):
+        if bvid == second:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                interrupted.set()
+        return await original_details(bvid)
+
+    async def close():
+        closing.set()
+        await release.wait()
+
+    adapter.get_video_details = delayed_details
+    adapter.close = close
+    collector = Collector(db, settings, lambda _: adapter)
+    job_id = collector.start([1], 'incremental')['id']
+    await asyncio.wait_for(started.wait(), 2)
+    collector.cancel(job_id)
+    try:
+        await asyncio.wait_for(closing.wait(), 2)
+        assert interrupted.is_set()
+        collector.cancel(job_id)
+        shutdown = asyncio.create_task(collector.close())
+        await asyncio.sleep(0)
+        assert not shutdown.done()
+    finally:
+        release.set()
+    await asyncio.wait_for(shutdown, 2)
+    saved = db.job(job_id)
+    assert saved['state'] == 'cancelled'
+    assert saved['checkpoints']['1']['seen'] == [first]
+    adapter.get_video_details = original_details
+    collector.resume(job_id)
+    await collector.task
+    assert db.job(job_id)['state'] == 'completed'
+    assert adapter.video_calls == [first, second]
+    assert db.source(1)['submissions'] == 2
+
+
+async def test_shutdown_before_worker_starts_leaves_resumable_job(db, settings, video):
+    adapter = FakeAdapter(video)
+    collector = Collector(db, settings, lambda _: adapter)
+    job_id = collector.start([1], 'incremental')['id']
+    await collector.close()
+    assert db.job(job_id)['state'] == 'interrupted'
+    assert adapter.calls == []
+    collector.resume(job_id)
+    await collector.task
+    assert db.job(job_id)['state'] == 'completed'
+
+
+@pytest.mark.parametrize("pages, expected_state", [
+    ([[{"type": 12, "id": 11}], [{"type": 24, "id": 11}], [{"type": 2, "bvid": "BV1br4y1R7BP"}]], "completed"),
+    ([[{"type": 12, "id": 11}], [{"type": 12, "id": 11}]], "failed"),
+    ([[{"type": 12, "id": 11}, {"type": 24, "id": 11}], [{"type": 24, "id": 11}, {"type": 12, "id": 11}], []], "failed"),
+    ([[], [{"type": 2, "bvid": "BV1br4y1R7BP"}]], "failed"),
+], ids=["articles-and-audio-before-video", "repeated-page", "reordered-repeated-page", "empty-page-with-more"])
+async def test_favorites_cursor_uses_all_resources_but_only_collects_videos(db, settings, video, pages, expected_state):
+    source = db.add_source("收藏夹", "https://space.bilibili.com/123/favlist?fid=456")
+    calls = []
+    def response(request):
+        path = request.url.path
+        calls.append(path)
+        if path == "/x/web-interface/nav":
+            data = {"wbi_img": {"img_url": "https://test.invalid/" + "a"*32 + ".png",
+                                "sub_url": "https://test.invalid/" + "b"*32 + ".png"}}
+        elif path == "/x/space/wbi/acc/info":
+            data = {"mid": 123, "name": "收藏者"}
+        elif path == "/x/v3/fav/resource/list":
+            page = int(request.url.params["pn"])
+            data = {"info": {"upper": {"mid": 123}, "id": 456, "media_count": sum(map(len, pages))},
+                    "medias": pages[page-1], "has_more": page < len(pages)}
+        elif path == "/x/web-interface/view":
+            assert request.url.params["bvid"] == video["bvid"]
+            data = video
+        elif path == "/x/tag/archive/tags":
+            data = [{"tag_name": "法里达"}]
+        else:
+            raise AssertionError(path)
+        return httpx.Response(200, json={"code": 0, "data": data})
+
+    settings.incremental_pages = 3
+    collector = Collector(db, settings, lambda cfg: BilibiliAdapter(cfg, transport=httpx.MockTransport(response)))
+    job_id = collector.start([source["id"]], "incremental")["id"]
+    await collector.task
+    job = db.job(job_id)
+    assert job["state"] == expected_state
+    if expected_state == "completed":
+        assert calls.count("/x/v3/fav/resource/list") == 3
+        assert calls.count("/x/web-interface/view") == calls.count("/x/tag/archive/tags") == 1
+        assert job["checkpoints"][str(source["id"])]["seen"] == [video["bvid"]]
+        assert db.source(source["id"])["submissions"] == 1
+    else:
+        assert job["errors"][0]["category"] == "pagination"
+        assert "/x/web-interface/view" not in calls
+        assert db.source(source["id"])["last_refresh_at"] is None

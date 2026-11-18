@@ -126,6 +126,8 @@ CLIP_FROM = """ FROM parts p
  JOIN annotations a ON a.clip_id=p.id
  LEFT JOIN user_state u ON u.clip_id=p.id """
 
+OVERVIEW_JOB_LIMIT = 10
+
 PLAYABLE = "p.active=1 AND v.verification_status='verified' AND v.availability_status='available'"
 PLAYBACK_URL = (f"CASE WHEN {PLAYABLE} THEN 'https://www.bilibili.com/video/' || p.video_bvid "
                 "|| '/?p=' || p.part_number END AS playback_url")
@@ -207,7 +209,7 @@ class Database:
         with self.connect() as con:
             return con.execute(sql, args).lastrowid
 
-    def sources(self, include_status=False):
+    def sources(self, include_status=False, *, recent_jobs=None):
         rows = self.all("""SELECT s.*, (SELECT COUNT(*) FROM memberships m WHERE m.source_id=s.id) AS submissions,
             (SELECT COUNT(*) FROM memberships m JOIN parts p ON p.video_bvid=m.video_bvid WHERE m.source_id=s.id AND p.active=1) AS entries,
             (SELECT COUNT(*) FROM curated_songs cs WHERE cs.source_id=s.id) AS listed_songs,
@@ -218,25 +220,39 @@ class Database:
             row["required_tags"] = json.loads(row["required_tags"])
             row["last_error"] = json.loads(row["last_error"]) if row["last_error"] else None
         if include_status:
+            if recent_jobs is None:
+                recent_jobs = self.jobs(OVERVIEW_JOB_LIMIT)
             for row in rows:
-                row["collection_status"] = self.collection_status(row)
+                row["collection_status"] = self.collection_status(row, recent_jobs)
         return rows
 
-    def collection_status(self, source):
-        """Describe the latest selected task even when its source never ran."""
+    def _latest_source_job(self, source, recent_jobs):
+        if recent_jobs is not None:
+            for job in recent_jobs:
+                if source["id"] in job["source_ids"]:
+                    checkpoint = job["checkpoints"].get(str(source["id"]), {})
+                    if checkpoint.get("source_url") in (None, source["canonical_url"]):
+                        return job
+            if len(recent_jobs) < OVERVIEW_JOB_LIMIT:
+                return None
+        # A rarely used source can have its latest compatible task outside the overview.
         row = self.one("""SELECT * FROM sync_jobs j WHERE EXISTS
             (SELECT 1 FROM json_each(j.source_ids) WHERE value=?)
             AND (json_extract(j.checkpoints, ?) IS NULL OR json_extract(j.checkpoints, ?)=?)
             ORDER BY (state IN ('queued','running')) DESC,heartbeat DESC,rowid DESC LIMIT 1""",
             (source['id'], f'$."{source["id"]}".source_url', f'$."{source["id"]}".source_url', source['canonical_url']))
+        return self.decode_job(row) if row else None
+
+    def collection_status(self, source, recent_jobs=None):
+        """Describe the latest selected task even when its source never ran."""
+        job = self._latest_source_job(source, recent_jobs)
         successful = [source.get(key) for key in ('last_refresh_at','last_complete_scan_at','last_discovery_at') if source.get(key)]
         result = {'state': 'idle', 'last_success_at': max(successful) if successful else None,
                   'last_attempt_at': None, 'finished_at': None, 'processed': 0, 'added_clips': None,
                   'added_included': None, 'skipped': 0, 'error': None, 'job_id': None, 'mode': None,
                   'current_page': None, 'scope': None, 'can_resume': False, 'unavailable': []}
-        if not row:
+        if not job:
             return result
-        job = self.decode_job(row)
         cp = job['checkpoints'].get(str(source['id']), {})
         phase = cp.get('state')
         active = job['state'] in {'queued', 'running'}
@@ -553,7 +569,7 @@ class Database:
         self.execute("INSERT INTO user_state(clip_id,bookmarked) VALUES(?,?) ON CONFLICT(clip_id) DO UPDATE SET bookmarked=excluded.bookmarked", (clip_id,int(value)))
 
     def overview(self, compact=False):
-        jobs = self.jobs(10)
+        jobs = self.jobs(OVERVIEW_JOB_LIMIT)
         if compact:
             # Only the collector/resume endpoint needs the checkpoint traversal history.
             for job in jobs:
@@ -565,7 +581,7 @@ class Database:
             SUM(a.inclusion_status='excluded') AS excluded,COUNT(DISTINCT NULLIF(a.song_group,'')) AS song_groups,
             SUM(COALESCE(u.bookmarked,0)) AS bookmarked
             FROM parts p JOIN annotations a ON p.id=a.clip_id LEFT JOIN user_state u ON p.id=u.clip_id WHERE p.active=1""")
-        return {**{k: v or 0 for k,v in counts.items()}, "uploaders": self.all("SELECT uploader_uid AS uid,uploader_name AS name,COUNT(*) AS submissions FROM videos GROUP BY uploader_uid ORDER BY uploader_name"), "sources": self.sources(include_status=True), "jobs": jobs}
+        return {**{k: v or 0 for k,v in counts.items()}, "uploaders": self.all("SELECT uploader_uid AS uid,uploader_name AS name,COUNT(*) AS submissions FROM videos GROUP BY uploader_uid ORDER BY uploader_name"), "sources": self.sources(include_status=True, recent_jobs=jobs), "jobs": jobs}
 
     def job(self, job_id):
         row = self.one("SELECT * FROM sync_jobs WHERE id=?", (job_id,))

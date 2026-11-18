@@ -37,6 +37,7 @@ class Page:
     bvids: list[str]
     has_more: bool
     total: int | None = None
+    resource_ids: list[str] | None = None
 
 
 def numeric_id(value) -> str:
@@ -260,6 +261,7 @@ class BilibiliAdapter:
         kind = source["source_type"]
         uid, collection = source.get("uid"), source.get("collection_id")
         size = 30
+        resource_ids = None
         try:
             if kind == 'songlist':
                 bvids = list(dict.fromkeys(row['bvid'] for row in await self.get_songlist() if row['bvid']))
@@ -284,8 +286,23 @@ class BilibiliAdapter:
                 info = data["info"]
                 if str(info["upper"]["mid"]) != str(uid) or str(info["id"]) != str(collection):
                     raise UpstreamError("identity", "Favorites owner or ID mismatch")
-                # Favorites may contain articles/audio; only videos have type 2.
-                rows = [r for r in data.get("medias") or [] if r.get("type") == 2]
+                # A page of articles or audio advances the folder cursor too.
+                # Keep its resource IDs for loop detection; only collect videos.
+                entries = data.get("medias")
+                if entries is None:
+                    entries = []
+                if not isinstance(entries, list):
+                    raise UpstreamError("schema", "Favorites media list format changed")
+                rows, resource_ids = [], []
+                for entry in entries:
+                    if not isinstance(entry, dict) or type(entry.get("type")) is not int:
+                        raise UpstreamError("schema", "Favorites media type missing")
+                    if entry["type"] == 2:
+                        rows.append(entry)
+                        resource_ids.append(entry["bvid"])
+                    else:
+                        resource_ids.append(f"{entry['type']}:{numeric_id(entry.get('id'))}")
+                resource_ids = list(dict.fromkeys(resource_ids))
                 total, more = int(info["media_count"]), bool(data["has_more"])
             elif kind == "search":
                 data = await self.signed("/x/web-interface/wbi/search/type", {"search_type": "video", "keyword": source["query"], "page": page, "page_size": 20, "order": "pubdate"})
@@ -297,6 +314,6 @@ class BilibiliAdapter:
                 raise ValueError("Unsupported source type")
             if not isinstance(rows, list) or any(not BVID.fullmatch(str(r.get("bvid", ""))) for r in rows):
                 raise UpstreamError("schema", "Enumeration returned invalid video identities")
-            return Page(list(dict.fromkeys(r["bvid"] for r in rows)), more, total)
+            return Page(list(dict.fromkeys(r["bvid"] for r in rows)), more, total, resource_ids)
         except (KeyError, TypeError, ValueError) as exc:
             raise UpstreamError("schema", f"{kind} pagination format changed ({type(exc).__name__})") from None

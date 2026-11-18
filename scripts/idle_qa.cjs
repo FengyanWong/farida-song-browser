@@ -80,6 +80,12 @@ async function until(test) {
     await page.evaluate(()=>window.changeVisible(true));await page.clock.runFor(20);
     await until(()=>overviews>before && clips>beforeClips);
     await until(async()=>await page.locator('#job-banner').isVisible());
+    const unchangedRows=clips;
+    await page.evaluate(()=>{window.firstCatalogRow=document.querySelector('#clip-rows tr');});
+    const activePolls=overviews;
+    await page.clock.runFor(1600);await until(()=>overviews>activePolls);await delay(150);
+    assert.equal(clips,unchangedRows);
+    assert.equal(await page.evaluate(()=>window.firstCatalogRow===document.querySelector('#clip-rows tr')),true);
     const during=overviews;active=false;
     await page.clock.runFor(1700);await until(()=>overviews>during);
     await until(async()=>!(await page.locator('#job-banner').isVisible()));
