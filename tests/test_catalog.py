@@ -62,6 +62,17 @@ def test_performer_aliases_find_original_spelling(db, source, video, performer):
         assert db.clips(q=query, status="all")["total"] == 2
 
 
+@pytest.mark.parametrize("performer", ["Ｆａｒｅｅｄａ", "法里達", "Farida", "法里达"])
+def test_performer_spellings_identify_singing_but_discovery_still_requires_both_tags(video, source, performer):
+    video.update(title=f"{performer} 翻唱《团圆》", desc="", pages=video["pages"][:1])
+    assert classify(video, video["pages"][0], [], source)[1] == "included"
+    discovery = {**source, "source_type": "search", "required_tags": ["法里达", "直播切片"]}
+    assert classify(video, video["pages"][0], ["直播切片"], discovery)[1] == "needs_review"
+    assert classify(video, video["pages"][0], ["法里达", "直播切片"], discovery)[1] == "included"
+    video["title"] = f"{performer} 聊天"
+    assert classify(video, video["pages"][0], [], source)[1] == "excluded"
+
+
 def test_latin_spaces_punctuation_and_sort_entire_set(db,source,video):
     for index,title in enumerate(["Zulu","Ain't No Sunshine","Abba"],1):
         sample=deepcopy(video);sample["bvid"]=f"BV{index:010d}";sample["pages"]=sample["pages"][:1]
@@ -202,6 +213,16 @@ def test_english_performer_alias_matches_both_scripts(db,source,video):
     ("BV1br4y1R7BP", [1, 2]),
     (" https://www.bilibili.com/video/BV1br4y1R7BP/?p=2&from=share ", [2]),
     ("https://m.bilibili.com/video/BV1br4y1R7BP?share_source=copy#details", [1, 2]),
+    ("【【法里达】歌曲分享-哔哩哔哩】 https://www.bilibili.com/video/BV1br4y1R7BP/?p=2&from=share", [2]),
+    ("【歌曲分享】\r\nhttps://m.bilibili.com/video/BV1br4y1R7BP/?p=2#details", [2]),
+    ("【歌曲分享】https://www.bilibili.com/video/BV1br4y1R7BP", [1, 2]),
+    ("【歌曲分享】 https://m.bilibili.com.evil.example/video/BV1br4y1R7BP/?p=2", []),
+    ("【歌曲分享】 https://www.bilibili.com@evil.example/video/BV1br4y1R7BP/?p=2", []),
+    ("【歌曲分享】 https://b23.tv/short", []),
+    ("【歌曲分享】 https://www.bilibili.com/video/BV1br4y1R7BP?p=1&p=2", []),
+    ("【歌曲分享】 https://www.bilibili.com/video/BV1br4y1R7BP https://m.bilibili.com/video/BV1br4y1R7BP?p=2", []),
+    ("【https://example.com/歌曲】 https://www.bilibili.com/video/BV1br4y1R7BP?p=2", []),
+    ("未加括号的标题 https://www.bilibili.com/video/BV1br4y1R7BP?p=2", []),
     ("https://www.bilibili.com/video/BV1br4y1R7BP?p=0", []),
     ("https://www.bilibili.com/video/BV1br4y1R7BP?p=1&p=2", []),
     ("https://example.com/video/BV1br4y1R7BP", []),

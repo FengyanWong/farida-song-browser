@@ -36,7 +36,8 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
       if(url.pathname.startsWith('/api/auth'))return route.fulfill({json:{state:'connected',stored:true,account:{uid:'123',name:'歌单搜索测试'},message:''}});
       if(url.pathname==='/api/play-queue')return route.fulfill({json:{items:useFullQueue?all:fixtures}});
       if(/^\/api\/playlists\/\d+$/.test(url.pathname)&&route.request().method()==='GET'){
-        const response=await route.fetch(),result=await response.json();
+        const response=await route.fetch();if(!response.ok())return route.fulfill({response});
+        const result=await response.json();
         result.items=result.items.map(item=>({...item,...fixtureById.get(item.id),playback_url:item.id===fixtures[2].id?null:item.playback_url}));return route.fulfill({response,json:result});
       }
       if(/^\/api\/clips\/[^/]+\/play$/.test(url.pathname)){
@@ -236,6 +237,77 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.equal((await(await fetch(base+'/api/playlists/'+savedId)).json()).name,'第二版');
     assert.equal(await unloadGuarded(),false);
     pass('Edits made while saving remain open for a second save; both submissions retain the same playlist ID');
+    const second=await context.newPage();
+    second.on('pageerror',error=>errors.push(error.message));
+    try {
+      await second.goto(base);await second.locator('#clip-rows tr').first().waitFor();
+      const detail=async id=>(await(await fetch(base+'/api/playlists/'+id)).json());
+      const openEditor=async(tab,id)=>{
+        await tab.locator('#playlist-select').selectOption(String(id));
+        await tab.locator('#playlist-edit').click();await tab.locator('#playlist-dialog').waitFor();
+      };
+      const saveEditor=async tab=>{
+        await tab.locator('#playlist-save-button').click();
+        await tab.locator('#playlist-dialog').waitFor({state:'hidden'});
+      };
+      const readIds=list=>list.items.map(item=>item.id);
+      const before=await detail(savedId), draftOrder=readIds(before);
+      [draftOrder[0],draftOrder[1]]=[draftOrder[1],draftOrder[0]];
+      await openEditor(page,savedId);await openEditor(second,savedId);
+      await nameInput.fill('我保留的草稿');await editor.locator('[data-item="0"][data-move="1"]').click();
+      await second.locator('#playlist-name').fill('另一个页面已保存');await second.locator('#playlist-items [data-remove="0"]').click();
+      await saveEditor(second);
+      await page.locator('#playlist-save-button').click();await page.locator('#playlist-save-copy').waitFor();
+      assert.match(await page.locator('#playlist-error').textContent(),/本页修改已保留/);
+      assert.equal(await nameInput.inputValue(),'我保留的草稿');assert.equal(await unloadGuarded(),true);
+      assert.deepEqual(readIds(await detail(savedId)),readIds(before).slice(1));
+      assert.ok(await editor.evaluate(el=>el.scrollWidth<=el.clientWidth));
+      await page.locator('#playlist-save-copy').click();await editor.waitFor({state:'hidden'});
+      const copyId=await page.locator('#playlist-select').inputValue();assert.notEqual(copyId,savedId);
+      const copy=await detail(copyId);assert.equal(copy.name,'我保留的草稿');assert.deepEqual(readIds(copy),draftOrder);
+      assert.equal((await detail(savedId)).name,'另一个页面已保存');
+      pass('Two editors preserve the first saved change; the second can explicitly save its full draft as a selected new playlist with its name and song order intact');
+
+      await openEditor(page,savedId);await nameInput.fill('待放弃的草稿');await openEditor(second,savedId);
+      await second.locator('#playlist-name').fill('载入这一版');await saveEditor(second);
+      await Promise.all([respond('confirm',true),page.locator('#playlist-delete').click()]);
+      await page.locator('#playlist-reload').waitFor();assert.equal((await detail(savedId)).name,'载入这一版');
+      await Promise.all([respond('confirm',false),page.locator('#playlist-reload').click()]);
+      assert.equal(await nameInput.inputValue(),'待放弃的草稿');
+      await Promise.all([respond('confirm',true),page.locator('#playlist-reload').click()]);
+      await until(async()=>await nameInput.inputValue()==='载入这一版');
+      assert.equal(await unloadGuarded(),false);assert.equal(await page.locator('#playlist-save-copy').isVisible(),false);
+      await nameInput.fill('载入后保存');await saveEditor(page);assert.equal((await detail(savedId)).name,'载入后保存');
+      pass('A stale Delete preserves the stored playlist; reloading requires explicit confirmation and adopts the current revision for the next Save');
+
+      await openEditor(page,savedId);await openEditor(second,savedId);await nameInput.fill('已删除原件的草稿');
+      second.once('dialog',dialog=>dialog.accept());await second.locator('#playlist-delete').click();
+      await second.locator('#playlist-dialog').waitFor({state:'hidden'});
+      await page.locator('#playlist-save-button').click();await page.locator('#playlist-reload').click();
+      await until(async()=>(await page.locator('#playlist-error').textContent()).includes('已被删除'));
+      assert.equal(await page.locator('#playlist-reload').isVisible(),false);
+      assert.equal(await nameInput.inputValue(),'已删除原件的草稿');await page.locator('#playlist-save-copy').click();
+      await editor.waitFor({state:'hidden'});
+      const recoveredId=await page.locator('#playlist-select').inputValue();
+      assert.equal((await detail(recoveredId)).name,'已删除原件的草稿');
+
+      let releaseDelete,announceDelete;
+      const deleteHeld=new Promise(resolve=>{releaseDelete=resolve;}),deleteStarted=new Promise(resolve=>{announceDelete=resolve;});
+      await openEditor(page,recoveredId);
+      await page.route('**/api/playlists/'+recoveredId,async route=>{
+        const result=await route.fetch();announceDelete();await deleteHeld;await route.fulfill({response:result});
+      },{times:1});
+      await Promise.all([respond('confirm',true),page.locator('#playlist-delete').click()]);await deleteStarted;
+      await Promise.all([respond('confirm',true),close.last().click()]);
+      await page.locator('#playlist-new').click();await nameInput.fill('新的编辑器');
+      const lateDelete=page.waitForResponse(r=>r.request().method()==='DELETE'&&r.url().endsWith('/'+recoveredId));
+      releaseDelete();await (await lateDelete).finished();await page.evaluate(()=>new Promise(requestAnimationFrame));
+      assert.equal(await nameInput.inputValue(),'新的编辑器');assert.equal(await editor.isVisible(),true);
+      assert.equal(await page.locator('#playlist-save-copy').isVisible(),false);
+      await Promise.all([respond('confirm',true),close.last().click()]);
+      await until(async()=>await page.locator('#playlist-select option[value="'+recoveredId+'"]').count()===0);
+      pass('A remotely deleted original can still be copied; a delayed Delete response leaves a newly opened draft intact');
+    } finally {await second.close();}
     const resolver='**/api/playlists/resolve-links';
     let lookups=0;
     page.on('request',request=>{if(new URL(request.url()).pathname==='/api/playlists/resolve-links')lookups++;});

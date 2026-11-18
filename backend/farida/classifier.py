@@ -1,12 +1,16 @@
 import re
 import unicodedata
 
-VERSION = "rules-3"
+VERSION = "rules-4"
 SINGING_COLLECTION_TYPES = frozenset({"season", "series", "favorites"})
 
 
 def normalize(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value or "").casefold().split())
+
+
+def normalize_performer(value: str) -> str:
+    return normalize(value).replace("fareeda", "法里达").replace("farida", "法里达").replace("法里達", "法里达")
 
 
 def is_singing_collection(source):
@@ -17,9 +21,9 @@ def is_singing_collection(source):
 def classify(video, part, tags, source, *, curated_song=None):
     title = video["title"]
     part_title = part.get("part", "")
-    context = normalize(" ".join([title, video.get("desc", ""), *tags]))
+    context = normalize_performer(" ".join([title, video.get("desc", ""), *tags]))
     local = normalize(part_title if len(video["pages"]) > 1 else title)
-    performer = any(alias in context for alias in ("法里达", "farida"))
+    performer = "法里达" in context
     collection = is_singing_collection(source)
     music_pattern = r"歌切|翻唱|直播翻唱|清唱|弹唱|演唱|合唱|歌回|唱歌|纯享|cover|acoustic|歌曲|音乐合集|歌单"
     music = bool(re.search(music_pattern, normalize(title + " " + part_title + " " + " ".join(tags)))) or bool(collection)

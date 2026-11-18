@@ -1,5 +1,7 @@
+import hashlib
 import json
 import re
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -7,7 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from .adapter import BVID, parse_source, validated_video, video_has_uploader
-from .classifier import SINGING_COLLECTION_TYPES, classify, is_singing_collection, normalize
+from .classifier import SINGING_COLLECTION_TYPES, classify, is_singing_collection, normalize, normalize_performer
 from .songlist import CURATOR, URL as SONGLIST_URL
 
 
@@ -16,12 +18,25 @@ VIDEO_LINK = re.compile(
     r"(?:\?([^#\s]*))?(?:#[^\s]*)?"
 )
 
+SHARE_TEXT = re.compile(r"【([^\r\n]+)】[ \t　]*(?:\r?\n[ \t　]*)?(https?://\S+)")
+LINK_IN_TITLE = re.compile(r"://|(?:bilibili\.com|b23\.tv)/", re.IGNORECASE)
+
 
 def video_reference(query):
-    """Recognize a local catalog lookup by BV ID or standard Bilibili video URL."""
+    """Recognize a BV ID, a Bilibili video URL, or a titled clipboard share."""
+    if len(query) > 2048:
+        return None
     query = query.strip()
     if BVID.fullmatch(query):
         return query, None
+    if query.startswith("【"):
+        # Only unwrap the bounded share format; ordinary text remains a catalog search.
+        wrapped = SHARE_TEXT.fullmatch(query)
+        if not wrapped:
+            return None
+        title, query = wrapped.groups()
+        if not title.strip() or LINK_IN_TITLE.search(title) or query.count("://") != 1:
+            return None
     match = VIDEO_LINK.fullmatch(query)
     if not match:
         return None
@@ -33,6 +48,23 @@ def video_reference(query):
     if len(parts) != 1 or not re.fullmatch(r"[0-9]{1,9}", parts[0]):
         return bvid, 0
     return bvid, int(parts[0])
+
+
+def pasted_video_references(links):
+    index = 0
+    while index < len(links):
+        line = links[index].strip()
+        index += 1
+        # The playlist textarea sends one item per line, including a separate share caption.
+        if line.startswith("【") and line.endswith("】") and index < len(links):
+            next_line = links[index].strip()
+            if next_line.startswith(("https://", "http://")):
+                pair = video_reference(line + "\n" + next_line)
+                if pair and pair[1] != 0:
+                    index += 1
+                    yield pair
+                    continue
+        yield video_reference(line)
 
 
 def now():
@@ -169,10 +201,6 @@ DETAIL_COLUMNS = """p.*,v.description,v.tags,v.availability_status,v.verificatio
 CLIP_SELECT = "SELECT " + DETAIL_COLUMNS + CLIP_FROM
 
 
-def search_text(value):
-    return normalize(value).replace("fareeda", "法里达").replace("farida", "法里达").replace("法里達", "法里达")
-
-
 def upload_boundary(value, *, end):
     # The GUI sends precise local-day boundaries. Date-only API clients use UTC days.
     if isinstance(value, datetime):
@@ -200,6 +228,15 @@ def clip_order(sort):
     return columns[sort] + ", p.video_bvid, p.part_number"
 
 
+class PlaylistConflict(Exception):
+    """The saved playlist changed or was deleted after an editor opened it."""
+
+
+def playlist_revision(playlist, clip_ids):
+    fields = [playlist["id"], playlist["created_at"], playlist["updated_at"], playlist["name"], clip_ids]
+    return hashlib.sha256(encode(fields).encode("utf-8")).hexdigest()
+
+
 class Database:
     def __init__(self, path):
         self.path = Path(path)
@@ -210,7 +247,7 @@ class Database:
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
         con.create_function("fold", 1, normalize, deterministic=True)
-        con.create_function("search_text", 1, search_text, deterministic=True)
+        con.create_function("search_text", 1, normalize_performer, deterministic=True)
         try:
             with con:
                 yield con
@@ -485,7 +522,11 @@ class Database:
         if status != "all":
             clauses.append("a.inclusion_status=?")
             args.append(status)
+        if len(q) > 2048:
+            raise ValueError("搜索内容最多 2,048 个字符。请缩短分享文字或删除链接中的跟踪参数，并保留分 P 参数。")
         reference = video_reference(q) if q else None
+        if len(q) > 500 and (not reference or reference[1] == 0):
+            raise ValueError("普通搜索最多 500 个字符。较长的输入须为有效的哔哩哔哩视频链接或分享文本。")
         if reference:
             bvid, part = reference
             clauses.append("v.bvid=?")
@@ -494,7 +535,7 @@ class Database:
                 clauses.append("p.part_number=?")
                 args.append(part)
         elif q:
-            folded = search_text(q)
+            folded = normalize_performer(q)
             folded = folded.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             clauses.append("search_text(a.display_song_title || ' ' || a.song_group || ' ' || v.raw_title || ' ' || p.raw_part_title || ' ' || v.uploader_name || ' ' || v.tags) LIKE ? ESCAPE '\\'")
             args.append("%" + folded + "%")
@@ -632,8 +673,7 @@ class Database:
     def resolve_playlist_links(self, links):
         targets = {}
         invalid = duplicates = 0
-        for link in links:
-            reference = video_reference(link)
+        for reference in pasted_video_references(links):
             if reference is None or reference[1] == 0:
                 invalid += 1
                 continue
@@ -673,29 +713,62 @@ class Database:
         return self.all('SELECT l.*,COUNT(i.clip_id) AS count FROM playlists l LEFT JOIN playlist_items i '
                         'ON i.playlist_id=l.id GROUP BY l.id ORDER BY l.updated_at DESC,l.id DESC')
 
-    def playlist(self, playlist_id):
-        result = self.one('SELECT * FROM playlists WHERE id=?', (playlist_id,))
-        if not result:
+    @staticmethod
+    def _read_playlist(con, playlist_id):
+        row = con.execute('SELECT * FROM playlists WHERE id=?', (playlist_id,)).fetchone()
+        if row is None:
             raise KeyError(playlist_id)
-        result['items'] = self.all(QUEUE_SELECT +
-            ' JOIN playlist_items pi ON pi.clip_id=p.id WHERE pi.playlist_id=? ORDER BY pi.position', (playlist_id,))
+        result = dict(row)
+        result['items'] = [dict(item) for item in con.execute(QUEUE_SELECT +
+            ' JOIN playlist_items pi ON pi.clip_id=p.id WHERE pi.playlist_id=? ORDER BY pi.position,pi.clip_id', (playlist_id,))]
+        result['revision'] = playlist_revision(row, [item['id'] for item in result['items']])
         return result
 
-    def save_playlist(self, name=None, clip_ids=None, playlist_id=None):
-        if name is not None:
-            name = name.strip()
-            if not 1 <= len(name) <= 80:
-                raise ValueError('歌单名称需要 1–80 个字符。')
+    def playlist(self, playlist_id):
         with self.connect() as con:
+            con.execute('BEGIN')
+            return self._read_playlist(con, playlist_id)
+
+    @staticmethod
+    def _check_playlist_revision(con, playlist_id, expected_revision):
+        if expected_revision is None:
+            return
+        row = con.execute('SELECT * FROM playlists WHERE id=?', (playlist_id,)).fetchone()
+        if row is None:
+            raise PlaylistConflict()
+        ids = [item[0] for item in con.execute(
+            'SELECT clip_id FROM playlist_items WHERE playlist_id=? ORDER BY position,clip_id', (playlist_id,))]
+        if playlist_revision(row, ids) != expected_revision:
+            raise PlaylistConflict()
+
+    def save_playlist(self, name=None, clip_ids=None, playlist_id=None, *, expected_revision=None):
+        with self.connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            if playlist_id is not None:
+                self._check_playlist_revision(con, playlist_id, expected_revision)
+            if name is not None:
+                name = name.strip()
+                if not 1 <= len(name) <= 80:
+                    raise ValueError('歌单名称需要 1–80 个字符。')
+            stamp = datetime.now(timezone.utc).isoformat(timespec='microseconds')
             if playlist_id is None:
                 if not name:
                     raise ValueError('请输入歌单名称。')
-                playlist_id = con.execute('INSERT INTO playlists(name,created_at,updated_at) VALUES(?,?,?)',
-                                          (name, now(), now())).lastrowid
-            elif not con.execute('SELECT 1 FROM playlists WHERE id=?', (playlist_id,)).fetchone():
-                raise KeyError(playlist_id)
-            if name is not None:
-                con.execute('UPDATE playlists SET name=? WHERE id=?', (name, playlist_id))
+                # SQLite can reuse a deleted rowid while the Windows clock is still on the same tick.
+                # Keep IDs exact in JavaScript when creating an independent playlist.
+                for _ in range(8):
+                    playlist_id = 1 + secrets.randbelow(2**53 - 1)
+                    inserted = con.execute('INSERT INTO playlists(id,name,created_at,updated_at) VALUES(?,?,?,?) '
+                                           'ON CONFLICT(id) DO NOTHING', (playlist_id, name, stamp, stamp))
+                    if inserted.rowcount:
+                        break
+                else:
+                    raise ValueError('暂时无法创建歌单，请重试。')
+            else:
+                updated = con.execute('UPDATE playlists SET name=COALESCE(?,name),updated_at=? WHERE id=?',
+                                      (name, stamp, playlist_id))
+                if not updated.rowcount:
+                    raise KeyError(playlist_id)
             if clip_ids is not None:
                 ids = list(dict.fromkeys(clip_ids))
                 missing = con.execute(
@@ -708,11 +781,12 @@ class Database:
                 con.execute('DELETE FROM playlist_items WHERE playlist_id=?', (playlist_id,))
                 con.executemany('INSERT INTO playlist_items(playlist_id,clip_id,position) VALUES(?,?,?)',
                                 [(playlist_id, clip_id, position) for position, clip_id in enumerate(ids)])
-            con.execute('UPDATE playlists SET updated_at=? WHERE id=?', (now(), playlist_id))
-        return self.playlist(playlist_id)
+            return self._read_playlist(con, playlist_id)
 
-    def delete_playlist(self, playlist_id):
+    def delete_playlist(self, playlist_id, *, expected_revision=None):
         with self.connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            self._check_playlist_revision(con, playlist_id, expected_revision)
             if not con.execute('DELETE FROM playlists WHERE id=?', (playlist_id,)).rowcount:
                 raise KeyError(playlist_id)
 

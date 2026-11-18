@@ -109,6 +109,18 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     assert.equal(queries.filter(q=>q==='同一首歌').length,1);
     pass('Chinese input composition issues a single search for the confirmed text');
     const wanted=fixture.ids[0],bvid=wanted.split(':')[0];
+    const longLink='【分享歌曲】 https://m.bilibili.com/video/'+bvid+'/?tracking='+'x'.repeat(600)+'&p=2';
+    await search.focus();await search.press('Control+a');await page.keyboard.insertText(longLink);
+    await until(()=>queries.includes(longLink));
+    // This fixture has only P1, so losing the P2 suffix would show the wrong recording.
+    await until(async()=>await page.locator('#clip-rows [data-play]').count()===0);
+    assert.equal(await search.inputValue(),longLink);
+    const overlong=longLink.replace('tracking=', 'tracking='+'x'.repeat(2048));
+    await search.press('Control+a');await page.keyboard.insertText(overlong);
+    await until(async()=>(await page.locator('#notice').textContent()).includes('2,048'));
+    assert.equal(await search.inputValue(),overlong);
+    assert.equal(queries.includes(overlong),false);
+    pass('Long Bilibili share text retains its P2 suffix and overlength input stays editable with a clear error');
     const canonical='https://www.bilibili.com/video/'+bvid+'/?p=1';
     await page.locator('#search').fill(canonical+'&share_source=copy');
     await until(async()=>{
@@ -159,7 +171,17 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await until(async()=>await page.locator('#page-number').textContent()==='3 / 3');
     assert.equal(await page.locator('#clip-rows [data-select]').first().evaluate(el=>el===document.activeElement),true);
     await page.locator('#clip-rows [data-select]').first().check();
+    const firstDocument=await page.evaluate(()=>performance.timeOrigin);
+    const initialLength=await page.evaluate(()=>history.length);
     await page.locator('[data-view=sources]').click();
+    await page.locator('[data-view=sources]').click();
+    assert.equal(await page.evaluate(()=>history.length),initialLength+1);
+    await page.goBack();await page.locator('#catalog-view').waitFor({state:'visible'});
+    assert.equal(await page.locator('#page-number').textContent(),'3 / 3');
+    assert.equal(await page.locator('#clip-rows [data-select]').first().isChecked(),true);
+    await page.goForward();await page.locator('#sources-view').waitFor({state:'visible'});
+    assert.equal(await page.evaluate(()=>performance.timeOrigin),firstDocument);
+    pass('Browser Back and Forward switch between the two app tabs, preserving page and selection without restarting the app');
     await page.locator('[data-view=catalog]').click();
     await until(async()=>await page.locator('#page-number').textContent()==='3 / 3');
     assert.equal(await page.locator('#clip-rows [data-select]').first().isChecked(),true);

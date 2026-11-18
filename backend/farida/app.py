@@ -24,7 +24,7 @@ from .config import Settings
 from . import __version__
 from .resources import resource_root
 from .auth import BilibiliLogin
-from .db import Database, PLAYER_STATE_SQL
+from .db import Database, PLAYER_STATE_SQL, PlaylistConflict
 from .sync import Collector
 from .lifetime import WindowLifetime
 from .playback import Playback
@@ -232,6 +232,11 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     async def missing(request,exc):
         return JSONResponse({"detail":"未找到此记录"},status_code=404)
 
+    @app.exception_handler(PlaylistConflict)
+    async def playlist_conflict(request, exc):
+        return JSONResponse({"detail": "歌单已修改或删除，请重新载入后再操作。"}, status_code=409,
+                            headers={"X-Farida-Error": "playlist_conflict"})
+
     @app.exception_handler(sqlite3.IntegrityError)
     async def conflict(request,exc):
         return JSONResponse({"detail":"此来源已存在，或另一个采集任务正在运行"},status_code=409)
@@ -331,8 +336,8 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
 
     @app.get("/api/clips")
     def clips(q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: CatalogDate | None=None,before: CatalogDate | None=None,bookmarked: bool=False,sort: CatalogSort="newest",page: int=1,page_size: int=40,grouped: bool=False,compact: bool=False):
-        if page < 1 or not 1 <= page_size <= 100 or len(q)>500:
-            raise ValueError("分页、日期范围或搜索参数无效")
+        if page < 1 or not 1 <= page_size <= 100:
+            raise ValueError("分页参数无效")
         query = db.grouped_clips if grouped else db.clips
         return query(q=q,status=status,source_id=source_id,uploader=uploader,after=after,before=before,bookmarked=bookmarked,sort=sort,page=page,page_size=page_size,compact=compact)
 
@@ -340,8 +345,6 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     def play_queue(q: str='', status: Literal['included','excluded','needs_review','all']='included', source_id: int | None=None,
                    uploader: str | None=None, after: CatalogDate | None=None, before: CatalogDate | None=None, bookmarked: bool=False,
                    sort: CatalogSort='newest'):
-        if len(q) > 500:
-            raise ValueError('日期范围或搜索参数无效')
         return {'items': db.playback_queue(q=q, status=status, source_id=source_id, uploader=uploader,
                                           after=after, before=before, bookmarked=bookmarked, sort=sort)}
 
@@ -375,12 +378,13 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         return db.playlist(playlist_id)
 
     @app.patch('/api/playlists/{playlist_id}')
-    def edit_playlist(playlist_id: int, body: PlaylistUpdate):
-        return db.save_playlist(body.name, body.clip_ids, playlist_id)
+    def edit_playlist(playlist_id: int, body: PlaylistUpdate, request: Request):
+        return db.save_playlist(body.name, body.clip_ids, playlist_id,
+                                expected_revision=request.headers.get('X-Farida-Playlist-Revision'))
 
     @app.delete('/api/playlists/{playlist_id}')
-    def remove_playlist(playlist_id: int):
-        db.delete_playlist(playlist_id)
+    def remove_playlist(playlist_id: int, request: Request):
+        db.delete_playlist(playlist_id, expected_revision=request.headers.get('X-Farida-Playlist-Revision'))
         return {'deleted': True}
 
     @app.post('/api/clips/{clip_id}/play')
@@ -497,8 +501,6 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
 
     @app.get("/api/export")
     def export(format: Literal["json","csv"]="csv",q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: CatalogDate | None=None,before: CatalogDate | None=None,bookmarked: bool=False,sort: CatalogSort="newest"):
-        if len(q)>500:
-            raise ValueError("无效的筛选条件")
         filters = dict(q=q, status=status, source_id=source_id, uploader=uploader,
                        after=after, before=before, bookmarked=bookmarked, sort=sort)
         if format == "json":

@@ -47,6 +47,40 @@ def test_real_target_opening_and_export(settings,video):
         assert client.get('/api/clips/'+target['id']).json()['statistics']['favorite'] is None
 
 
+def test_long_share_reference_selects_the_requested_part_everywhere(settings, video):
+    import csv
+    import io
+
+    app, _ = client_app(settings)
+    with TestClient(app) as client:
+        db = app.state.db
+        db.save_video(db.source(1), video, [])
+        prefix = f'https://www.bilibili.com/video/{video["bvid"]}/?share='
+        long_url = prefix + "x" * 580 + "&p=2"
+        suffix = "】 " + long_url
+        at_limit = "【" + "🎵" * (2047 - len(suffix)) + suffix
+        assert len(at_limit) == 2048
+
+        for endpoint, params in (("/api/clips", {}), ("/api/clips", {"grouped": True}),
+                                 ("/api/play-queue", {}), ("/api/export", {"format": "json"}),
+                                 ("/api/export", {"format": "csv"})):
+            for query in (long_url, "【歌曲】 " + long_url, at_limit):
+                reply = client.get(endpoint, params={**params, "q": query})
+                assert reply.status_code == 200, reply.text
+                if params.get("format") == "csv":
+                    rows = list(csv.DictReader(io.StringIO(reply.content.decode("utf-8-sig"))))
+                else:
+                    payload = reply.json()
+                    rows = payload if isinstance(payload, list) else payload["items"]
+                assert [int(row["part_number"]) for row in rows] == [2]
+
+            for query, message in ((at_limit.replace("【", "【a", 1), "2,048"), ("字"*501, "500"),
+                                   (long_url + "&p=1", "有效"), (long_url.replace("bilibili.com", "example.com"), "有效")):
+                reply = client.get(endpoint, params={**params, "q": query})
+                assert reply.status_code == 400 and message in reply.json()["detail"]
+            assert client.get(endpoint, params={**params, "q": "字"*500}).status_code == 200
+
+
 def test_local_upload_day_matches_catalog_groups_queue_and_exports(settings, video):
     from datetime import datetime
 

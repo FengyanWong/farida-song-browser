@@ -40,7 +40,7 @@ const accountLogin = new AccountLogin(api, async()=>{
   notice('');
   if(initialViewReady)await refresh();
 });
-const playlistPlayer = new PlaylistPlayer(api, parameters, selectedClips, ()=>accountLogin.canCollect() && !state.stopping);
+const playlistPlayer = new PlaylistPlayer(api, requestParameters, selectedClips, ()=>accountLogin.canCollect() && !state.stopping);
 const miniPlayer = new MiniPlayer(playlistPlayer);
 connectMediaControls(playlistPlayer);
 async function quitApp() {
@@ -68,7 +68,11 @@ async function quitApp() {
 $$('[data-quit-app]').forEach(button=>button.onclick=quitApp);
 $('#shutdown-dialog').addEventListener('cancel',event=>event.preventDefault());
 document.addEventListener('farida-auth-change',()=>{renderJob();if(!accountLogin.canCollect())playlistPlayer.stop(accountLogin.loggingOut);else playlistPlayer.updateResumeButton();if(state.view==='sources')renderSources();});
+const searchLimitMessage = '搜索内容最多 2,048 个字符。请缩短分享文字或删除链接中的跟踪参数，并保留分 P 参数。';
 function parameters() {
+  const query = $('#search').value;
+  // Browser lengths count UTF-16 code units; the API limits Unicode characters.
+  if (query.length > 2048 && (query.length > 4096 || [...query].length > 2048)) return null;
   const result=new URLSearchParams({status:state.filter==='bookmarked'?'all':state.filter,sort:$('#sort').value,page:state.page,page_size:state.pageSize});
   const inputs={q:'#search',source_id:'#source-filter',uploader:'#uploader-filter'};
   for(const [key,selector] of Object.entries(inputs)) if($(selector).value) result.set(key,$(selector).value);
@@ -87,8 +91,16 @@ function parameters() {
   if(state.grouped)result.set('grouped','true');
   return result;
 }
-function saveRoute() {
-  history.replaceState(null,'',`#${state.view}${state.filter==='included'?'':`?filter=${state.filter}`}`);
+function requestParameters() {
+  const params = parameters();
+  if (!params) throw new Error(searchLimitMessage);
+  return params;
+}
+function saveRoute(rememberView=false) {
+  const hash='#'+state.view+(state.filter==='included'?'':'?filter='+state.filter);
+  if(location.hash===hash)return;
+  if(rememberView)history.pushState(null,'',hash);
+  else history.replaceState(null,'',hash);
 }
 function readRoute() {
   const [view,query]=location.hash.slice(1).split('?');
@@ -99,7 +111,7 @@ function readRoute() {
   }
   setView(view);
 }
-function setView(view) {
+function setView(view, rememberView=false) {
   if(!['catalog','sources'].includes(view))view='catalog';
   state.view=view;closePageJump();
   $$('.nav-item').forEach(el=>{el.classList.toggle('active',el.dataset.view===view);if(el.dataset.view===view)el.setAttribute('aria-current','page');else el.removeAttribute('aria-current');});
@@ -107,7 +119,7 @@ function setView(view) {
   $('#page-title').innerHTML=e(names[view])+'<span class="title-dot">.</span>';
   $('#catalog-view').hidden=view==='sources';$('#sources-view').hidden=view!=='sources';
   $('#clip-filter').value=state.filter;$('#export-button').hidden=view==='sources';
-  saveRoute();renderJob();
+  saveRoute(rememberView);renderJob();
   if(view==='sources'){renderSources();accountLogin.refresh();}else loadClips();
 }
 function optionList(selector, rows, getValue, getLabel, first) {
@@ -144,6 +156,7 @@ async function loadOverview() {
 }
 let displayedCatalogScope, catalogLoadError;
 function catalogScope(params) {
+  if (!params) return null;
   const scope=new URLSearchParams(params);
   scope.delete('page');
   return scope.toString();
@@ -181,6 +194,7 @@ async function loadClips() {
   const request=++state.request, params=parameters(), scope=catalogScope(params);
   guardCatalogResults(scope);
   try {
+    if (!params) throw new Error(searchLimitMessage);
     params.set('compact','true');
     const result=await api('/api/clips?'+params);
     if (request!==state.request || scope!==catalogScope(parameters())) return;
@@ -478,7 +492,7 @@ document.addEventListener('click',async event=>{
   const button=event.target.closest('button,a');if(!button || button.disabled)return;
   try {
     if(button.matches('.close-dialog'))button.closest('dialog').close();
-    if(button.dataset.view)setView(button.dataset.view);
+    if(button.dataset.view)setView(button.dataset.view,true);
     if(button.dataset.group!==undefined){
       const group=state.clips.groups[Number(button.dataset.group)];
       state.expandedGroups.has(group.key)?state.expandedGroups.delete(group.key):state.expandedGroups.add(group.key);
@@ -609,7 +623,17 @@ $('#page-jump').onfocusout=event=>{
   if(!$('#page-jump').contains(event.relatedTarget))closePageJump();
 };
 $('#sync-button').onclick=()=>startSync();$('#first-scan').onclick=()=>startSync();$('#full-scan').onclick=()=>startSync('full');
-$('#export-button').onclick=()=>{const params=parameters();params.delete('page');params.delete('page_size');location.href='/api/export?'+params;};
+$('#export-button').onclick=async()=>{
+  const params=parameters();
+  if (!params) { notice(searchLimitMessage,true); return; }
+  const scope=catalogScope(params);
+  // A long query may be a valid video reference. Confirm it before starting a download.
+  if (params.get('q')?.length>500 && scope!==displayedCatalogScope) {
+    await loadClips();
+    if (scope!==displayedCatalogScope || scope!==catalogScope(parameters())) return;
+  }
+  params.delete('page');params.delete('page_size');location.href='/api/export?'+params;
+};
 $('#add-source').onclick=()=>showSource();
 $('#source-form').onsubmit=async event=>{
   event.preventDefault();$('#source-form-error').textContent='';
@@ -618,7 +642,7 @@ $('#source-form').onsubmit=async event=>{
   if(state.editSource && data.url===state.editSource.canonical_url)delete data.url;
   try{await api('/api/sources'+(state.editSource?'/'+state.editSource.id:''),{method:state.editSource?'PATCH':'POST',body:JSON.stringify(data)});$('#source-dialog').close();await loadOverview();toast('来源已保存。');}catch(error){$('#source-form-error').textContent=error.message;}
 };
-document.addEventListener('keydown',event=>{if(event.key==='/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName) && !document.querySelector('dialog[open]')){event.preventDefault();if(state.view==='sources')setView('catalog');$('#search').focus();}});
+document.addEventListener('keydown',event=>{if(event.key==='/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName) && !document.querySelector('dialog[open]')){event.preventDefault();if(state.view==='sources')setView('catalog',true);$('#search').focus();}});
 window.addEventListener('hashchange',readRoute);
 async function poll() {
   if (state.stopping || document.hidden || polling) return;
