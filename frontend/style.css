@@ -46,3 +46,13 @@
   font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
 }
 .playlist-import-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 9px; margin: 7px 0; }
+
+.source-card .missing-links-open { margin-left: 8px; }
+.missing-links-credit { margin: 0 0 10px; font-size: 12px; }
+#missing-links-list { list-style: none; margin: 0; padding: 0; max-height: min(48vh, 28rem); overflow: auto; }
+#missing-links-list li { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; padding: 8px 3px; border-bottom: 1px solid var(--line); }
+#missing-links-list li > span { flex: 1 1 8rem; min-width: 0; overflow-wrap: anywhere; }
+#missing-links-list strong, #missing-links-list small { display: block; }
+#missing-links-list strong { font-weight: 500; font-size: 13px; }
+#missing-links-list small, #missing-links-list a { font-size: 11px; }
+.missing-links-footer { margin-top: 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }

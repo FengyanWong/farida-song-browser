@@ -251,15 +251,17 @@ function renderClips() {
 }
 function errorText(error) {
   if(!error)return '';
-  if(error.category==='restricted')return 'B站暂时限制访问，采集已暂停。已保存的歌曲仍可使用。请稍后点击「继续任务」；若登录已失效，可在右上角重新登录。';
+  const retry=Number.isFinite(Date.parse(error.retry_at)) ?
+    `来源建议在 ${dateTime(error.retry_at,true)}（本机时间）后点击「继续任务」。` : '请稍后点击「继续任务」。';
+  if(error.category==='restricted')return 'B站暂时限制访问，采集已暂停。已保存的歌曲仍可使用。'+retry;
   if(error.category==='authentication')return '登录已失效，请在右上角账号菜单重新登录后再采集。';
   if(error.category==='network')return '无法连接来源网站。请检查网络后点击「继续任务」，已保存的歌曲不会丢失。';
   if(error.category==='pagination')return '分页未完整结束；已保存进度，尚不能确认完整覆盖。';
   if(error.category==='identity')return '返回的身份与配置不一致，请检查来源 UID。';
   if(error.category==='video_identity')return '某条投稿的主投稿人或联合创作者未能与来源核对，已保存进度。';
   if(error.category==='schema')return '来源网站返回的数据格式有变化，已保留采集进度。若持续失败，需要更新应用。';
-  if(error.category==='server')return '来源网站暂时不可用，请稍后点击「继续任务」。';
-  if(error.category==='retry_later')return '来源网站要求稍后重试，采集已暂停。请稍后点击「继续任务」。';
+  if(error.category==='server')return '来源网站暂时不可用。'+retry;
+  if(error.category==='retry_later')return '来源网站要求稍后重试，采集已暂停。'+retry;
   if(error.category==='internal')return '本地采集出现错误，已保存进度。可重新启动应用，或查看使用说明中的排查方法。';
   return error.message || '采集未完成，已保存进度。';
 }
@@ -289,8 +291,9 @@ function renderJob() {
 }
 function collectionStatus(source) {
   const status=source.collection_status||{state:'idle'};
-  const names={idle:'尚未采集',queued:'等待采集',running:'正在采集',completed:'更新完成',paused:status.error?.category==='authentication'?'需要重新登录':status.error?.category==='restricted'?'访问受限，已暂停':'采集已暂停',failed:'未完成',cancelled:'已取消',interrupted:'上次采集中断',not_started:'本次尚未执行'};
-  const detail=status.state==='not_started'?'任务在前序来源停止，此来源未开始采集。':status.state==='queued'?'等待前序来源完成。':status.state==='running'?`已检查 ${status.processed} 个视频${status.current_page?` · 第 ${status.current_page} 页`:''}`:'';
+  const indexReady=source.source_type==='songlist' && !!status.index_fetched_at;
+  const names={idle:'尚未采集',queued:indexReady?'等待补全视频':'等待采集',running:'正在采集',completed:'更新完成',paused:status.error?.category==='authentication'?'需要重新登录':status.error?.category==='restricted'?'访问受限，已暂停':'采集已暂停',failed:'未完成',cancelled:'已取消',interrupted:'上次采集中断',not_started:indexReady?'视频资料待补全':'本次尚未执行'};
+  const detail=status.state==='not_started'?(indexReady?'整理歌单已更新。继续任务后会检查 B 站视频资料。':'任务在前序来源停止，此来源未开始采集。'):status.state==='queued'?'等待前序来源完成。':status.state==='running'?`已检查 ${status.processed} 个视频${status.current_page?` · 第 ${status.current_page} 页`:''}`:'';
   const scope=source.source_type==='search'?'标签搜索仅检查限定页数，不代表全部视频。':status.mode==='incremental'&&source.source_type!=='songlist'?'本次检查最近投稿，完整历史需使用「完整扫描」。':'';
   const counted=status.added_clips!=null;
   const additions=counted?`新增 ${status.added_clips} 个片段 · 其中 ${status.added_included||0} 个已收录${status.skipped?` · 跳过 ${status.skipped} 个不可访问视频`:''}`:status.last_attempt_at?'旧任务未记录新增数':'';
@@ -309,11 +312,64 @@ function renderSources() {
     const verified=source.verification_status==='verified',search=source.source_type==='search',curated=source.source_type==='songlist';
     const skipped=skippedVideos({checkpoints:{[source.id]:{unavailable:source.collection_status?.unavailable||[]}}});
     const subtitle=curated?'CLANNADOR 整理':search?'法里达 + 直播切片':`UID ${e(source.uid)}`;
-    const dates=curated?`${source.listed_songs || 0} 首歌 · ${source.linked_songs || 0} 个 BV 链接<br>歌单读取：${dateTime(source.list_fetched_at)}<br>每次更新重读歌单，补齐新增视频。<br><a href="https://fareeda.songlist.cc/" target="_blank" rel="noopener noreferrer">查看原歌单 ↗</a>`:search?`上次标签发现：${dateTime(source.last_discovery_at)}<br>仅保留实际标签同时匹配的歌唱内容；其他候选待确认。`:`完整扫描：${source.last_complete_scan_at?dateTime(source.last_complete_scan_at):'尚未完成'}<br>最近更新：${dateTime(source.last_refresh_at)}`;
+    const dates=curated?`${source.listed_songs || 0} 首歌 · ${source.linked_songs || 0} 个 BV 链接<br>歌单读取：${dateTime(source.collection_status?.index_fetched_at || source.list_fetched_at)}<br>每次更新重读歌单，补齐新增视频。<br><a href="https://fareeda.songlist.cc/" target="_blank" rel="noopener noreferrer">查看原歌单 ↗</a><button type="button" class="text-button missing-links-open" data-missing-links="${e(source.id)}" aria-haspopup="dialog" aria-controls="missing-links-dialog">查看待补全链接</button>`:search?`上次标签发现：${dateTime(source.last_discovery_at)}<br>仅保留实际标签同时匹配的歌唱内容；其他候选待确认。`:`完整扫描：${source.last_complete_scan_at?dateTime(source.last_complete_scan_at):'尚未完成'}<br>最近更新：${dateTime(source.last_refresh_at)}`;
     return `<article class="source-card ${source.enabled?'':'disabled'}"><div class="source-card-top"><span class="source-avatar">${search?icon('search'):e(source.display_name[0])}</span><div><h3>${e(source.display_name)}</h3><small>${subtitle}${source.resolved_name && source.resolved_name!==source.display_name?` · 当前名称 ${e(source.resolved_name)}`:''}</small></div>${!search&&!curated?`<button class="icon-button" data-edit-source="${source.id}" title="编辑来源" aria-label="编辑 ${e(source.display_name)}" ${active?'disabled':''}>${icon('settings')}</button>`:''}</div><div class="source-meta"><span class="badge">${sourceTypes[source.source_type]}</span><span class="badge ${verified?'ok':'warn'}">${curated?(verified?'歌单已读取':'等待读取'):search?'有限搜索发现':verified?'身份已核对':'身份待核对'}</span>${!source.enabled?'<span class="badge muted">已停用</span>':''}</div><div class="source-stats"><span>${source.submissions} 个原视频</span><span>${source.entries} 个片段</span></div><div class="source-dates">${dates}</div>${collectionStatus(source)}${skipped}${source.collection_status?.error?`<div class="source-error">${e(errorText(source.collection_status.error))}</div>`:''}<div class="source-actions">${source.collection_status?.can_resume?`<button class="button small" data-resume="${e(source.collection_status.job_id)}" ${active||!source.enabled?'disabled':''}>继续任务</button>`:''}<button class="button small" data-scan-source="${source.id}" ${active||!source.enabled?'disabled':''}>${curated?'更新歌单':search?'发现片段':'采集更新'}</button>${!search&&!curated?`<button class="button small" data-full-source="${source.id}" ${active||!source.enabled?'disabled':''}>完整扫描</button>`:''}<button class="text-button" data-toggle-source="${source.id}" ${active?'disabled':''}>${source.enabled?'停用':'启用'}</button></div></article>`;
   }).join('');
   $('#job-history').innerHTML=state.overview.jobs.length?state.overview.jobs.map(job=>`<div class="history-item"><span class="badge ${job.state==='completed'?'ok':job.state==='running'?'':'warn'}">${labels[job.state] || e(job.state)}</span><span>${job.mode==='full'?'完整采集':'最近更新'} · ${job.processed} 个视频 · ${jobAdditions(job)}</span><span class="history-time">${dateTime(job.started_at)}</span>${['failed','paused','interrupted','cancelled'].includes(job.state)?`<button class="button small" data-resume="${e(job.id)}" ${active?'disabled':''}>继续任务</button>`:''}${job.errors.length?`<div class="history-error">${e(errorText(job.errors[0]))}</div>`:''}${skippedVideos(job)}</div>`).join(''):'<div class="history-empty">还没有采集记录</div>';
 }
+let missingLinksView;
+const missingLinksDialog=$('#missing-links-dialog');
+function openMissingLinks(sourceId) {
+  missingLinksView?.controller.abort();
+  missingLinksView={sourceId,after:0,count:0,loading:false,controller:new AbortController()};
+  $('#missing-links-list').replaceChildren();
+  $('#missing-links-more').hidden=true;
+  missingLinksDialog.showModal();
+  loadMissingLinks();
+}
+async function loadMissingLinks() {
+  const view=missingLinksView;
+  if (!view || view.loading || view.after===null) return;
+  const more=$('#missing-links-more'), status=$('#missing-links-status'), list=$('#missing-links-list');
+  view.loading=true;
+  more.setAttribute('aria-disabled','true');
+  status.textContent='正在读取本机歌单…';
+  try {
+    const page=await api(`/api/sources/${view.sourceId}/missing-links?after_id=${view.after}&limit=40`,{signal:view.controller.signal});
+    if (view!==missingLinksView || !missingLinksDialog.open) return;
+    const previous=view.count;
+    // Each songlist entry is independent, even if other entries share its title or BV.
+    const rows=page.items.map(song=>`<li><span><strong>${e(song.song_title||song.bvid)}</strong>${song.original_artist?`<small class="muted">原唱：${e(song.original_artist)}</small>`:''}</span><a href="${e(song.url)}" target="_blank" rel="noopener noreferrer" aria-label="打开原视频 ${e(song.bvid)}">${e(song.bvid)} ↗</a></li>`);
+    list.insertAdjacentHTML('beforeend',rows.join(''));
+    view.count+=page.items.length;
+    view.after=page.next_after_id;
+    status.textContent=view.count?`已显示 ${view.count} 条`:'当前没有待补全的链接。';
+    if (document.activeElement===more) {
+      const firstNew=list.children[previous]?.querySelector('a');
+      (firstNew || missingLinksDialog.querySelector('.close-dialog')).focus();
+    }
+    more.hidden=view.after===null;
+    more.textContent='加载更多';
+  } catch(error) {
+    if (view!==missingLinksView || !missingLinksDialog.open || error.name==='AbortError') return;
+    status.textContent=error.message;
+    more.hidden=false;
+    more.textContent='重试';
+  } finally {
+    view.loading=false;
+    if (view===missingLinksView) more.removeAttribute('aria-disabled');
+  }
+}
+$('#missing-links-more').onclick=loadMissingLinks;
+missingLinksDialog.addEventListener('close',()=>{
+  if (missingLinksDialog.open || !missingLinksView) return;
+  const {sourceId,controller}=missingLinksView;
+  controller.abort();
+  missingLinksView=null;
+  $('#missing-links-list').replaceChildren();
+  if (state.view==='sources' && document.activeElement===document.body)
+    $(`[data-missing-links="${sourceId}"]`)?.focus({preventScroll:true});
+});
 async function startSync(mode='incremental',sourceIds=[]) {
   try {notice('');await api('/api/sync',{method:'POST',body:JSON.stringify({mode,source_ids:sourceIds})});await loadOverview();toast('采集任务已启动，内容会逐条保存。');}
   catch(error){notice(error.message,true);if(error.status===401)await accountLogin.requireLogin();}
@@ -406,6 +462,7 @@ document.addEventListener('click',async event=>{
     }
     if(button.dataset.cancel){await api(`/api/sync/${button.dataset.cancel}/cancel`,{method:'POST'});await loadOverview();}
     if(button.dataset.resume){notice('');await api(`/api/sync/${button.dataset.resume}/resume`,{method:'POST'});await loadOverview();}
+    if(button.dataset.missingLinks)openMissingLinks(button.dataset.missingLinks);
     if(button.dataset.scanSource)await startSync('incremental',[Number(button.dataset.scanSource)]);
     if(button.dataset.fullSource)await startSync('full',[Number(button.dataset.fullSource)]);
     if(button.dataset.editSource)showSource(state.overview.sources.find(s=>s.id===Number(button.dataset.editSource)));

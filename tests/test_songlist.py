@@ -1,9 +1,10 @@
+import asyncio
 from copy import deepcopy
 
 import httpx
 import pytest
 
-from farida.adapter import BilibiliAdapter, UpstreamError, parse_source
+from farida.adapter import BilibiliAdapter, Page, UpstreamError, parse_source
 from farida.db import Database
 from farida.session import SessionStore
 from farida.songlist import ENDPOINT, URL, parse_songlist
@@ -181,3 +182,122 @@ async def test_resume_replays_completed_pages_skips_private_video_and_finishes(d
     row = db.clip('BV0000000000:100')
     assert row['bookmarked'] and row['display_song_title'] == '保留我的名称'
     assert db.clip(private + ':100') is None
+
+
+async def test_all_sources_update_public_index_before_bilibili_pauses(db, settings, video):
+    curated = next(source for source in db.sources() if source['source_type'] == 'songlist')
+    calls = []
+    def handler(request):
+        calls.append(str(request.url))
+        if str(request.url) == ENDPOINT:
+            assert 'cookie' not in request.headers
+            return httpx.Response(200, json=payload(video, name='新收录曲目'))
+        assert request.url.path == '/x/web-interface/nav'
+        return httpx.Response(429)
+
+    worker = Collector(db, settings, lambda _: BilibiliAdapter(settings, transport=httpx.MockTransport(handler)))
+    job_id = worker.start([], 'incremental')['id']
+    await worker.task
+    job = db.job(job_id)
+    assert calls == [ENDPOINT, 'https://api.bilibili.com/x/web-interface/nav']
+    assert job['state'] == 'paused' and job['errors'][0]['http_status'] == 429
+    assert db.one("SELECT song_title FROM curated_songs WHERE source_id=? AND id=1", (curated['id'],))['song_title'] == '新收录曲目'
+    assert job['checkpoints'][str(curated['id'])]['state'] == 'pending'
+    assert db.source(curated['id'])['last_refresh_at'] is None
+    assert db.overview()['submissions'] == 0
+
+
+@pytest.mark.parametrize('index_error', [False, True])
+async def test_index_fetched_once_and_video_requests_follow_selected_order(db, settings, video, index_error):
+    curated = next(source for source in db.sources() if source['source_type'] == 'songlist')
+    db.save_songlist(curated, parse_songlist(payload(video, name='原歌单')))
+    calls = []
+    def handler(request):
+        if str(request.url) == ENDPOINT:
+            calls.append('index')
+            if index_error:
+                return httpx.Response(503)
+            return httpx.Response(200, json=payload(video))
+        path = request.url.path
+        if path == '/x/web-interface/nav':
+            data = {'wbi_img': {'img_url':'https://test.invalid/'+'a'*32+'.png', 'sub_url':'https://test.invalid/'+'b'*32+'.png'}}
+        elif path == '/x/space/wbi/acc/info':
+            mid = request.url.params['mid']
+            calls.append('profile:'+mid)
+            data = {'mid':int(mid), 'name':'测试'}
+        elif path == '/x/space/wbi/arc/search':
+            calls.append('uploads:'+request.url.params['mid'])
+            data = {'list':{'vlist':[]}, 'page':{'count':0}}
+        elif path == '/x/web-interface/view':
+            calls.append('video')
+            data = video
+        elif path == '/x/tag/archive/tags':
+            calls.append('tags')
+            data = [{'tag_name':'法里达'}]
+        else:
+            raise AssertionError(path)
+        return httpx.Response(200, json={'code':0, 'data':data})
+
+    worker = Collector(db, settings, lambda _: BilibiliAdapter(settings, transport=httpx.MockTransport(handler)))
+    job_id = worker.start([2, curated['id'], 1], 'incremental')['id']
+    await worker.task
+    job = db.job(job_id)
+    expected_calls = ['index','profile:210887872','uploads:210887872']
+    if index_error:
+        assert job['state'] == 'failed' and job['errors'][0]['category'] == 'songlist'
+        assert db.one('SELECT song_title FROM curated_songs WHERE source_id=? AND id=1', (curated['id'],))['song_title'] == '原歌单'
+    else:
+        expected_calls += ['video','tags']
+        assert job['state'] == 'completed' and db.source(curated['id'])['submissions'] == 1
+    assert calls == expected_calls + ['profile:394803911','uploads:394803911']
+    if index_error:
+        index_error = False
+        calls.clear()
+        worker.resume(job_id)
+        await worker.task
+        assert db.job(job_id)['state'] == 'completed'
+        assert calls == ['index', 'video', 'tags']
+
+
+@pytest.mark.parametrize('patch', [{'enabled':False}, {'url':'https://space.bilibili.com/987654'}])
+async def test_source_changes_after_read_skip_video_lookup(db, settings, video, patch):
+    curated = next(source for source in db.sources() if source['source_type'] == 'songlist')
+    adapter = BilibiliAdapter(settings, transport=httpx.MockTransport(lambda _: httpx.Response(200,json=payload(video))))
+    resolve = adapter.resolve_source
+    listed = []
+    async def resolve_source(source):
+        if source['id'] == curated['id']:
+            return await resolve(source)
+        db.update_source(curated['id'], dict(patch))
+        return {'uid':source['uid'], 'name':'测试', 'method':'fixture'}
+    async def list_entries(source, page):
+        listed.append(source['id'])
+        return Page([],False,0)
+    adapter.resolve_source = resolve_source
+    adapter.list_entries = list_entries
+    worker = Collector(db, settings, lambda _: adapter)
+    job_id = worker.start([1, curated['id']], 'incremental')['id']
+    await worker.task
+    job = db.job(job_id)
+    assert job['errors'][0]['category'] == 'source_changed' and job['state'] == 'failed'
+    assert listed == [1] and db.source(curated['id'])['last_error'] is None
+
+
+async def test_cancel_during_public_fetch_preserves_the_previous_index(db, settings, video):
+    curated = next(source for source in db.sources() if source['source_type'] == 'songlist')
+    db.save_songlist(curated, parse_songlist(payload(video, name='原歌单')))
+    started = asyncio.Event()
+    calls = []
+    async def handler(request):
+        calls.append(str(request.url))
+        started.set()
+        await asyncio.Event().wait()
+
+    worker = Collector(db, settings, lambda _: BilibiliAdapter(settings, transport=httpx.MockTransport(handler)))
+    job_id = worker.start([], 'incremental')['id']
+    await asyncio.wait_for(started.wait(), 2)
+    worker.cancel(job_id)
+    await worker.task
+    assert calls == [ENDPOINT]
+    assert db.job(job_id)['state'] == 'cancelled'
+    assert db.one('SELECT song_title FROM curated_songs WHERE id=1')['song_title'] == '原歌单'

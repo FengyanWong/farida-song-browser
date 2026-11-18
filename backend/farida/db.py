@@ -8,7 +8,7 @@ from urllib.parse import parse_qs
 
 from .adapter import BVID, parse_source, validated_video, video_has_uploader
 from .classifier import classify, normalize
-from .songlist import URL as SONGLIST_URL
+from .songlist import CURATOR, URL as SONGLIST_URL
 
 
 VIDEO_LINK = re.compile(
@@ -146,7 +146,7 @@ CURATED_CREDIT = "EXISTS(SELECT 1 FROM curated_songs cs WHERE cs.bvid=v.bvid) AS
 
 
 def songlist_credit(present):
-    return ("CLANNADOR", SONGLIST_URL) if present else ("", "")
+    return (CURATOR, SONGLIST_URL) if present else ("", "")
 
 
 # Both catalog views display the original upload, membership credit, and bookmark.
@@ -265,6 +265,8 @@ class Database:
         if not job:
             return result
         cp = job['checkpoints'].get(str(source['id']), {})
+        if cp.get('index_fetched_at'):
+            result['index_fetched_at'] = cp['index_fetched_at']
         phase = cp.get('state')
         active = job['state'] in {'queued', 'running'}
         if phase == 'completed':
@@ -315,6 +317,37 @@ class Database:
 
     def verified_source(self, source_id, identity):
         self.execute("UPDATE sources SET resolved_name=?,verified_uid=?,verification_status='verified',verification_method=?,last_error=NULL WHERE id=?", (identity["name"],identity["uid"],identity["method"],source_id))
+
+    def missing_songlist_links(self, source_id, after_id=0, limit=40):
+        if not 1 <= limit <= 100 or not 0 <= after_id < 2**63:
+            raise ValueError("歌单链接的分页参数无效。")
+        if not 0 < source_id < 2**63:
+            raise KeyError(source_id)
+        items = []
+        next_after_id = None
+        with self.connect() as con:
+            con.execute("BEGIN")
+            source = con.execute("SELECT source_type FROM sources WHERE id=?", (source_id,)).fetchone()
+            if source is None:
+                raise KeyError(source_id)
+            if source["source_type"] != "songlist":
+                raise ValueError("此来源不是整理歌单。")
+            rows = con.execute(
+                "SELECT c.id,c.song_title,c.original_artist,c.bvid FROM curated_songs c "
+                "WHERE c.source_id=? AND c.id>? AND c.bvid IS NOT NULL "
+                "AND NOT EXISTS(SELECT 1 FROM videos v WHERE v.bvid=c.bvid) ORDER BY c.id",
+                (source_id, after_id),
+            )
+            for row in rows:
+                bvid = row["bvid"]
+                # A restored legacy row must still be a real BV identifier before becoming a link.
+                if not isinstance(bvid, str) or not BVID.fullmatch(bvid):
+                    continue
+                if len(items) == limit:
+                    next_after_id = items[-1]["id"]
+                    break
+                items.append({**dict(row), "url": f"https://www.bilibili.com/video/{bvid}/"})
+        return {"items": items, "next_after_id": next_after_id, "attribution": CURATOR, "source_url": SONGLIST_URL}
 
     def save_songlist(self, source, rows):
         stamp = now()

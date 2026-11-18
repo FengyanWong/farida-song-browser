@@ -8,7 +8,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
@@ -24,12 +24,39 @@ MIXIN_ORDER = (46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,1
 
 
 class UpstreamError(Exception):
-    def __init__(self, category: str, message: str, *, status=None, code=None):
+    def __init__(self, category: str, message: str, *, status=None, code=None, retry_at=None):
         super().__init__(message)
         self.category, self.status, self.code = category, status, code
+        self.retry_at = retry_at
 
     def as_dict(self):
-        return {"category": self.category, "message": str(self), "http_status": self.status, "upstream_code": self.code}
+        info = {"category": self.category, "message": str(self), "http_status": self.status, "upstream_code": self.code}
+        if self.retry_at is not None:
+            info["retry_at"] = self.retry_at
+        return info
+
+
+def retry_after(header, received):
+    """Return the requested delay and a UTC timestamp suitable for a saved job."""
+    if not header:
+        return None, None
+    value = header.strip()
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+        delay = float(value)
+        try:
+            deadline = received + timedelta(seconds=delay)
+        except OverflowError:
+            return delay, None
+    else:
+        try:
+            deadline = parsedate_to_datetime(value)
+            if deadline.tzinfo is None:
+                return None, None
+            deadline = deadline.astimezone(timezone.utc)
+            delay = (deadline - received).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return None, None
+    return max(0, delay), deadline.isoformat(timespec="seconds")
 
 
 @dataclass
@@ -163,25 +190,20 @@ class BilibiliAdapter:
                     await asyncio.sleep(2 ** attempt)
                     continue
                 raise UpstreamError("network", f"Network request failed ({type(exc).__name__})") from None
-            if response.status_code in {401,403,412,429}:
-                retry = response.headers.get("Retry-After")
-                hint = f"; Retry-After: {retry[:80]}" if retry else ""
-                raise UpstreamError("authentication" if response.status_code == 401 else "restricted", f"Bilibili restricted access (HTTP {response.status_code}){hint}. Collection stopped; retry later or sign in locally.", status=response.status_code)
-            if response.status_code >= 500:
+            if response.status_code in {401,403,412,429} or response.status_code >= 500:
+                delay, retry_at = retry_after(response.headers.get("Retry-After"), datetime.now(timezone.utc))
+                if response.status_code < 500:
+                    category = "authentication" if response.status_code == 401 else "restricted"
+                    raise UpstreamError(category, f"Bilibili restricted access (HTTP {response.status_code})",
+                                        status=response.status_code, retry_at=retry_at)
+                if delay is not None and delay > 30:
+                    raise UpstreamError("retry_later", "Bilibili requested a later retry; collection stopped",
+                                        status=response.status_code, retry_at=retry_at)
                 if attempt < 2:
-                    retry = response.headers.get("Retry-After", "")
-                    try:
-                        delay = float(retry)
-                    except ValueError:
-                        try:
-                            delay = (parsedate_to_datetime(retry) - datetime.now(timezone.utc)).total_seconds()
-                        except (ValueError, TypeError):
-                            delay = 2 ** attempt
-                    if delay > 30:
-                        raise UpstreamError("retry_later", f"Bilibili requested a later retry ({retry[:80]}); collection stopped", status=response.status_code)
-                    await asyncio.sleep(max(0, delay))
+                    await asyncio.sleep(2 ** attempt if delay is None else delay)
                     continue
-                raise UpstreamError("server", "Bilibili server unavailable after 3 attempts", status=response.status_code)
+                raise UpstreamError("server", "Bilibili server unavailable after 3 attempts",
+                                    status=response.status_code, retry_at=retry_at)
             if response.status_code != 200:
                 raise UpstreamError("http", f"Unexpected Bilibili HTTP {response.status_code}", status=response.status_code)
             try:

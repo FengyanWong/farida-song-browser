@@ -57,6 +57,7 @@ class Collector:
                 raise ValueError("来源地址已更改，请新建扫描任务")
             if cp.get("state") != "completed":
                 cp["state"] = "pending"
+                cp.pop("index_fetched_at", None)
         job.update(state="queued", errors=[], finished_at=None)
         try:
             self.db.save_job(job)
@@ -116,6 +117,23 @@ class Collector:
             await asyncio.sleep(10)
             self.db.execute("UPDATE sync_jobs SET heartbeat=? WHERE id=? AND state='running'", (now(),job_id))
 
+    def _selected_source(self, source_id, expected_url):
+        source = self.db.source(source_id)
+        if not source or not source["enabled"]:
+            raise UpstreamError("source_changed", "采集来源已停用或不存在。")
+        if expected_url and source["canonical_url"] != expected_url:
+            raise UpstreamError("source_changed", "采集来源地址已更改，请重新更新。")
+        return source
+
+    def _save_public_index(self, source, songs, job, cp):
+        self.db.save_songlist(source, songs)
+        # The public index can be reordered between attempts. Replay its current
+        # BV list when this source reaches its normal turn for video metadata.
+        current_ids = {row["bvid"] for row in songs if row["bvid"]}
+        seen = sorted(set(cp["seen"]) & current_ids)
+        cp.update(page=1, page_hashes={}, seen=seen, processed=len(seen), state="pending", index_fetched_at=now())
+        job["processed"] = sum(checkpoint.get("processed", 0) for checkpoint in job["checkpoints"].values())
+
     async def run(self, job_id):
         job = self.db.job(job_id)
         job["state"] = "running"
@@ -124,38 +142,50 @@ class Collector:
         pulse = asyncio.create_task(self.heartbeat(job_id))
         try:
             adapter = self.adapter_factory(self.settings)
-            for source_id in job["source_ids"]:
+            # The independently hosted song index can update even if an uploader
+            # later hits a Bilibili limit. Keep all BV lookups in the chosen order.
+            public_ids = {row["id"] for row in self.db.all("SELECT id FROM sources WHERE source_type='songlist'")}
+            stages = [(sid, True) for sid in job["source_ids"] if sid in public_ids]
+            stages.extend((sid, False) for sid in job["source_ids"])
+            for source_id, index_only in stages:
                 self.check_cancel(job)
-                source = self.db.source(source_id)
-                cp = job["checkpoints"].setdefault(str(source_id), {"page":1,"seen":[],"page_hashes":{},"state":"pending","processed":0,"unavailable":[],"source_url":source["canonical_url"],"added_clips":0,"added_included":0})
-                if cp["state"] == "completed":
+                cp = job["checkpoints"].setdefault(str(source_id), {"page":1,"seen":[],"page_hashes":{},"state":"pending","processed":0,"unavailable":[],"added_clips":0,"added_included":0})
+                if cp["state"] in {"completed", "failed"}:
                     continue
                 cp["state"] = "running"
                 cp["attempted_at"] = now()
                 cp.pop("finished_at", None)
                 self.db.save_job(job)
                 try:
-                    identity = await adapter.resolve_source(source)
-                    if source['source_type'] == 'songlist':
-                        self.db.save_songlist(source, identity['songs'])
-                        # The public index can be reordered between runs. Replay
-                        # it from the beginning and retain only current BV IDs.
-                        current_ids = {row['bvid'] for row in identity['songs'] if row['bvid']}
-                        cp.update(page=1, page_hashes={}, seen=sorted(set(cp['seen']) & current_ids))
-                        cp['processed'] = len(cp['seen'])
-                        job['processed'] = sum(c.get('processed', 0) for c in job['checkpoints'].values())
-                    self.db.verified_source(source_id, identity)
-                    source = self.db.source(source_id)
-                    await self.scan_source(adapter, source, job, cp)
+                    source = self._selected_source(source_id, cp.get("source_url"))
+                    cp.setdefault("source_url", source["canonical_url"])
+                    if (source["source_type"] == "songlist") != (source_id in public_ids):
+                        raise UpstreamError("source_changed", "采集来源类型已更改，请重新更新。")
+                    if index_only or source_id not in public_ids:
+                        identity = await adapter.resolve_source(source)
+                        self.check_cancel(job)
+                        if not self.db.one("SELECT id FROM sources WHERE id=? AND canonical_url=? AND enabled=1",
+                                           (source_id, cp["source_url"])):
+                            raise UpstreamError("source_changed", "采集来源已更改或停用，请重新更新。")
+                        if index_only:
+                            self._save_public_index(source, identity["songs"], job, cp)
+                        self.db.verified_source(source_id, identity)
+                        if not index_only:
+                            # Classification uses the freshly verified collection identity.
+                            source = self._selected_source(source_id, cp["source_url"])
+                    if not index_only:
+                        await self.scan_source(adapter, source, job, cp)
                 except UpstreamError as exc:
                     cp["state"] = "failed"
                     cp["finished_at"] = now()
                     error = {"source_id":source_id, **exc.as_dict()}
-                    job["errors"].append(error)
-                    self.db.execute("UPDATE sources SET last_error=? WHERE id=?", (encode(error),source_id))
-                    if exc.category in {"restricted","retry_later","authentication"}:
+                    self.db.execute("UPDATE sources SET last_error=? WHERE id=? AND canonical_url=? AND enabled=1",
+                                    (encode(error), source_id, cp.get("source_url")))
+                    if not index_only and exc.category in {"restricted","retry_later","authentication"}:
+                        job["errors"].insert(0, error)
                         job["state"] = "paused"
                         break
+                    job["errors"].append(error)
                 self.db.save_job(job)
             if job["state"] == "running":
                 job["state"] = "failed" if job["errors"] else "completed"

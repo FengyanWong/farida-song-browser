@@ -443,6 +443,10 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     def sources():
         return db.sources()
 
+    @app.get("/api/sources/{source_id}/missing-links")
+    def missing_links(source_id: int, after_id: int=0, limit: int=40):
+        return db.missing_songlist_links(source_id, after_id, limit)
+
     @app.post("/api/sources",status_code=201)
     def add_source(body: SourceCreate):
         return db.add_source(body.display_name,body.url,body.singing_collection)

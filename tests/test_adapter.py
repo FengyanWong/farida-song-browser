@@ -73,3 +73,36 @@ async def test_changed_response_is_not_empty_success(settings):
     with pytest.raises(UpstreamError) as error:await adapter.list_entries({"source_type":"season","uid":"1","collection_id":"2"},1)
     assert error.value.category=="schema"
     await adapter.close()
+
+
+def test_retry_after_handles_seconds_dates_missing_and_unrepresentable_deadlines():
+    from datetime import datetime, timezone
+    from farida.adapter import retry_after
+
+    received = datetime(2026, 9, 6, 10, 0, tzinfo=timezone.utc)
+    expected = (90, '2026-09-06T10:01:30+00:00')
+    assert retry_after('90', received) == expected
+    assert retry_after('Sun, 06 Sep 2026 10:01:30 GMT', received) == expected
+    assert retry_after('Sun, 06 Sep 2026 09:00:00 GMT', received)[0] == 0
+    for invalid in (None, '', '-2', 'broken', 'nan'):
+        assert retry_after(invalid, received) == (None, None)
+    delay, deadline = retry_after('9' * 100, received)
+    assert delay > 30 and deadline is None
+
+
+@pytest.mark.parametrize('status,category', [(429,'restricted'), (503,'retry_later')])
+async def test_explicit_retry_time_is_saved_without_a_second_request(settings, status, category):
+    calls = []
+    def limited(request):
+        calls.append(request.url.path)
+        return httpx.Response(status, headers={'Retry-After': 'Sun, 06 Sep 2099 10:01:30 GMT'})
+    adapter = BilibiliAdapter(settings, transport=httpx.MockTransport(limited))
+    try:
+        with pytest.raises(UpstreamError) as error:
+            await adapter.request('/test')
+        details = error.value.as_dict()
+        assert details['retry_at'] == '2099-09-06T10:01:30+00:00'
+        assert details['category'] == category
+        assert calls == ['/test']
+    finally:
+        await adapter.close()

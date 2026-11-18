@@ -25,7 +25,7 @@ class StartupAdapter:
 
     async def resolve_source(self, source):
         self.resolved.append(source['id'])
-        if self.restricted:
+        if self.restricted and source['source_type'] != 'songlist':
             raise UpstreamError('restricted', 'Synthetic restriction', code=-352)
         return {'uid': source['uid'], 'name': source['display_name'], 'method': 'test_fixture', 'songs': []}
 
@@ -37,7 +37,7 @@ class StartupAdapter:
         self.closed = True
 
 
-@pytest.mark.parametrize('disabled', [None, 1, 'all'])
+@pytest.mark.parametrize('disabled', [None, 1, 6, 'all'])
 async def test_startup_scans_enabled_sources_once_without_page_triggers(settings, disabled):
     db = Database(settings.db_path)
     db.initialize()
@@ -72,7 +72,7 @@ async def test_startup_scans_enabled_sources_once_without_page_triggers(settings
                 for path in ['/', '/api/session', '/api/overview', '/api/clips']:
                     assert (await client.get(path)).status_code == 200
         assert len(db.jobs()) == (1 if enabled else 0)
-        assert adapter.resolved == enabled
+        assert adapter.resolved == [sid for sid in enabled if sid == 6] + [sid for sid in enabled if sid != 6]
 
 
 async def test_startup_restriction_stops_all_sources_and_is_not_retried_on_reload(settings):
@@ -85,14 +85,14 @@ async def test_startup_restriction_stops_all_sources_and_is_not_retried_on_reloa
         job = db.jobs()[0]
         assert job['state'] == 'paused'
         assert job['errors'][0]['upstream_code'] == -352
-        assert adapter.resolved == [job['source_ids'][0]]
+        assert adapter.resolved == [6, job['source_ids'][0]]
         assert adapter.listed == []
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://testserver') as client:
             await client.get('/')
             await client.get('/api/session')
             assert (await client.get('/api/overview')).json()['jobs'][0]['state'] == 'paused'
         assert len(db.jobs()) == 1
-        assert adapter.resolved == [job['source_ids'][0]]
+        assert adapter.resolved == [6, job['source_ids'][0]]
 
 
 async def test_signed_out_startup_makes_no_upstream_requests_and_rejects_collect_and_resume(settings):
@@ -162,7 +162,7 @@ async def test_qr_login_releases_one_startup_scan_even_with_repeated_tab_polls(s
         jobs = app.state.db.jobs()
         assert len(jobs) == 1 and jobs[0]['state'] == 'completed'
         assert jobs[0]['source_ids'] == [1,2,3,4,5,6]
-        assert adapter.resolved == [1,2,3,4,5,6]
+        assert adapter.resolved == [6,1,2,3,4,5]
 
 
 async def test_expired_login_blocks_manual_scan_after_previous_success(settings):

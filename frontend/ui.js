@@ -44,9 +44,11 @@ export function toast(message, link) {
   }
   el.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => el.hidden = true, link ? 15000 : 4000);
 }
-const displayTime = new Intl.DateTimeFormat('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
-export function dateTime(value) {
+const dateOptions = {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false};
+const displayTime = new Intl.DateTimeFormat('zh-CN', dateOptions);
+const preciseTime = new Intl.DateTimeFormat('zh-CN', {...dateOptions,second:'2-digit'});
+export function dateTime(value, seconds=false) {
   if (!value) return '尚无记录';
   const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? '未知时间' : displayTime.format(date);
+  return Number.isNaN(date.valueOf()) ? '未知时间' : (seconds ? preciseTime : displayTime).format(date);
 }

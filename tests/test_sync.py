@@ -334,3 +334,19 @@ async def test_favorites_cursor_uses_all_resources_but_only_collects_videos(db, 
         assert job["errors"][0]["category"] == "pagination"
         assert "/x/web-interface/view" not in calls
         assert db.source(source["id"])["last_refresh_at"] is None
+
+
+async def test_first_scan_of_verified_singing_collection_classifies_with_fresh_identity(db, settings, video):
+    source = db.add_source("歌唱合集", "https://space.bilibili.com/123/lists/456?type=season", singing_collection=True)
+    assert source["verification_status"] == "pending"
+    video.update(title="午夜录制", desc="", pages=video["pages"][:1])
+    adapter = FakeAdapter(video)
+    async def no_tags(bvid):
+        return []
+    adapter.get_video_tags = no_tags
+    collector = Collector(db, settings, lambda _: adapter)
+    job_id = collector.start([source["id"]], "incremental")["id"]
+    await collector.task
+    assert db.job(job_id)["state"] == "completed"
+    assert db.source(source["id"])["verification_status"] == "verified"
+    assert db.clip(video["bvid"] + ":100")["inclusion_status"] == "included"
