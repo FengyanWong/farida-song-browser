@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from .adapter import BVID, parse_source, validated_video, video_has_uploader
-from .classifier import classify, normalize
+from .classifier import SINGING_COLLECTION_TYPES, classify, normalize
 from .songlist import CURATOR, URL as SONGLIST_URL
 
 
@@ -173,6 +173,17 @@ def search_text(value):
     return normalize(value).replace("fareeda", "法里达").replace("farida", "法里达").replace("法里達", "法里达")
 
 
+def upload_boundary(value, *, end):
+    # The GUI sends precise local-day boundaries. Date-only API clients use UTC days.
+    if isinstance(value, datetime):
+        try:
+            return value.astimezone(timezone.utc).isoformat()
+        except OverflowError as exc:
+            raise ValueError("上传日期超出支持范围") from exc
+    if value is not None:
+        return str(value) + ("T23:59:59+00:00" if end else "T00:00:00+00:00")
+
+
 def clip_order(sort):
     columns = {
         "newest": "v.published_at DESC",
@@ -296,6 +307,8 @@ class Database:
     @staticmethod
     def _source_row(row):
         row = dict(row)
+        if row["source_type"] not in SINGING_COLLECTION_TYPES:
+            row["singing_collection"] = 0
         row["required_tags"] = json.loads(row["required_tags"])
         row["last_error"] = json.loads(row["last_error"]) if row["last_error"] else None
         return row
@@ -310,7 +323,7 @@ class Database:
 
     def add_source(self, name, url, singing_collection=False):
         fields = parse_source(url)
-        if fields["source_type"] == "uploader":
+        if fields["source_type"] not in SINGING_COLLECTION_TYPES:
             singing_collection = False
         source_id = self.execute("INSERT INTO sources(source_type,display_name,uid,collection_id,canonical_url,singing_collection,created_at) VALUES(?,?,?,?,?,?,?)", (fields["source_type"],name or fields["uid"],fields["uid"],fields["collection_id"],fields["canonical_url"],int(singing_collection),now()))
         return self.source(source_id)
@@ -320,7 +333,7 @@ class Database:
         url = changes.pop("url", None)
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            current = con.execute("SELECT canonical_url FROM sources WHERE id=?", (source_id,)).fetchone()
+            current = con.execute("SELECT canonical_url,source_type,singing_collection FROM sources WHERE id=?", (source_id,)).fetchone()
             if current is None:
                 raise KeyError(source_id)
             if url is not None and url.strip() != current["canonical_url"]:
@@ -332,6 +345,9 @@ class Database:
                                    last_discovery_at=None, last_error=None)
                     # Other sources and local video/user data keep their original records.
                     con.execute("DELETE FROM memberships WHERE source_id=?", (source_id,))
+            kind = changes.get("source_type", current["source_type"])
+            if kind not in SINGING_COLLECTION_TYPES and changes.get("singing_collection", current["singing_collection"]):
+                changes["singing_collection"] = 0
             if changes:
                 assignments = ",".join(key + "=?" for key in changes)
                 con.execute("UPDATE sources SET " + assignments + " WHERE id=?", [*changes.values(), source_id])
@@ -478,12 +494,15 @@ class Database:
         if uploader:
             clauses.append("v.uploader_uid=?")
             args.append(uploader)
-        if after:
+        start, end = upload_boundary(after, end=False), upload_boundary(before, end=True)
+        if start and end and start > end:
+            raise ValueError("起始上传日期不能晚于结束日期")
+        if start:
             clauses.append("v.published_at>=?")
-            args.append(str(after) + "T00:00:00+00:00")
-        if before:
+            args.append(start)
+        if end:
             clauses.append("v.published_at<=?")
-            args.append(str(before) + "T23:59:59+00:00")
+            args.append(end)
         if bookmarked:
             clauses.append("u.bookmarked=1")
         return " WHERE " + " AND ".join(clauses), args

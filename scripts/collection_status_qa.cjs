@@ -44,11 +44,33 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     const cp=(source,state)=>({state,source_url:source.canonical_url,processed:source.collection_status.processed,added_clips:source.collection_status.added_clips,added_included:source.collection_status.added_included,unavailable:source.collection_status.unavailable,current_page:source.collection_status.current_page});
     const task={id:'status-task',state:'paused',mode:'full',source_ids:[complete.id,paused.id,unstarted.id],started_at:stamp,finished_at:stamp,processed:32,cancel_requested:0,errors:[restricted],checkpoints:{[complete.id]:cp(complete,'completed'),[paused.id]:cp(paused,'failed'),[unstarted.id]:cp(unstarted,'pending')}};
     overview.jobs=[task,{...task,id:'older-stale',state:'failed',source_ids:[complete.id],errors:[],checkpoints:{[complete.id]:{state:'failed',unavailable:[{...unavailable,bvid:'BV0000000999'}]}}}];
+    let holdNextOverview=false, heldOverview=null, failNextOverview=false;
+    async function holdPoll() {
+      holdNextOverview=true;heldOverview=null;
+      await page.evaluate(()=>document.dispatchEvent(new Event('visibilitychange')));
+      await until(()=>heldOverview!==null);
+      return heldOverview;
+    }
+    async function deliver(route, response) {
+      await Promise.all([
+        page.waitForEvent('requestfinished', request=>request===route.request()),
+        route.fulfill(response),
+      ]);
+      await page.evaluate(()=>new Promise(done=>requestAnimationFrame(()=>requestAnimationFrame(done))));
+    }
     await context.route('**/*',async route=>{
       const url=new URL(route.request().url());
       if(url.origin!==base)return route.abort();
       if(url.pathname.startsWith('/api/auth'))return route.fulfill({json:{state:'connected',stored:true,account:{uid:'123',name:'采集状态测试'},message:''}});
-      if(url.pathname==='/api/overview')return route.fulfill({json:overview});
+      if(url.pathname==='/api/overview'){
+        if(holdNextOverview){holdNextOverview=false;heldOverview=route;return;}
+        if(failNextOverview){failNextOverview=false;return route.fulfill({status:503,json:{detail:'测试失败'}});}
+        return route.fulfill({json:overview});
+      }
+      if(url.pathname==='/api/sources/'+legacy.id && route.request().method()==='PATCH'){
+        legacy.enabled=route.request().postDataJSON().enabled;
+        return route.fulfill({json:legacy});
+      }
       if(url.pathname==='/api/sync/status-task/resume'){
         resumeRequests.push(url.pathname);task.state='running';task.errors=[];task.finished_at=null;
         task.checkpoints[paused.id].state='running';task.checkpoints[paused.id].current_page=3;task.processed=35;
@@ -91,22 +113,35 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.match(legacyText,/旧任务未记录新增数/);assert.doesNotMatch(legacyText,/新增 0 个片段/);
     assert.match(await text(search),/标签搜索仅检查限定页数，不代表全部视频/);
     pass('Unstarted sources are distinct from legacy unknown counts, and tag discovery explains its bounded coverage');
+    const previousOverview=structuredClone(overview), pendingPoll=await holdPoll();
     await card(paused).locator('[data-resume]').click();await until(()=>resumeRequests.length===1);
     await until(async()=>(await page.locator('#job-banner').textContent()).includes('第 3 页'));
+    await deliver(pendingPoll,{json:previousOverview});
+    assert.match(await page.locator('#job-banner').textContent(),/第 3 页/,'An older poll must not undo the newly resumed job');
     assert.match(await page.locator('#job-banner').textContent(),new RegExp(paused.display_name));
     assert.match(await page.locator('#job-banner').textContent(),/已检查 35 个视频/);
     assert.match(await text(paused),/正在采集.*已检查 11 个视频.*第 3 页/s);
     assert.match(await text(unstarted),/等待采集/);
     assert.equal(await card(paused).locator('[data-scan-source]').isDisabled(),true);
+    failNextOverview=true;
+    await until(async()=>(await page.locator('#connection-label').textContent())==='本地服务未连接');
+    assert.match(await text(paused),/正在采集/);
     task.state='completed';task.finished_at=stamp;task.processed=50;task.checkpoints[paused.id].state='completed';task.checkpoints[unstarted.id].state='completed';
     Object.assign(paused.collection_status,{state:'completed',finished_at:stamp,last_success_at:stamp,can_resume:false});
     Object.assign(unstarted.collection_status,{state:'completed',finished_at:stamp,last_success_at:stamp,last_attempt_at:stamp,can_resume:false});
-    await until(async()=>(await page.locator('#job-banner').textContent()).includes('已完成'));
+    await until(async()=>(await page.locator('#job-banner').textContent()).includes('已完成'),6500);
     assert.equal(await page.locator('#job-banner .spinner').count(),0);
     assert.equal(await card(paused).locator('[data-resume]').count(),0);
     assert.equal(await card(paused).locator('[data-scan-source]').isEnabled(),true);
     assert.match(await text(paused),/更新完成/);
     pass('Retry routes to the selected task; resumed active progress and terminal completion refresh the banner and source actions');
+    const delayedFailure=await holdPoll();
+    await card(legacy).locator('[data-toggle-source]').click();
+    await until(async()=>(await card(legacy).locator('[data-toggle-source]').textContent())==='启用');
+    await deliver(delayedFailure,{status:503,json:{detail:'过期的请求失败'}});
+    assert.match(await page.locator('#connection-label').textContent(),/本地运行/);
+    assert.equal(await card(legacy).locator('[data-toggle-source]').textContent(),'启用');
+    pass('Late poll successes and failures preserve newer manual updates; a current failed poll keeps the status and the next active poll recovers');
     await page.screenshot({path:path.join(output,'collection-status-desktop.png'),fullPage:true});
     await page.setViewportSize({width:390,height:844});
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Sources page overflows mobile viewport');

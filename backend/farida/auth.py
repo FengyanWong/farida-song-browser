@@ -4,6 +4,7 @@ import math
 import re
 import secrets
 import time
+from collections import deque
 from http.cookies import SimpleCookie, CookieError
 from urllib.parse import parse_qs, urljoin, urlsplit
 
@@ -18,6 +19,8 @@ POLL = 'https://passport.bilibili.com/x/passport-login/web/qrcode/poll'
 NAV = 'https://api.bilibili.com/x/web-interface/nav'
 COOKIE_NAMES = {'SESSDATA', 'bili_jct', 'DedeUserID', 'DedeUserID__ckMd5', 'sid', 'buvid3', 'buvid4', 'b_nut', 'bili_ticket', 'bili_ticket_expires'}
 TERMINAL = {'authenticated', 'saved', 'expired', 'failed', 'cancelled'}
+MAX_QR_OBSERVERS = 64
+QR_LIFETIME_SECONDS = 180
 
 
 class LoginError(ValueError):
@@ -75,6 +78,7 @@ class BilibiliLogin:
         self.clock, self.poll_interval = clock, poll_interval
         self.lock = asyncio.Lock()
         self.pending = None
+        self.expiry_task = None
         self.last_start = float('-inf')
         self.last_check = float('-inf')
         try:
@@ -122,27 +126,53 @@ class BilibiliLogin:
         except (ValueError, TypeError, KeyError):
             raise LoginError('哔哩哔哩登录响应格式有变化，请稍后重试。') from None
 
-    def attempt_result(self, include_image=False):
+    def attempt_result(self, handle, *, include_image=False, state=None):
         pending = self.pending
-        result = {'id': pending['id'], 'state': pending['state'], 'expires_in': max(0, math.ceil(pending['expires'] - self.clock())), 'poll_after_ms': max(3000, math.ceil(self.poll_interval * 1000)), 'message': pending.get('message', '')}
+        state = state or pending['state']
+        result = {'id': handle, 'state': state, 'expires_in': max(0, math.ceil(pending['expires'] - self.clock())),
+                  'poll_after_ms': max(3000, math.ceil(self.poll_interval * 1000)), 'message': pending.get('message', '')}
         if include_image and pending.get('image'):
             result['qr_image'] = pending['image']
-        if pending['state'] in {'authenticated', 'saved'}:
+        if state in {'authenticated', 'saved'}:
             result['auth'] = self.status()
         return result
 
+    def join_attempt(self, observer):
+        handles = self.pending['observers']
+        if observer not in handles:
+            if len(handles) >= MAX_QR_OBSERVERS:
+                raise LoginError('正在使用二维码的页面过多，请等待二维码到期后再试。')
+            handles[observer] = secrets.token_urlsafe(24)
+        return self.attempt_result(handles[observer], include_image=True)
+
+    async def expire_after(self, attempt):
+        await asyncio.sleep(max(0, attempt['expires'] - self.clock()))
+        async with self.lock:
+            if self.pending is attempt and attempt['state'] not in TERMINAL:
+                attempt['state'] = 'expired'
+                await self.discard_client()
+
     async def discard_client(self):
+        timer, self.expiry_task = self.expiry_task, None
+        if timer is not None and timer is not asyncio.current_task():
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
         if self.pending and self.pending.get('client'):
             await self.pending['client'].aclose()
             self.pending['client'] = None
         if self.pending:
             self.pending['key'] = None
             self.pending['image'] = None
+            # Keep only opaque handles for tabs that still need the terminal result.
+            self.pending['terminal_handles'].update(self.pending['observers'].values())
+            self.pending['observers'].clear()
 
-    async def start(self):
+    async def start(self, observer=None):
         async with self.lock:
-            if self.pending and self.pending['state'] not in TERMINAL and self.clock() < self.pending['expires']:
-                return self.attempt_result(include_image=True)
+            if self.pending and self.pending['state'] not in TERMINAL:
+                if self.clock() < self.pending['expires']:
+                    return self.join_attempt(observer)
+                self.pending['state'] = 'expired'
             if self.clock() - self.last_start < 5:
                 raise LoginError('请稍候几秒，再刷新登录二维码。')
             self.last_start = self.clock()
@@ -160,9 +190,12 @@ class BilibiliLogin:
             except Exception:
                 await client.aclose()
                 raise
-            self.pending = {'id': secrets.token_urlsafe(24), 'key': key, 'image': image, 'client': client,
-                            'state': 'waiting', 'expires': self.clock() + 180, 'next_poll': self.clock() + self.poll_interval}
-            return self.attempt_result(include_image=True)
+            self.pending = {'key': key, 'image': image, 'client': client, 'observers': {}, 'terminal_handles': set(),
+                            'released': deque(maxlen=MAX_QR_OBSERVERS), 'state': 'waiting',
+                            'expires': self.clock() + QR_LIFETIME_SECONDS, 'next_poll': self.clock() + self.poll_interval}
+            # Hidden or abandoned pages may never poll to discover that the code expired.
+            self.expiry_task = asyncio.create_task(self.expire_after(self.pending))
+            return self.join_attempt(observer)
 
     async def credentials(self, client, response, data):
         cookies = {cookie.name: cookie_value(cookie.value) for cookie in client.cookies.jar if cookie.name in COOKIE_NAMES and not cookie.is_expired()}
@@ -203,17 +236,20 @@ class BilibiliLogin:
 
     async def poll(self, attempt_id):
         async with self.lock:
-            if not self.pending or not secrets.compare_digest(self.pending['id'], attempt_id):
-                raise LoginError('此二维码已关闭，请重新扫码登录。')
             pending = self.pending
+            if pending and attempt_id in pending['released']:
+                return self.attempt_result(attempt_id, state='cancelled')
+            if not pending or (attempt_id not in pending['observers'].values()
+                               and attempt_id not in pending['terminal_handles']):
+                raise LoginError('此二维码已关闭，请重新扫码登录。')
             if pending['state'] in TERMINAL:
-                return self.attempt_result()
+                return self.attempt_result(attempt_id)
             if self.clock() >= pending['expires']:
                 pending['state'] = 'expired'
                 await self.discard_client()
-                return self.attempt_result()
+                return self.attempt_result(attempt_id)
             if self.clock() < pending['next_poll']:
-                return self.attempt_result()
+                return self.attempt_result(attempt_id)
             pending['next_poll'] = self.clock() + self.poll_interval
             try:
                 response = await self.request(pending['client'], POLL, {'qrcode_key': pending['key']})
@@ -245,7 +281,7 @@ class BilibiliLogin:
             except (LoginError, SessionError) as exc:
                 pending['state'], pending['message'] = 'failed', str(exc)
                 await self.discard_client()
-            return self.attempt_result()
+            return self.attempt_result(attempt_id)
 
     async def check(self):
         async with self.lock:
@@ -273,9 +309,16 @@ class BilibiliLogin:
 
     async def cancel(self, attempt_id):
         async with self.lock:
-            if self.pending and secrets.compare_digest(self.pending['id'], attempt_id) and self.pending['state'] not in TERMINAL:
-                self.pending['state'] = 'cancelled'
-                await self.discard_client()
+            pending = self.pending
+            if pending and pending['state'] not in TERMINAL:
+                for observer, handle in pending['observers'].items():
+                    if handle == attempt_id:
+                        del pending['observers'][observer]
+                        pending['released'].append(handle)
+                        if not pending['observers']:
+                            pending['state'] = 'cancelled'
+                            await self.discard_client()
+                        break
             return {'cancelled': True}
 
     async def logout(self):
@@ -292,3 +335,4 @@ class BilibiliLogin:
     async def close(self):
         async with self.lock:
             await self.discard_client()
+            self.pending = None

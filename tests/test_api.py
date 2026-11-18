@@ -47,6 +47,35 @@ def test_real_target_opening_and_export(settings,video):
         assert client.get('/api/clips/'+target['id']).json()['statistics']['favorite'] is None
 
 
+def test_local_upload_day_matches_catalog_groups_queue_and_exports(settings, video):
+    from datetime import datetime
+
+    app, _ = client_app(settings)
+    with TestClient(app) as client:
+        db = app.state.db
+        source = db.source(1)
+        # In Shanghai these uploads straddle midnight between March 1 and 2.
+        timestamps = ("2026-03-01T15:59:59Z", "2026-03-01T16:00:00Z",
+                      "2026-03-02T15:59:59Z", "2026-03-02T16:00:00Z")
+        ids = [f"BV{n:010d}" for n in range(4)]
+        for bvid, stamp in zip(ids, timestamps):
+            db.save_video(source, {**video, "bvid": bvid,
+                                   "pubdate": int(datetime.fromisoformat(stamp).timestamp())}, [])
+        day = {"after": "2026-03-02T00:00:00+08:00", "before": "2026-03-02T23:59:59+08:00"}
+        for path, options in (("/api/clips", {}), ("/api/clips", {"grouped": True}),
+                              ("/api/play-queue", {}), ("/api/export", {"format": "json"})):
+            reply = client.get(path, params={**day, **options})
+            assert reply.status_code == 200, reply.text
+            result = reply.json()
+            items = result if isinstance(result, list) else result["items"]
+            assert {item["id"].split(":")[0] for item in items} == set(ids[1:3])
+        exported = client.get("/api/export", params=day).text
+        assert all((bvid in exported) == (bvid in ids[1:3]) for bvid in ids)
+        legacy = client.get("/api/clips", params={"after": "2026-03-02", "before": "2026-03-02"}).json()
+        assert {item["video_bvid"] for item in legacy["items"]} == set(ids[2:])
+        assert client.get("/api/clips", params={"after":"2026-03-03", "before":day["before"]}).status_code == 400
+
+
 def test_source_settings_and_unknown_fields(settings):
     app,_=client_app(settings)
     with TestClient(app) as client:

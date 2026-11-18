@@ -70,8 +70,19 @@ $('#shutdown-dialog').addEventListener('cancel',event=>event.preventDefault());
 document.addEventListener('farida-auth-change',()=>{renderJob();if(!accountLogin.canCollect())playlistPlayer.stop(accountLogin.loggingOut);else playlistPlayer.updateResumeButton();if(state.view==='sources')renderSources();});
 function parameters() {
   const result=new URLSearchParams({status:state.filter==='bookmarked'?'all':state.filter,sort:$('#sort').value,page:state.page,page_size:state.pageSize});
-  const inputs={q:'#search',source_id:'#source-filter',uploader:'#uploader-filter',after:'#after',before:'#before'};
+  const inputs={q:'#search',source_id:'#source-filter',uploader:'#uploader-filter'};
   for(const [key,selector] of Object.entries(inputs)) if($(selector).value) result.set(key,$(selector).value);
+  for(const key of ['after','before']){
+    const value=$('#'+key).value;
+    if(!value)continue;
+    const boundary=new Date(value+'T00:00:00');
+    if(key==='before'){
+      // A local day can have 23 or 25 hours when clocks change.
+      boundary.setHours(24,0,0,0);
+      boundary.setTime(boundary.getTime()-1000);
+    }
+    result.set(key,Number.isFinite(boundary.getTime())?boundary.toISOString():value);
+  }
   if(state.filter==='bookmarked')result.set('bookmarked','true');
   if(state.grouped)result.set('grouped','true');
   return result;
@@ -104,8 +115,18 @@ function optionList(selector, rows, getValue, getLabel, first) {
   el.innerHTML=`<option value="">${first}</option>`+rows.map(r=>`<option value="${e(getValue(r))}">${e(getLabel(r))}</option>`).join('');
   if([...el.options].some(o=>o.value===selected))el.value=selected;
 }
+let overviewRequest = 0;
 async function loadOverview() {
-  const o = await api('/api/overview?compact=true');
+  const request = ++overviewRequest;
+  let o;
+  try {
+    o = await api('/api/overview?compact=true');
+  } catch (error) {
+    if (request !== overviewRequest || state.stopping) return;
+    throw error;
+  }
+  // A poll started before a manual update may finish after its newer snapshot.
+  if (request !== overviewRequest || state.stopping) return;
   schedulePoll(o.jobs.some(j=>['running','queued'].includes(j.state)) ? 1500 : 10000);
   $('#connection-label').textContent='本地运行 · 自动保存';$('.status-dot').style.background='var(--green)';
   const signature = JSON.stringify(o);
@@ -403,9 +424,25 @@ function updateSelection() {
   $$('[data-select]').forEach(el=>el.checked=state.selected.has(el.dataset.select));
 }
 function filtersChanged() {clearTimeout(searchTimer);closePageJump();state.page=1;state.expandedGroups.clear();clearSelection();loadClips();}
+function updateSingingCollectionControl() {
+  const checkbox=$('#singing-collection');
+  let collection=false;
+  try {
+    const url=new URL($('#source-url').value.trim()),params=url.searchParams;
+    if(url.protocol==='https:' && url.hostname==='space.bilibili.com') {
+      collection=!!(params.get('fid') || params.get('sid') || /^\/\d+\/lists\/\d+(?:\/|$)/.test(url.pathname));
+    } else if(url.protocol==='https:' && url.hostname==='www.bilibili.com') {
+      collection=/^\/medialist\/play\/\d+\/?$/.test(url.pathname) && !!params.get('business_id')
+        && ['space_series','space_collection'].includes(params.get('business'));
+    }
+  } catch {}
+  checkbox.disabled=!collection;
+  if(!collection)checkbox.checked=false;
+}
+$('#source-url').addEventListener('input',updateSingingCollectionControl);
 function showSource(source) {
   state.editSource=source || null;$('#source-name').value=source?.display_name || '';$('#source-url').value=source?.canonical_url || '';
-  $('#singing-collection').checked=!!source?.singing_collection;$('#source-form-error').textContent='';$('#source-dialog-title').textContent=source?'编辑来源':'添加来源';$('#source-dialog').showModal();
+  $('#singing-collection').checked=!!source?.singing_collection;updateSingingCollectionControl();$('#source-form-error').textContent='';$('#source-dialog-title').textContent=source?'编辑来源':'添加来源';$('#source-dialog').showModal();
 }
 async function showDetail(id) {
   const clip=await api('/api/clips/'+encodeURIComponent(id));const el=$('#detail-content');

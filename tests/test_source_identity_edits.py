@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from farida.app import create_app
@@ -29,10 +30,31 @@ def test_equivalent_uploader_edits_preserve_memberships_and_history(settings, vi
                 "display_name": "新名称", "url": url, "enabled": False, "singing_collection": True,
             })
             assert response.status_code == 200
-            expected = {**original, "display_name": "新名称", "enabled": 0, "singing_collection": 1}
+            expected = {**original, "display_name": "新名称", "enabled": 0, "singing_collection": 0}
             assert response.json() == expected
             assert db.all("SELECT * FROM memberships WHERE source_id=1") == before_memberships
             assert db.collection_status(response.json())["job_id"] == "finished"
+
+
+@pytest.mark.parametrize("url,kind", [
+    ("https://space.bilibili.com/123/lists/456?type=season", "season"),
+    ("https://space.bilibili.com/123/lists/456?type=series", "series"),
+    ("https://space.bilibili.com/123/favlist?fid=456", "favorites"),
+])
+def test_only_collection_sources_can_enable_singing_evidence(db, url, kind):
+    source = db.add_source("测试", "123", singing_collection=True)
+    assert source["singing_collection"] == 0
+    collection = db.update_source(source["id"], {"url": url, "singing_collection": True})
+    assert collection["source_type"] == kind and collection["singing_collection"] == 1
+    assert db.update_source(source["id"], {"url": "123"})["singing_collection"] == 0
+    assert db.update_source(source["id"], {"singing_collection": True})["singing_collection"] == 0
+    assert db.add_source("合集", url, singing_collection=True)["singing_collection"] == 1
+
+
+def test_public_songlist_and_discovery_never_take_collection_flag(db):
+    for source in db.sources():
+        if source["source_type"] in {"songlist", "search"}:
+            assert db.update_source(source["id"], {"singing_collection": True})["singing_collection"] == 0
 
 
 def test_collection_alias_and_real_replacement_are_distinguished(settings, video):

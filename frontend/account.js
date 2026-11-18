@@ -7,6 +7,7 @@ export class AccountLogin {
   constructor(api, changed) {
     this.api=api;this.changed=changed;this.preview=true;this.busy=false;this.loggingOut=false;this.initialized=false;this.stopped=false;
     this.generation=0;this.revision=0;this.attempt=null;this.operations=Promise.resolve();
+    this.qrObserver=globalThis.crypto?.randomUUID?.();
     this.dialog=$('#login-dialog');
     $('#account-toggle').onclick=()=>this.toggleMenu();
     $('#login-button').onclick=()=>this.openQR();
@@ -16,6 +17,13 @@ export class AccountLogin {
     $('#logout-button').onclick=()=>this.accountAction('logout');
     this.dialog.addEventListener('cancel',event=>{if(!this.canCollect())event.preventDefault();});
     this.dialog.addEventListener('close',()=>this.closed());
+    let qrHidden=document.hidden;
+    document.addEventListener('visibilitychange',()=>{
+      if (document.hidden===qrHidden) return;
+      qrHidden=document.hidden;
+      clearTimeout(this.timer);
+      if (!qrHidden) this.poll(this.generation);
+    });
     document.addEventListener('click',event=>{if(!event.target.closest('#account-menu-wrap'))this.toggleMenu(false);});
     document.addEventListener('keydown',event=>{if(event.key==='Escape')this.toggleMenu(false);});
   }
@@ -143,7 +151,8 @@ export class AccountLogin {
     this.queue(async()=>{
       await this.cancel(old);if(!this.valid(generation))return;
       try {
-        const result=await this.api('/api/auth/qr',{method:'POST'});
+        const path=this.qrObserver ? '/api/auth/qr?observer='+this.qrObserver : '/api/auth/qr';
+        const result=await this.api(path,{method:'POST'});
         if(!this.valid(generation)){await this.cancel(result.id);return;}
         this.attempt=result.id;
         if(!/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(result.qr_image||''))throw new Error('二维码加载失败，请重新获取。');
@@ -153,7 +162,7 @@ export class AccountLogin {
     });
   }
   failure(message) {
-    clearTimeout(this.timer);this.hideImage();$('#login-qr-box').hidden=true;
+    this.pollGeneration=null;clearTimeout(this.timer);this.hideImage();$('#login-qr-box').hidden=true;
     $('#login-message').textContent=message;$('#login-message').classList.add('error');
     $('#login-expiry').textContent='';$('#login-retry').hidden=false;
   }
@@ -167,11 +176,15 @@ export class AccountLogin {
     if(!activeStates.has(result.state)){this.failure(result.message||(result.state==='expired'?'二维码已过期，请刷新后重新扫码。':'登录已结束，请重新获取二维码。'));return;}
     $('#login-message').textContent=result.state==='scanned'?'已扫码，请在手机上确认登录。':'等待扫码';
     $('#login-expiry').textContent=`二维码约 ${Math.max(0,Math.ceil(result.expires_in))} 秒后过期`;
-    this.timer=setTimeout(()=>this.poll(generation),Math.max(3000,result.poll_after_ms||3000));
+    this.pollGeneration=generation;
+    clearTimeout(this.timer);
+    if (!document.hidden) this.timer=setTimeout(()=>this.poll(generation),Math.max(3000,result.poll_after_ms||3000));
   }
   async poll(generation) {
-    if(!this.valid(generation)||!this.attempt)return;
+    if(document.hidden||!this.valid(generation)||!this.attempt||this.pollGeneration!==generation||this.polling===generation)return;
+    this.polling=generation;
     try {await this.update(await this.api(`/api/auth/qr/${encodeURIComponent(this.attempt)}/poll`,{method:'POST'}),generation);}
     catch(error){if(this.valid(generation))this.failure(error.message);}
+    finally{if(this.polling===generation)this.polling=null;}
   }
 }

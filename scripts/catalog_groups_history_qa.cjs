@@ -351,7 +351,7 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     assert.deepEqual(errors,[]);pass('Grouped catalog and history fit a 390px viewport, retain two navigation tabs, and produce no JavaScript errors');
     await page.locator('#listening-history-dialog .close-dialog').first().click();
     await page.locator('#filter-button').click();
-    const range = page.getByRole('group',{name:'上传日期（UTC）'});
+    const range = page.getByRole('group',{name:'上传日期（本地时间）'});
     for (const width of [320,360,390]) {
       await page.setViewportSize({width,height:844});
       for (const label of ['起始上传日期','结束上传日期']) {
@@ -371,11 +371,42 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await range.getByLabel('起始上传日期').fill('2020-01-01');
     const filteredDates = page.waitForRequest(request=>{
       const url=new URL(request.url());
-      return url.pathname==='/api/clips' && url.searchParams.get('after')==='2020-01-01' &&
-        url.searchParams.get('before')==='2030-01-01';
+      return url.pathname==='/api/clips' && url.searchParams.get('after')==='2020-01-01T00:00:00.000Z' &&
+        url.searchParams.get('before')==='2030-01-01T23:59:59.000Z';
     });
     await range.getByLabel('结束上传日期').fill('2030-01-01');await filteredDates;
     pass('Both upload dates and picker edges fit 320–390px widths; keyboard navigation and combined range requests work');
+    async function checkLocalDays(zone, boundaries) {
+      const local=await browser.newContext({locale:'zh-CN',timezoneId:zone});
+      const view=await local.newPage();
+      try {
+        await local.route('**/*',route=>{
+          const url=new URL(route.request().url());
+          if(url.origin!==base)return route.abort();
+          if(url.pathname.startsWith('/api/auth'))return route.fulfill({json:{state:'connected',stored:true,account:{uid:'123',name:'日期测试'},message:''}});
+          return route.continue();
+        });
+        await view.goto(base+'/#catalog');
+        await view.locator('#filter-button').click();
+        for(const [day,start,end] of boundaries){
+          const filtered=view.waitForRequest(request=>{
+            const url=new URL(request.url());
+            return url.pathname==='/api/clips' && url.searchParams.get('after')===start && url.searchParams.get('before')===end;
+          });
+          await view.locator('#after').fill(day);
+          await view.locator('#before').fill(day);
+          await filtered;
+        }
+      }finally{await local.close();}
+    }
+    await checkLocalDays('Asia/Shanghai',[
+      ['2026-03-02','2026-03-01T16:00:00.000Z','2026-03-02T15:59:59.000Z']
+    ]);
+    await checkLocalDays('Europe/London',[
+      ['2026-03-29','2026-03-29T00:00:00.000Z','2026-03-29T22:59:59.000Z'],
+      ['2026-10-25','2026-10-24T23:00:00.000Z','2026-10-25T23:59:59.000Z']
+    ]);
+    pass('Upload dates follow the displayed local calendar in Shanghai and on both the 23-hour and 25-hour London days');
     await page.close();await until(()=>service.exitCode!==null);assert.equal(service.exitCode,0);
     fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({checks,errors,output,packaged:!!exe,blockedExternalRequests:blocked.length},null,2));
   }finally{await browser.close();if(service.exitCode===null)spawnSync('taskkill',['/PID',String(service.pid),'/T','/F'],{stdio:'ignore',windowsHide:true});}

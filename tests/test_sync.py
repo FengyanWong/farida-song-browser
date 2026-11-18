@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from farida.adapter import BilibiliAdapter, Page, UpstreamError
+from farida.classifier import VERSION, classify
 from farida.db import Database, encode, now
 from farida.sync import Collector
 
@@ -334,6 +335,39 @@ async def test_favorites_cursor_uses_all_resources_but_only_collects_videos(db, 
         assert job["errors"][0]["category"] == "pagination"
         assert "/x/web-interface/view" not in calls
         assert db.source(source["id"])["last_refresh_at"] is None
+
+
+async def test_incremental_refresh_repairs_legacy_uploader_evidence_and_preserves_manual_changes(db, settings, video):
+    source = db.source(1)
+    db.verified_source(1, {"uid": source["uid"], "name": source["display_name"], "method": "fixture"})
+    db.execute("UPDATE sources SET singing_collection=1 WHERE id=1")
+    video.update(title="工作室日常记录", desc="")
+    for part in video["pages"]:
+        part["part"] = "现场记录"
+    source = db.source(1)
+    assert not source["singing_collection"] and not db.sources()[0]["singing_collection"]
+    assert classify(video, video["pages"][0], [], {**source, "singing_collection": 1})[1] == "needs_review"
+    db.save_video(source, video, [])
+    auto, manual = [f"{video['bvid']}:{part['cid']}" for part in video["pages"]]
+    db.execute("UPDATE annotations SET inclusion_status='included',classification_version='rules-1' WHERE clip_id IN (?,?)",
+               (auto, manual))
+    db.annotate([manual], {"inclusion_status": "included", "display_song_title": "我的曲名", "notes": "保留"})
+    db.bookmark(manual, True)
+    assert db.clip(auto)["inclusion_status"] == "included"
+
+    adapter = FakeAdapter(video)
+    collector = Collector(db, settings, lambda _: adapter)
+    job = collector.start([1], "incremental")
+    await collector.task
+    assert db.job(job["id"])["state"] == "completed" and not adapter.video_calls
+    automatic = db.clip(auto)
+    assert automatic["inclusion_status"] == "needs_review" and automatic["classification_version"] == VERSION
+    kept = db.clip(manual)
+    assert (kept["inclusion_status"], kept["display_song_title"], kept["notes"], kept["bookmarked"]) == (
+        "included", "我的曲名", "保留", 1)
+    assert kept["classification_reason"] == "用户手动确认"
+    assert db.update_source(1, {"display_name": "离落"})["singing_collection"] == 0
+    assert db.one("SELECT singing_collection FROM sources WHERE id=1")["singing_collection"] == 0
 
 
 async def test_first_scan_of_verified_singing_collection_classifies_with_fresh_identity(db, settings, video):

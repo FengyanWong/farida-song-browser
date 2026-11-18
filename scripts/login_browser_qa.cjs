@@ -23,6 +23,24 @@ const connected=()=>({state:'connected',stored:true,account:{uid:'123',name:'测
  page.on('pageerror',error=>errors.push(error.message));
  let auth=signedOut(),mode='happy',attempt=0,polls=0,delayGeneration=false,creating=false,checkOverride=null,checkCalls=0,manualScans=0,releaseCheck=null,holdCheck=false;
  const cancelled=[],pollTimes=[];
+ let heldPoll=null;
+ function holdNextPoll(result){
+  let release;
+  const wait=new Promise(resolve=>{release=resolve;});
+  heldPoll={result,wait};
+  return release;
+ }
+ async function visibility(hidden){
+  await page.evaluate(hidden=>{
+   Object.defineProperty(document,'hidden',{configurable:true,value:hidden});
+   document.dispatchEvent(new Event('visibilitychange'));
+  },hidden);
+ }
+ const qrRequest=request=>new URL(request.url()).pathname.endsWith('/poll');
+ async function returnToQR(){
+  const request=page.waitForRequest(qrRequest,{timeout:2000});
+  await visibility(false);await request;
+ }
  const menu=async()=>{if(!await page.locator('#account-menu').isVisible())await page.locator('#account-toggle').click();};
  const signedIn=async()=>{await page.waitForFunction(()=>!document.querySelector('#login-dialog').open&&document.querySelector('#account-status').textContent==='已登录');};
  try{
@@ -46,7 +64,8 @@ const connected=()=>({state:'connected',stored:true,account:{uid:'123',name:'测
     result={id,state:'waiting',qr_image:qr,expires_in:180,poll_after_ms:3000};
    }else if(pathname.endsWith('/poll')){
     polls++;pollTimes.push(Date.now());const id=pathname.split('/')[4];
-    if(mode==='expired')result={id,state:'expired',expires_in:0};
+    if(heldPoll){const held=heldPoll;heldPoll=null;await held.wait;result={id,...held.result};}
+    else if(mode==='expired')result={id,state:'expired',expires_in:0};
     else if(mode==='waiting'||polls===1)result={id,state:mode==='waiting'?'waiting':'scanned',expires_in:177,poll_after_ms:3000};
     else{auth=connected();result={id,state:'authenticated',auth,expires_in:174};}
    }else if(pathname.endsWith('/cancel')){cancelled.push(pathname.split('/')[4]);result={cancelled:true};}
@@ -125,6 +144,36 @@ const connected=()=>({state:'connected',stored:true,account:{uid:'123',name:'测
   await page.locator('#login-qr').waitFor({state:'visible'});
   assert.ok(cancelled.includes('offline-qr-'+firstAttempt));assert.equal(attempt,firstAttempt+1);assert.ok(!cancelled.includes('offline-qr-'+attempt));
   checks.push('Optional account switch can close/reopen safely without cancelling the new QR');
+  await visibility(true);await page.waitForTimeout(3250);
+  assert.equal(polls,0,'The hidden tab must cancel the already scheduled waiting-state poll');
+  const releaseScanned=holdNextPoll({state:'scanned',expires_in:160,poll_after_ms:3000});
+  await returnToQR();await visibility(false);await visibility(true);await visibility(false);await visibility(true);
+  assert.equal(polls,1,'A pending request can serve several visibility changes');
+  releaseScanned();await page.waitForFunction(()=>document.querySelector('#login-message').textContent.includes('在手机上确认'));
+  await page.waitForTimeout(3250);assert.equal(polls,1,'An in-flight response received while hidden must not schedule the next check');
+  mode='expired';await returnToQR();
+  await page.waitForFunction(()=>document.querySelector('#login-message').textContent.includes('二维码已过期'));
+  await visibility(true);await visibility(false);await page.waitForTimeout(150);
+  assert.equal(polls,2);assert.equal(attempt,firstAttempt+1);
+  checks.push('Hidden waiting and scanned codes do not poll; returning checks immediately once, and an expired code waits for an explicit retry');
+
+  mode='waiting';delayGeneration=false;
+  await page.locator('#login-retry').click();await page.locator('#login-qr').waitFor({state:'visible'});
+  const oldId='offline-qr-'+attempt;
+  const releaseOld=holdNextPoll({state:'authenticated',auth:connected()});
+  await visibility(true);await returnToQR();
+  await page.keyboard.press('Escape');await menu();await page.locator('#login-button').click();
+  await page.locator('#login-qr').waitFor({state:'visible'});assert.ok(cancelled.includes(oldId));
+  const releaseNew=holdNextPoll({state:'scanned',expires_in:150,poll_after_ms:3000});
+  await visibility(true);await returnToQR();
+  const oldResponse=page.waitForResponse(response=>response.url().endsWith('/'+oldId+'/poll'));
+  releaseOld();await oldResponse;
+  await visibility(true);await visibility(false);await page.waitForTimeout(150);
+  assert.equal(polls,1);assert.equal(await page.locator('#login-dialog').isVisible(),true);
+  assert.equal(await page.locator('#login-message').textContent(),'等待扫码');
+  releaseNew();await page.waitForFunction(()=>document.querySelector('#login-message').textContent.includes('在手机上确认'));
+  checks.push('A cancelled challenge’s late confirmation cannot dismiss the replacement QR or release its in-flight poll');
+
   await page.setViewportSize({width:390,height:844});
   assert.equal(await page.locator('#login-dialog').evaluate(el=>el.scrollWidth<=el.clientWidth),true);
   await page.screenshot({path:path.join(output,'login-required-mobile.png')});

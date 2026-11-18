@@ -1,7 +1,8 @@
 import re
 import unicodedata
 
-VERSION = "rules-1"
+VERSION = "rules-2"
+SINGING_COLLECTION_TYPES = frozenset({"season", "series", "favorites"})
 
 
 def normalize(value: str) -> str:
@@ -14,7 +15,8 @@ def classify(video, part, tags, source, *, curated_song=None):
     context = normalize(" ".join([title, video.get("desc", ""), *tags]))
     local = normalize(part_title if len(video["pages"]) > 1 else title)
     performer = any(alias in context for alias in ("法里达", "farida"))
-    collection = source.get("singing_collection") and source.get("verification_status") == "verified"
+    collection = (source["source_type"] in SINGING_COLLECTION_TYPES
+                  and source.get("singing_collection") and source.get("verification_status") == "verified")
     performer = performer or bool(collection)
     music_pattern = r"歌切|翻唱|直播翻唱|清唱|弹唱|演唱|合唱|歌回|唱歌|纯享|cover|acoustic|歌曲|音乐合集|歌单"
     music = bool(re.search(music_pattern, normalize(title + " " + part_title + " " + " ".join(tags)))) or bool(collection)

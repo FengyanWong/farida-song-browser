@@ -11,11 +11,12 @@ from contextlib import asynccontextmanager
 from datetime import date
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.background import BackgroundTask
 
@@ -31,6 +32,7 @@ from .player_state import PlayerState
 from .backup import export_backup, restore_validated_backup, validate_backup, LIMIT
 
 
+CatalogDate = AwareDatetime | date
 CatalogSort = Literal["newest", "oldest", "title", "uploader", "discovered"]
 
 
@@ -296,9 +298,9 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         return login.status()
 
     @app.post('/api/auth/qr')
-    async def auth_start():
+    async def auth_start(observer: UUID | None=None):
         real_login_only()
-        return await login.start()
+        return await login.start(observer)
 
     @app.post('/api/auth/qr/{attempt_id}/poll')
     async def auth_poll(attempt_id: str):
@@ -325,17 +327,17 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         return await login.logout()
 
     @app.get("/api/clips")
-    def clips(q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: date | None=None,before: date | None=None,bookmarked: bool=False,sort: CatalogSort="newest",page: int=1,page_size: int=40,grouped: bool=False,compact: bool=False):
-        if page < 1 or not 1 <= page_size <= 100 or len(q)>500 or (after and before and after>before):
+    def clips(q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: CatalogDate | None=None,before: CatalogDate | None=None,bookmarked: bool=False,sort: CatalogSort="newest",page: int=1,page_size: int=40,grouped: bool=False,compact: bool=False):
+        if page < 1 or not 1 <= page_size <= 100 or len(q)>500:
             raise ValueError("分页、日期范围或搜索参数无效")
         query = db.grouped_clips if grouped else db.clips
         return query(q=q,status=status,source_id=source_id,uploader=uploader,after=after,before=before,bookmarked=bookmarked,sort=sort,page=page,page_size=page_size,compact=compact)
 
     @app.get('/api/play-queue')
     def play_queue(q: str='', status: Literal['included','excluded','needs_review','all']='included', source_id: int | None=None,
-                   uploader: str | None=None, after: date | None=None, before: date | None=None, bookmarked: bool=False,
+                   uploader: str | None=None, after: CatalogDate | None=None, before: CatalogDate | None=None, bookmarked: bool=False,
                    sort: CatalogSort='newest'):
-        if len(q) > 500 or (after and before and after > before):
+        if len(q) > 500:
             raise ValueError('日期范围或搜索参数无效')
         return {'items': db.playback_queue(q=q, status=status, source_id=source_id, uploader=uploader,
                                           after=after, before=before, bookmarked=bookmarked, sort=sort)}
@@ -491,8 +493,8 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             return job
 
     @app.get("/api/export")
-    def export(format: Literal["json","csv"]="csv",q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: date | None=None,before: date | None=None,bookmarked: bool=False,sort: CatalogSort="newest"):
-        if len(q)>500 or (after and before and after>before):
+    def export(format: Literal["json","csv"]="csv",q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: CatalogDate | None=None,before: CatalogDate | None=None,bookmarked: bool=False,sort: CatalogSort="newest"):
+        if len(q)>500:
             raise ValueError("无效的筛选条件")
         filters = dict(q=q, status=status, source_id=source_id, uploader=uploader,
                        after=after, before=before, bookmarked=bookmarked, sort=sort)
