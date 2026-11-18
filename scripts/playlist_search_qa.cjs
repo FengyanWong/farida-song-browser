@@ -208,6 +208,74 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.equal((await(await fetch(base+'/api/playlists/'+savedId)).json()).name,'第二版');
     assert.equal(await unloadGuarded(),false);
     pass('Edits made while saving remain open for a second save; both submissions retain the same playlist ID');
+    const resolver='**/api/playlists/resolve-links';
+    let lookups=0;
+    page.on('request',request=>{if(new URL(request.url()).pathname==='/api/playlists/resolve-links')lookups++;});
+    const savedLists=async()=>(await(await fetch(base+'/api/playlists')).json()).items;
+    const oldCount=(await savedLists()).length;
+    const pasted=page.locator('#playlist-import-text'), importButton=page.locator('#playlist-import-add');
+    const importStatus=page.locator('#playlist-import-status');
+    const fillRepeated=(count,line)=>pasted.evaluate((el,{count,line})=>{
+      el.value=Array(count).fill(line).join('\n');
+      el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertFromPaste'}));
+    },{count,line});
+    await page.locator('#playlist-new').click();await page.locator('#playlist-import summary').click();
+    const copiedLinks=links.split('\n');
+    await pasted.fill(copiedLinks[0]);await pasted.press('End');await pasted.press('Enter');
+    assert.equal(await pasted.inputValue(),copiedLinks[0]+'\n');
+    await nameInput.fill('粘贴未提交');await page.locator('#playlist-save-button').click();
+    assert.equal(await editor.isVisible(),true);
+    assert.match(await importStatus.textContent(),/请先点击/);
+    assert.equal((await savedLists()).length,oldCount);
+
+    await fillRepeated(20001,'BV0000000000');await importButton.click();
+    assert.match(await importStatus.textContent(),/20,000/);
+    await pasted.fill('x'.repeat(2049));await importButton.click();
+    assert.match(await importStatus.textContent(),/2,048/);assert.equal(lookups,0);
+    // Mark one unrelated video in the disposable catalog unavailable for this import.
+    const usedVideos=new Set([fixtures[0],fixtures[4],fixtures[3],fixtures[5]].map(clip=>clip.id.split(':')[0]));
+    const unavailable=all.find(clip=>!usedVideos.has(clip.id.split(':')[0]));
+    const changed=spawnSync(path.resolve('.venv/Scripts/python.exe'),['-c',
+      'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute("UPDATE videos SET availability_status=? WHERE bvid=?",(sys.argv[2],sys.argv[3])); db.commit(); db.close()',
+      path.join(output,'数据','catalog.sqlite3'),'unavailable',unavailable.id.split(':')[0]],{encoding:'utf8',windowsHide:true});
+    assert.equal(changed.status,0,changed.stderr);
+    const mixed=[...copiedLinks,'',copiedLinks[0],'invalid-line','BV0000000000',unavailable.playback_url].join('\n');
+    await pasted.fill(mixed);await importButton.click();
+    await until(async()=>(await importStatus.textContent()).includes('已加入 4 首'));
+    assert.match(await importStatus.textContent(),/重复输入 1 行，格式无效 1 行，本机未找到 1 行，不可播放 1 行/);
+    assert.equal(await pasted.inputValue(),mixed);
+    assert.equal(lookups,1);assert.equal((await savedLists()).length,oldCount);
+    await page.locator('#playlist-copy-links').click();assert.equal(await page.evaluate(()=>window.__copied),links);
+    await pasted.fill(links);await importButton.click();
+    await until(async()=>(await importStatus.textContent()).includes('已加入 0 首，歌单已有 4 首'));
+    assert.equal(await pasted.inputValue(),'');assert.equal(await page.locator('#playlist-items li').count(),4);
+    assert.equal(lookups,2);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    await fillRepeated(20000,copiedLinks[0]);await importButton.click();
+    await until(async()=>(await importStatus.textContent()).includes('歌单已有 1 首，重复输入 19999 行'));
+    assert.equal(lookups,3);assert.equal(await pasted.inputValue(),'');
+    await nameInput.fill('链接导入测试');await page.locator('#playlist-save-button').click();await editor.waitFor({state:'hidden'});
+    const pastedId=await page.locator('#playlist-select').inputValue();
+    const imported=await(await fetch(base+'/api/playlists/'+pastedId)).json();
+    assert.deepEqual(imported.items.map(item=>item.id),[fixtures[0],fixtures[4],fixtures[3],fixtures[5]].map(item=>item.id));
+    pass('Copied links round-trip in order through one local lookup per paste; unavailable, invalid, missing, duplicate and already-present lines are counted up to 20,000 lines; only Save writes a playlist');
+
+    let releaseLookup, lookupStarted;
+    const pendingLookup=new Promise(resolve=>{lookupStarted=resolve;});
+    const blockLookup=new Promise(resolve=>{releaseLookup=resolve;});
+    await page.route(resolver,async route=>{lookupStarted();await blockLookup;await route.continue();},{times:1});
+    await page.locator('#playlist-new').click();await page.locator('#playlist-import summary').click();
+    await pasted.fill(links);await importButton.click();await pendingLookup;
+    assert.equal(await page.locator('#playlist-save-button').isDisabled(),true);
+    await Promise.all([respond('confirm',true),close.last().click()]);
+    await page.locator('#playlist-new').click();await page.locator('#playlist-import summary').click();
+    await pasted.fill('新草稿');const lateResponse=page.waitForResponse(resolver);
+    releaseLookup();await (await lateResponse).finished();
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(resolve)));
+    assert.equal(await pasted.inputValue(),'新草稿');assert.equal(await importStatus.textContent(),'');
+    assert.equal(await page.locator('#playlist-items [data-remove]').count(),0);
+    assert.equal(await page.locator('#playlist-save-button').isDisabled(),false);
+    await Promise.all([respond('confirm',true),close.last().click()]);
+    pass('Closing during a lookup guards the draft; late results leave a newly opened editor untouched');
     useFullQueue=true;
     await page.locator('#play-all').click();await until(async()=>await page.locator('#player-queue button').count()===all.length);
     assert.ok(all.length>=1000);

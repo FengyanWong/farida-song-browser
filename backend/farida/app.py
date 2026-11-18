@@ -2,18 +2,18 @@ import asyncio
 from collections import OrderedDict
 from threading import Lock
 import csv
-import io
 import json
 import secrets
 import sqlite3
+import tempfile
 import webbrowser
 from contextlib import asynccontextmanager
 from datetime import date
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -32,6 +32,31 @@ from .backup import export_backup, restore_validated_backup, validate_backup, LI
 
 
 CatalogSort = Literal["newest", "oldest", "title", "uploader", "discovered"]
+
+
+def csv_cell(value):
+    # Prefix values that a spreadsheet could interpret as a formula.
+    text = str(value or "")
+    return "'" + text if text.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")) else value
+
+
+class CatalogCSVResponse(StreamingResponse):
+    """Own the completed spool until the HTTP download finishes or disconnects."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        size = stream.tell()
+        stream.seek(0)
+        super().__init__(
+            iter(lambda: stream.read(32 * 1024), ""), media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": "attachment; filename=farida-clips.csv", "Content-Length": str(size)},
+        )
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.stream.close()
 
 
 class Model(BaseModel):
@@ -65,6 +90,10 @@ class BulkAnnotation(Model):
 
 class Bookmark(Model):
     bookmarked: bool
+
+
+class PlaylistLinks(Model):
+    links: list[Annotated[str, Field(min_length=1, max_length=2048)]] = Field(min_length=1, max_length=20000)
 
 
 class PlaylistCreate(Model):
@@ -332,6 +361,10 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     def create_playlist(body: PlaylistCreate):
         return db.save_playlist(body.name, body.clip_ids)
 
+    @app.post('/api/playlists/resolve-links')
+    def resolve_playlist_links(body: PlaylistLinks):
+        return db.resolve_playlist_links(body.links)
+
     @app.get('/api/playlists/{playlist_id}')
     def get_playlist(playlist_id: int):
         return db.playlist(playlist_id)
@@ -457,18 +490,25 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     def export(format: Literal["json","csv"]="csv",q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: date | None=None,before: date | None=None,bookmarked: bool=False,sort: CatalogSort="newest"):
         if len(q)>500 or (after and before and after>before):
             raise ValueError("无效的筛选条件")
-        # The same query covers the complete stored selection, not just the UI page.
-        entries = db.clips(q=q,status=status,source_id=source_id,uploader=uploader,after=after,before=before,bookmarked=bookmarked,sort=sort,page_size=2147483647)["items"]
+        filters = dict(q=q, status=status, source_id=source_id, uploader=uploader,
+                       after=after, before=before, bookmarked=bookmarked, sort=sort)
         if format == "json":
+            entries = db.clips(**filters, page_size=2147483647)["items"]
             return JSONResponse(entries,headers={"Content-Disposition":"attachment; filename=farida-clips.json"})
-        output = io.StringIO()
-        writer = csv.writer(output)
-        keys = ["display_song_title","raw_title","uploader_name","published_at","video_bvid","cid","part_number","playback_url","inclusion_status","songlist_attribution","songlist_url"]
-        writer.writerow(keys)
-        for entry in entries:
-            # Prevent spreadsheet formula execution from upstream/user titles.
-            writer.writerow([("'" + str(entry.get(k) or "")) if str(entry.get(k) or "").lstrip().startswith(("=","+","-","@","\t","\r")) else entry.get(k) for k in keys])
-        return Response("\ufeff"+output.getvalue(),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":"attachment; filename=farida-clips.csv"})
+        stream = tempfile.SpooledTemporaryFile(max_size=256 * 1024, mode="w+", encoding="utf-8", newline="")
+        try:
+            stream.write("\ufeff")
+            writer = csv.writer(stream)
+            writer.writerow(("display_song_title", "raw_title", "uploader_name", "published_at", "video_bvid",
+                             "cid", "part_number", "playback_url", "inclusion_status", "songlist_attribution",
+                             "songlist_url"))
+            with db.csv_rows(**filters) as rows:
+                for row in rows:
+                    writer.writerow(csv_cell(value) for value in row)
+            return CatalogCSVResponse(stream)
+        except BaseException:
+            stream.close()
+            raise
 
     @app.get("/api/player-state")
     def player_state(compact: bool = False):

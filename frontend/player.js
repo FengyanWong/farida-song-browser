@@ -1,6 +1,8 @@
 import { $, $$, escape as e, icon, toast, writeClipboard } from './ui.js';
 import { bindPlaylistDrag } from './playlist-drag.js';
 
+const maxPlaylistItems = 20000;
+
 export class PlaylistPlayer {
   constructor(api, parameters, selectedClips) {
     this.api=api;this.parameters=parameters;this.selectedClips=selectedClips;
@@ -24,18 +26,21 @@ export class PlaylistPlayer {
     $('#playlist-add-selected').onclick=()=>this.editSelected(this.selectedClips());
     $('#playlist-add-results').onclick=()=>this.addResults();
     $('#playlist-copy-links').onclick=()=>this.copyPlaylistLinks();
+    $('#playlist-import-add').onclick=()=>this.importPlaylistLinks();
+    $('#playlist-import-text').oninput=()=>{if(this.editing)this.editing.linksChecked=false;};
     $('#playlist-save').onsubmit=event=>{event.preventDefault();this.save();};
     $('#playlist-delete').onclick=()=>this.remove();
     const editor = $('#playlist-dialog');
+    const hasDraft = () => this.hasPlaylistChanges() || !!$('#playlist-import-text').value.trim();
     this.warnBeforeUnload = event => {
-      if (editor.open && this.hasPlaylistChanges()) {
+      if (editor.open && hasDraft()) {
         event.preventDefault();
         event.returnValue = true;
       }
     };
     const discard = () => {
       if (this.editing?.saving) return confirm('歌单正在保存，关闭编辑器？');
-      return !this.hasPlaylistChanges() || confirm('放弃未保存的歌单修改？');
+      return !hasDraft() || confirm('放弃未保存的歌单修改？');
     };
     editor.addEventListener('cancel', event => { if (!discard()) event.preventDefault(); });
     editor.addEventListener('click', event => {
@@ -442,6 +447,11 @@ export class PlaylistPlayer {
     this.editing = {id:list?.id ?? null, savedName:list?.name ?? '',
                     savedIds:items.map(item=>item.id), items:[...items]};
     this.addItems(add);
+    $('#playlist-import').open=false;
+    $('#playlist-import-text').value='';
+    $('#playlist-import-text').readOnly=false;
+    $('#playlist-import-add').disabled=false;
+    $('#playlist-import-status').textContent='';
     $('#playlist-save-button').disabled=false;$('#playlist-delete').disabled=false;
     $('#playlist-search').value='';$('#playlist-search-clear').hidden=true;
     $('#playlist-name').value=this.editing.savedName;
@@ -450,9 +460,58 @@ export class PlaylistPlayer {
     this.renderEditing();$('#playlist-dialog').showModal();$('#playlist-name').focus();
     window.addEventListener('beforeunload', this.warnBeforeUnload);
   }
-  addItems(items) {
-    const ids=new Set(this.editing.items.map(item=>item.id));
-    for(const item of items)if(!ids.has(item.id)){this.editing.items.push(item);ids.add(item.id);}
+  addItems(items, limit=Infinity) {
+    const current=this.editing.items, ids=new Set(current.map(item=>item.id));
+    let added=0, existing=0, overflow=0;
+    for (const item of items) {
+      if (ids.has(item.id)) { existing++; continue; }
+      if (current.length>=limit) { overflow++; continue; }
+      current.push(item);ids.add(item.id);added++;
+    }
+    return {added,existing,overflow};
+  }
+  async importPlaylistLinks() {
+    const edit=this.editing, input=$('#playlist-import-text'), status=$('#playlist-import-status');
+    if (!edit || edit.resolving || edit.saving) return;
+    const links=input.value.split(/\r?\n/).map(line=>line.trim()).filter(Boolean);
+    if (!links.length) {
+      status.textContent='请先粘贴视频链接或 BV 号。';input.focus();return;
+    }
+    if (links.length>maxPlaylistItems || links.some(line=>line.length>2048 && [...line].length>2048)) {
+      status.textContent='每次最多添加 20,000 行，每行最多 2,048 个字符。';return;
+    }
+    edit.resolving=true;
+    input.readOnly=true;
+    $('#playlist-import-add').disabled=true;
+    $('#playlist-save-button').disabled=true;
+    $('#playlist-delete').disabled=true;
+    status.textContent='正在查找本机片段…';
+    try {
+      const result=await this.api('/api/playlists/resolve-links',{method:'POST',body:JSON.stringify({links})});
+      if (edit!==this.editing || !$('#playlist-dialog').open) return;
+      const {added,existing,overflow}=this.addItems(result.items,maxPlaylistItems);
+      if (added) this.renderEditing();
+      const counts=[`已加入 ${added} 首`];
+      if (existing) counts.push(`歌单已有 ${existing} 首`);
+      if (result.duplicates) counts.push(`重复输入 ${result.duplicates} 行`);
+      if (result.invalid) counts.push(`格式无效 ${result.invalid} 行`);
+      if (result.missing) counts.push(`本机未找到 ${result.missing} 行`);
+      if (result.unavailable) counts.push(`不可播放 ${result.unavailable} 行`);
+      if (overflow) counts.push(`歌单已满，另有 ${overflow} 首未加入`);
+      status.textContent=counts.join('，')+'。';
+      if (!overflow && !result.invalid && !result.missing && !result.unavailable) input.value='';
+      edit.linksChecked=true;
+    } catch (error) {
+      if (edit===this.editing && $('#playlist-dialog').open) status.textContent=error.message;
+    } finally {
+      edit.resolving=false;
+      if (edit===this.editing && $('#playlist-dialog').open) {
+        input.readOnly=false;
+        $('#playlist-import-add').disabled=false;
+        $('#playlist-save-button').disabled=false;
+        $('#playlist-delete').disabled=false;
+      }
+    }
   }
   async addResults() {
     const edit=this.editing;
@@ -528,10 +587,18 @@ export class PlaylistPlayer {
   }
   async save() {
     const edit=this.editing,name=$('#playlist-name').value.trim();
-    if (!edit || edit.saving) return;
+    if (!edit || edit.saving || edit.resolving) return;
+    if (!edit.linksChecked && $('#playlist-import-text').value.trim()) {
+      $('#playlist-import').open=true;
+      $('#playlist-import-status').textContent='请先点击「加入歌单」查找这些链接，或清空后保存。';
+      $('#playlist-import-add').focus();
+      return;
+    }
     if(!name){$('#playlist-error').textContent='请输入歌单名称。';return;}
     const ids = edit.items.map(item=>item.id);
     edit.saving=true;
+    $('#playlist-import-text').readOnly=true;
+    $('#playlist-import-add').disabled=true;
     $('#playlist-save-button').disabled=true;$('#playlist-delete').disabled=true;
     try {
       const result=await this.api('/api/playlists'+(edit.id?'/'+edit.id:''),{
@@ -553,6 +620,8 @@ export class PlaylistPlayer {
     } finally {
       edit.saving=false;
       if (this.editing === edit) {
+        $('#playlist-import-text').readOnly=false;
+        $('#playlist-import-add').disabled=false;
         $('#playlist-save-button').disabled=false;
         $('#playlist-delete').disabled=false;
       }

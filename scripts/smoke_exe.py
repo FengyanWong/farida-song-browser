@@ -9,7 +9,6 @@ import socket
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +20,10 @@ from threading import Thread
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 from farida import __version__
+if __package__:
+    from .release_staging import staging_directory
+else:
+    from release_staging import staging_directory
 
 
 @contextmanager
@@ -56,11 +59,17 @@ def main(proxy_url, destinations):
     expected = json.loads((ROOT / "data/catalog.json").read_text(encoding="utf-8"))["counts"]
     output = ROOT / ".local" / "exe-smoke"
     output.mkdir(parents=True, exist_ok=True)
-    workspace = Path(tempfile.mkdtemp(prefix="运行测试-", dir=output))
+    with staging_directory(output, "运行测试-") as workspace:
+        report = check_executable(args.executable, workspace, expected, proxy_url, destinations)
+        (output / "results.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, indent=2))
+
+
+def check_executable(source_executable, workspace, expected, proxy_url, destinations):
     program = workspace / "独立程序"
     program.mkdir()
     executable = program / "法里达.exe"
-    shutil.copy2(args.executable, executable)
+    shutil.copy2(source_executable, executable)
     data = workspace / "用户数据"
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -178,9 +187,7 @@ def main(proxy_url, destinations):
     diagnostic = (data / 'launcher.log').read_text(encoding='utf-8')
     assert '法里达' in diagnostic and 'Traceback' not in diagnostic
     checks.append('Windowless output is retained in a UTF-8 local log')
-    report = {"checks": checks, "catalog": expected, "executable_bytes": args.executable.stat().st_size}
-    (output / "results.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report, indent=2))
+    return {"checks": checks, "catalog": expected, "executable_bytes": source_executable.stat().st_size}
 
 
 if __name__ == "__main__":

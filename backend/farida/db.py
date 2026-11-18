@@ -121,10 +121,10 @@ CREATE INDEX IF NOT EXISTS membership_video ON memberships(video_bvid);
 CREATE UNIQUE INDEX IF NOT EXISTS single_active_job ON sync_jobs((1)) WHERE state IN ('queued','running');
 """
 
-CLIP_FROM = """ FROM parts p
- JOIN videos v ON v.bvid=p.video_bvid
+CLIP_JOINS = """ JOIN videos v ON v.bvid=p.video_bvid
  JOIN annotations a ON a.clip_id=p.id
  LEFT JOIN user_state u ON u.clip_id=p.id """
+CLIP_FROM = " FROM parts p" + CLIP_JOINS
 
 OVERVIEW_JOB_LIMIT = 10
 
@@ -142,12 +142,19 @@ PLAYER_STATE_SQL = """SELECT s.id, CASE WHEN p.id IS NULL THEN s.value
  ELSE json_patch(s.value,p.value) END AS value FROM playback_state s
  LEFT JOIN playback_progress p ON s.id=p.id WHERE s.id=1"""
 
+CURATED_CREDIT = "EXISTS(SELECT 1 FROM curated_songs cs WHERE cs.bvid=v.bvid) AS has_curated_credit"
+
+
+def songlist_credit(present):
+    return ("CLANNADOR", SONGLIST_URL) if present else ("", "")
+
+
 # Both catalog views display the original upload, membership credit, and bookmark.
 CATALOG_COLUMNS = """(SELECT COUNT(*) FROM parts siblings
  WHERE siblings.video_bvid=p.video_bvid AND siblings.active=1) AS part_count,
  v.uploader_uid,v.uploader_name,v.raw_title,v.thumbnail_url,v.published_at,
  a.display_song_title,a.song_group,a.inclusion_status,COALESCE(u.bookmarked,0) AS bookmarked,
- EXISTS(SELECT 1 FROM curated_songs cs WHERE cs.bvid=v.bvid) AS has_curated_credit,""" + PLAYBACK_URL
+ """ + CURATED_CREDIT + "," + PLAYBACK_URL
 BROWSE_COLUMNS = "p.id,p.part_number,p.raw_part_title," + CATALOG_COLUMNS
 DETAIL_COLUMNS = """p.*,v.description,v.tags,v.availability_status,v.verification_status,v.statistics,
  v.stats_fetched_at,v.stats_scope,v.fetched_at,v.provenance,
@@ -414,8 +421,7 @@ class Database:
     def clip_row(row):
         for key in ("tags","statistics","provenance","manual_fields"):
             row[key] = json.loads(row[key])
-        row['songlist_attribution'] = 'CLANNADOR' if row['has_curated_credit'] else ''
-        row['songlist_url'] = SONGLIST_URL if row['has_curated_credit'] else ''
+        row['songlist_attribution'], row['songlist_url'] = songlist_credit(row['has_curated_credit'])
         return row
 
     def clips(self, page=1, page_size=40, sort="newest", *, compact=False, **filters):
@@ -433,6 +439,16 @@ class Database:
             for item in items:
                 self.clip_row(item)
         return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+    @contextmanager
+    def csv_rows(self, sort="newest", **filters):
+        where, args = self.filters(**filters)
+        columns = ("a.display_song_title,v.raw_title,v.uploader_name,v.published_at,"
+                   "p.video_bvid,p.cid,p.part_number," + PLAYBACK_URL + ",a.inclusion_status," + CURATED_CREDIT)
+        with self.connect() as con:
+            # The cursor holds one read snapshot for all matching rows.
+            rows = con.execute("SELECT " + columns + CLIP_FROM + where + " ORDER BY " + clip_order(sort), args)
+            yield ((*row[:-1], *songlist_credit(row[-1])) for row in rows)
 
     def grouped_clips(self, page=1, page_size=40, sort="newest", *, compact=False, **filters):
         """Page complete song groups, retaining every matching recording."""
@@ -512,6 +528,46 @@ class Database:
         where, args = self.filters(**filters)
         order = clip_order(sort)
         return self.all(QUEUE_SELECT + where + f' ORDER BY {order}', args)
+
+    def resolve_playlist_links(self, links):
+        targets = {}
+        invalid = duplicates = 0
+        for link in links:
+            reference = video_reference(link)
+            if reference is None or reference[1] == 0:
+                invalid += 1
+                continue
+            bvid, part = reference
+            target = (bvid, part or 1)
+            if target in targets:
+                duplicates += 1
+            else:
+                targets[target] = None
+
+        found = set()
+        playable = {}
+        if targets:
+            # Start with the requested pairs and use the existing per-video index.
+            # A previously archived CID can share a part number with its replacement.
+            sql = ("SELECT requested.key AS ordinal," + QUEUE_COLUMNS
+                   + " FROM json_each(?) requested CROSS JOIN parts p"
+                   + " ON p.video_bvid=json_extract(requested.value,'$[0]')"
+                   + " AND p.part_number=json_extract(requested.value,'$[1]')" + CLIP_JOINS)
+            with self.connect() as con:
+                for row in con.execute(sql, (encode(list(targets)),)):
+                    ordinal = row["ordinal"]
+                    found.add(ordinal)
+                    if row["playback_url"]:
+                        # Do not guess if an inconsistent catalog has two active CIDs.
+                        if ordinal in playable:
+                            playable[ordinal] = None
+                        else:
+                            item = dict(row)
+                            del item["ordinal"]
+                            playable[ordinal] = item
+        items = [playable[index] for index in range(len(targets)) if playable.get(index)]
+        return {"items": items, "invalid": invalid, "duplicates": duplicates,
+                "missing": len(targets) - len(found), "unavailable": len(found) - len(items)}
 
     def playlists(self):
         return self.all('SELECT l.*,COUNT(i.clip_id) AS count FROM playlists l LEFT JOIN playlist_items i '

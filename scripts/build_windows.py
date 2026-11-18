@@ -8,13 +8,16 @@ import ssl
 import struct
 import subprocess
 import sys
-import tempfile
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 from farida import __version__
+if __package__:
+    from .release_staging import staging_directory
+else:
+    from release_staging import staging_directory
 
 
 def runtime_packages():
@@ -73,8 +76,11 @@ def main():
     for folder in (build, dist, release):
         folder.mkdir(parents=True, exist_ok=True)
     # Fresh staging avoids stale notices and OneDrive locks from earlier builds.
-    licenses = Path(tempfile.mkdtemp(prefix="licenses-", dir=build))
-    work = Path(tempfile.mkdtemp(prefix="pyinstaller-", dir=build))
+    with staging_directory(build, "licenses-") as licenses, staging_directory(build, "pyinstaller-") as work:
+        build_release(snapshot, build, dist, release, licenses, work)
+
+
+def build_release(snapshot, build, dist, release, licenses, work):
     collect_licenses(licenses)
     icon = build / "app.ico"
     make_icon(icon)
