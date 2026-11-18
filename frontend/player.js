@@ -1,4 +1,4 @@
-import { $, $$, escape as e, icon, toast, writeClipboard } from './ui.js';
+import { $, $$, escape as e, icon, toast, copyClipLinks } from './ui.js';
 import { bindPlaylistDrag } from './playlist-drag.js';
 
 const maxPlaylistItems = 20000;
@@ -57,6 +57,9 @@ export class PlaylistPlayer {
       if (!editor.open) {
         window.removeEventListener('beforeunload', this.warnBeforeUnload);
         this.editing = null;
+        $('#playlist-items').replaceChildren();
+        $('#playlist-copy-text').value='';
+        $('#playlist-import-text').value='';
         if (this.refreshListsOnClose) this.loadPlaylists().catch(error=>toast(error.message));
       }
     });
@@ -121,6 +124,13 @@ export class PlaylistPlayer {
     this.compact=!!compact;$('#music-player').classList.toggle('compact',this.compact);
     $('#player-compact').textContent=this.compact?'展开播放器':'收起播放器';
     $('#player-compact').setAttribute('aria-expanded',String(!this.compact));
+    const list=$('#player-queue');
+    if (this.compact) this.releaseQueueRows();
+    else if (!$('#music-player').hidden && this.queue.length && !list.childElementCount) {
+      this.renderQueue();
+      const selected=list.querySelector('[aria-current]');
+      if(selected)list.scrollTop=selected.offsetTop-list.offsetTop-45;
+    }
     if(persist)this.persistPreferences();
   }
   preferences() {return {volume:this.video.volume,muted:this.video.muted,compact:this.compact};}
@@ -186,7 +196,12 @@ export class PlaylistPlayer {
     if (button) button.tabIndex = 0;
     this.queueTabStop = button;
   }
+  releaseQueueRows() {
+    this.setQueueTabStop(null);
+    $('#player-queue').replaceChildren();
+  }
   renderQueue() {
+    if (this.compact) return;
     const input=$('#player-queue-search'),query=input.value,rows=this.matchingItems(this.queue,query);
     input.dataset.appliedQuery=query;
     $('#player-queue-count').textContent=query.trim()?`${rows.length} / ${this.queue.length} 首`:`共 ${this.queue.length} 首`;
@@ -291,11 +306,12 @@ export class PlaylistPlayer {
     if (!saved || this.resumeLoad || this.persistenceSuspended || !this.canPlay()) return;
     this.beginQueueRequest();
     if (saved.items===this.queue) {
-      // The queue, its progress key, shuffle history and search results are still in memory.
+      // Keep the original queue and its progress key. Rebuild its visible rows on demand.
       this.saved=null;
       $('#player-remembered').hidden=true;
       $('#music-player').hidden=false;
       this.logicalPlay=saved.logicalPlay;
+      this.renderQueue();
       this.recoveryAttempts=0;
       this.play(this.index,saved,!!this.logicalPlay);
     } else {
@@ -501,6 +517,10 @@ export class PlaylistPlayer {
     ++this.generation;this.beginQueueRequest();this.abort?.abort();this.segments=[];this.logicalPlay=null;this.handlingFailure=null;this.failed=false;
     this.video.pause();this.video.removeAttribute('src');this.video.load();
     panel.hidden=true;$('#play-all').disabled=false;
+    this.releaseQueueRows();
+    if (!keepResume) {
+      this.queue=[];this.index=-1;this.history=[];this.visited.clear();this.unavailable.clear();
+    }
     if (keepResume) {
       this.updateResumeButton();
       if (!remembered.hidden) remembered.focus({preventScroll:true});
@@ -650,33 +670,34 @@ export class PlaylistPlayer {
     }
   }
   async copyPlaylistLinks() {
-    const edit = this.editing;
-    const links = edit.items.map(item => item.playback_url).filter(Boolean);
-    const skipped = edit.items.length - links.length;
-    const status = $('#playlist-copy-status');
-    const fallback = $('#playlist-copy-text');
-    fallback.hidden = true;
-    const suffix = skipped ? `，跳过 ${skipped} 个不可用片段` : '';
-    if (!links.length) {
-      status.textContent = '没有可复制的链接' + suffix + '。';
-      return;
-    }
-    const text = links.join('\n');
-    const copied = await writeClipboard(text);
-    if (edit !== this.editing || !$('#playlist-dialog').open) return;
-    if (copied) {
-      status.textContent = `已复制 ${links.length} 个链接${suffix}。`;
-    } else {
-      status.textContent = `请手动复制以下 ${links.length} 个链接${suffix}。`;
-      fallback.value = text;
-      fallback.hidden = false;
-      fallback.focus();
-      fallback.select();
+    const edit=this.editing;
+    if (!edit || edit.copying || !edit.items.length) return;
+    const ids=edit.items.map(item=>item.id);
+    const current=()=>this.currentEditor(edit) && edit.items.length===ids.length &&
+      ids.every((id,index)=>id===edit.items[index].id);
+    const button=$('#playlist-copy-links'),status=$('#playlist-copy-status'),fallback=$('#playlist-copy-text');
+    edit.copying=true;button.disabled=true;fallback.hidden=true;
+    status.textContent='正在读取当前链接…';
+    try {
+      const result=await copyClipLinks(this.api,ids,current);
+      if (!result) return;
+      const {text,count,skipped,copied}=result;
+      const suffix=skipped?`，跳过 ${skipped} 个不可用片段`:'';
+      if (!count) status.textContent='没有可复制的链接'+suffix+'。';
+      else if (copied) status.textContent=`已复制 ${count} 个链接${suffix}。`;
+      else {
+        status.textContent=`请手动复制以下 ${count} 个链接${suffix}。`;
+        fallback.value=text;fallback.hidden=false;fallback.focus();fallback.select();
+      }
+    } catch(error) {if(current())status.textContent=error.message;}
+    finally {
+      edit.copying=false;
+      if (this.currentEditor(edit)) button.disabled=!edit.items.length;
     }
   }
   renderEditing() {
     this.playlistDrag?.cancel();
-    $('#playlist-copy-links').disabled = !this.editing.items.length;
+    $('#playlist-copy-links').disabled = !!this.editing.copying || !this.editing.items.length;
     $('#playlist-copy-status').textContent = '';
     $('#playlist-copy-text').hidden = true;
     $('#playlist-copy-text').value = '';

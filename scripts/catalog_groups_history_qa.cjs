@@ -325,8 +325,8 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
       return ids.length===1 && ids[0]===wanted;
     });
     await page.locator('#clip-rows [data-detail]').click();
-    await page.locator('[data-copy-url]').click();
-    assert.equal(await page.evaluate(()=>window.copiedUrl),canonical);
+    await page.locator('[data-copy-clip]').click();
+    await until(async()=>await page.evaluate(()=>window.copiedUrl)===canonical);
     await page.locator('#detail-dialog .close-dialog').click();
     await page.locator('#search').fill('');
     await until(async()=>await page.locator('#clip-rows [data-play]').count()===40);
@@ -631,6 +631,33 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     });
     await range.getByLabel('结束上传日期').fill('2030-01-01');await filteredDates;
     pass('Both upload dates and picker edges fit 320–390px widths; keyboard navigation and combined range requests work');
+    let exportRequests=0, catalogReads=0;
+    const countExports=request=>{
+      const url=new URL(request.url());
+      if(url.pathname==='/api/export') exportRequests++;
+      if(url.pathname==='/api/clips') catalogReads++;
+    };
+    page.on('request',countExports);
+    await range.getByLabel('结束上传日期').fill('2019-01-01');
+    const invalidDate='起始上传日期不能晚于结束日期';
+    await until(async()=>(await page.locator('#notice').innerText()).includes(invalidDate));
+    const invalidAgain=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/clips' && response.status()===400);
+    await page.locator('#export-button').click();await invalidAgain;
+    assert.equal(exportRequests,0);assert.equal(new URL(page.url()).pathname,'/');
+    await range.getByLabel('结束上传日期').fill('2030-01-01');
+    await until(()=>page.locator('#notice').isHidden());
+    const reads=catalogReads;
+    const downloading=page.waitForEvent('download');await page.locator('#export-button').click();
+    const catalogFile=await downloading;assert.equal(catalogFile.suggestedFilename(),'farida-clips.csv');
+    assert.equal(await catalogFile.failure(),null);assert.equal(catalogReads,reads);
+    await page.route(url=>url.pathname==='/api/export',route=>route.fulfill({status:500,body:'temporary error'}),{times:1});
+    await page.locator('#export-button').click();
+    await until(async()=>(await page.locator('#notice').innerText()).includes('导出失败'));
+    assert.equal(new URL(page.url()).pathname,'/');assert.equal(exportRequests,2);
+    const retry=page.waitForEvent('download');await page.locator('#export-button').click();
+    assert.equal(await (await retry).failure(),null);assert.equal(await page.locator('#notice').isHidden(),true);
+    page.off('request',countExports);
+    pass('Invalid date ranges stay in the catalog, valid filters download without rereading, and export errors keep the app open');
     async function checkLocalDays(zone, boundaries) {
       const local=await browser.newContext({locale:'zh-CN',timezoneId:zone});
       const view=await local.newPage();

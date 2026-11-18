@@ -201,6 +201,7 @@ DETAIL_COLUMNS = """p.*,v.description,v.tags,v.availability_status,v.verificatio
  v.stats_fetched_at,v.stats_scope,v.fetched_at,v.provenance,
  a.classification_reason,a.classification_version,a.manual_fields,COALESCE(u.notes,'') AS notes,""" + CATALOG_COLUMNS
 CLIP_SELECT = "SELECT " + DETAIL_COLUMNS + CLIP_FROM
+GROUP_KEY = "COALESCE(NULLIF(fold(a.song_group),''), NULLIF(fold(a.display_song_title),''), p.id)"
 
 
 def upload_boundary(value, *, end):
@@ -598,48 +599,71 @@ class Database:
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
     @contextmanager
-    def csv_rows(self, sort="newest", **filters):
+    def export_rows(self, format, *, sort="newest", grouped=False, **filters):
         where, args = self.filters(**filters)
-        columns = ("a.display_song_title,v.raw_title,v.uploader_name,v.published_at,"
-                   "p.video_bvid,p.cid,p.part_number," + PLAYBACK_URL + ",a.inclusion_status," + CURATED_CREDIT)
+        order = clip_order(sort)
+        columns = DETAIL_COLUMNS if format == "json" else (
+            "a.display_song_title,v.raw_title,v.uploader_name,v.published_at,"
+            "p.video_bvid,p.cid,p.part_number," + PLAYBACK_URL + ",a.inclusion_status," + CURATED_CREDIT
+        )
+        query = "SELECT " + columns + CLIP_FROM
+        if grouped:
+            # Groups follow their first matching clip; each group's clips keep their individual order.
+            ranked = (f"SELECT p.id,{GROUP_KEY} AS group_key,ROW_NUMBER() OVER (ORDER BY {order}) AS ordinal"
+                      + CLIP_FROM + where)
+            query = ("WITH ranked AS (" + ranked + "), ordered AS ("
+                     "SELECT id,ordinal,MIN(ordinal) OVER (PARTITION BY group_key) AS first_ordinal FROM ranked) "
+                     + query + " JOIN ordered ON ordered.id=p.id ORDER BY ordered.first_ordinal,ordered.ordinal")
+        else:
+            query += where + " ORDER BY " + order
         with self.connect() as con:
-            # The cursor holds one read snapshot for all matching rows.
-            rows = con.execute("SELECT " + columns + CLIP_FROM + where + " ORDER BY " + clip_order(sort), args)
-            yield ((*row[:-1], *songlist_credit(row[-1])) for row in rows)
+            # The cursor holds one read snapshot until the export is completely spooled.
+            rows = con.execute(query, args)
+            if format == "json":
+                yield (self.clip_row(dict(row)) for row in rows)
+            else:
+                yield ((*row[:-1], *songlist_credit(row[-1])) for row in rows)
 
     def grouped_clips(self, page=1, page_size=40, sort="newest", *, compact=False, **filters):
         """Page complete song groups, retaining every matching recording."""
         where, args = self.filters(**filters)
-        order = clip_order(sort)
-        # Rank compact IDs first so descriptions and other metadata are only
-        # loaded for recordings that belong to this page.
-        group_key = "COALESCE(NULLIF(fold(a.song_group),''), NULLIF(fold(a.display_song_title),''), p.id)"
-        rank = (f"SELECT p.id, {group_key} AS group_key, "
-                f"ROW_NUMBER() OVER (ORDER BY {order}) AS ordinal"
-                + CLIP_FROM + where)
-        columns = BROWSE_COLUMNS if compact else DETAIL_COLUMNS
-        page_query = ("WITH ranked AS (" + rank + "), selected AS ("
-                      "SELECT group_key, MIN(ordinal) AS first_ordinal FROM ranked GROUP BY group_key "
-                      "ORDER BY first_ordinal LIMIT ? OFFSET ?) "
-                      + "SELECT ranked.group_key," + columns + CLIP_FROM
-                      + " JOIN ranked ON ranked.id=p.id JOIN selected ON selected.group_key=ranked.group_key"
-                      + " ORDER BY selected.first_ordinal, ranked.ordinal")
+        start = (page - 1) * page_size
+        stop = start + page_size
+        seen_groups, selected = set(), {}
+        total_clips = 0
         with self.connect() as con:
             con.execute("BEGIN")
-            counts = con.execute(f"SELECT COUNT(*) AS clips, COUNT(DISTINCT {group_key}) AS groups"
-                                 + CLIP_FROM + where, args).fetchone()
-            rows = con.execute(page_query, [*args, page_size, (page-1)*page_size]).fetchall()
-        groups, items = {}, []
-        for row in rows:
-            item = dict(row)
-            key = item.pop('group_key')
-            group = groups.setdefault(key, {'key': key, 'title': item['song_group'].strip() or item['display_song_title'],
-                                            'count': 0, 'clip_ids': []})
-            group['count'] += 1
-            group['clip_ids'].append(item['id'])
-            items.append(item if compact else self.clip_row(item))
-        return {'groups': list(groups.values()), 'items': items, 'total': counts['groups'],
-                'total_clips': counts['clips'], 'page': page, 'page_size': page_size}
+            # A group's first recording determines its position. Count and select in
+            # the same pass to avoid repeating expensive text filters and sorting.
+            ordered = "SELECT p.id," + GROUP_KEY + CLIP_FROM + where + " ORDER BY " + clip_order(sort)
+            for clip_id, key in con.execute(ordered, args):
+                total_clips += 1
+                if key not in seen_groups:
+                    if start <= len(seen_groups) < stop:
+                        selected[key] = []
+                    seen_groups.add(key)
+                if key in selected:
+                    selected[key].append(clip_id)
+            total_groups = len(seen_groups)
+            del seen_groups
+            rows_by_id = {}
+            if selected:
+                ids = [clip_id for group in selected.values() for clip_id in group]
+                columns = BROWSE_COLUMNS if compact else DETAIL_COLUMNS
+                rows = con.execute("SELECT " + columns + CLIP_FROM + " WHERE p.id IN (SELECT value FROM json_each(?))",
+                                   (encode(ids),))
+                rows_by_id = {row["id"]: dict(row) for row in rows}
+        groups, items = [], []
+        for key, ids in selected.items():
+            first = rows_by_id[ids[0]]
+            groups.append({"key": key, "title": first["song_group"].strip() or first["display_song_title"],
+                           "count": len(ids), "clip_ids": ids})
+            items.extend(rows_by_id[clip_id] for clip_id in ids)
+        if not compact:
+            for item in items:
+                self.clip_row(item)
+        return {"groups": groups, "items": items, "total": total_groups, "total_clips": total_clips,
+                "page": page, "page_size": page_size}
 
     def listening_history(self):
         return self.all("SELECT h.last_played_at," + QUEUE_COLUMNS + CLIP_FROM +
@@ -727,6 +751,16 @@ class Database:
         where, args = self.filters(**filters)
         order = clip_order(sort)
         return self.all(QUEUE_SELECT + where + f' ORDER BY {order}', args)
+
+    def playlist_copy_links(self, clip_ids):
+        # A saved CID stays the same when a multipart video is reordered.
+        # Join in draft order and read all current part numbers in one snapshot.
+        sql = ("SELECT " + PLAYBACK_URL + " FROM json_each(?) requested"
+               " CROSS JOIN parts p ON p.id=requested.value JOIN videos v ON v.bvid=p.video_bvid"
+               f" WHERE {PLAYABLE} ORDER BY requested.key")
+        with self.connect() as con:
+            links = [row[0] for row in con.execute(sql, (encode(clip_ids),))]
+        return {"links": links, "skipped": len(clip_ids) - len(links)}
 
     def resolve_playlist_links(self, links):
         targets = {}

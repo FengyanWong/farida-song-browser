@@ -292,3 +292,41 @@ def test_summary_playlist_saves_return_matching_revisions_without_reading_clip_d
         reordered = client.patch(target+"?summary=true", json={"clip_ids": ids[::-1]}).json()
         assert reordered["revision"] == client.get(target).json()["revision"]
         assert [item["id"] for item in client.get(target).json()["items"]] == ids[::-1]
+
+
+def test_copy_links_resolves_current_parts_in_draft_order(settings, video):
+    opened = []
+    app = create_app(settings, scan_on_start=False, browser_opener=lambda url: opened.append(url) or True)
+    with TestClient(app) as client:
+        db = app.state.db
+        bvid = video["bvid"]
+        video["pages"].append({"cid": 300, "page": 3, "part": "第三首", "duration": 60})
+        db.save_video(db.source(1), video, [])
+        clip_id = lambda cid: f"{bvid}:{cid}"
+        url = lambda page: f"https://www.bilibili.com/video/{bvid}/?p={page}"
+        draft = [clip_id(300), clip_id(100), "missing", clip_id(200)]
+        endpoint = "/api/playlists/copy-links"
+        assert client.post(endpoint, json={"clip_ids": draft}).status_code == 403
+        client.headers["X-Farida-Token"] = client.get("/api/session").json()["token"]
+
+        def copy(ids):
+            response = client.post(endpoint, json={"clip_ids": ids})
+            assert response.status_code == 200
+            return response.json()
+
+        assert copy(draft) == {"links": [url(3), url(1), url(2)], "skipped": 1}
+        first, second, _ = video["pages"]
+        video["pages"] = [{**second, "page": 1}, {**first, "page": 2, "cid": 400}, {**first, "page": 3}]
+        db.save_video(db.source(1), video, [])
+        assert copy(draft) == {"links": [url(3), url(1)], "skipped": 2}
+        assert copy([]) == {"links": [], "skipped": 0}
+        assert copy([clip_id(100), clip_id(200)] * 600) == {"links": [url(3), url(1)] * 600, "skipped": 0}
+        assert copy(["missing"] * 20000) == {"links": [], "skipped": 20000}
+        assert client.post(endpoint, json={"clip_ids": ["missing"] * 20001}).status_code == 422
+        assert client.post(endpoint, json={"clip_ids": ["x" * 101]}).status_code == 422
+        assert opened == []
+        assert client.post(f"/api/clips/{clip_id(100)}/open").json()["url"] == url(3)
+        assert client.post(f"/api/clips/{clip_id(300)}/open").status_code == 409
+        assert opened == [url(3)]
+        db.execute("UPDATE videos SET availability_status='unavailable' WHERE bvid=?", (bvid,))
+        assert copy(draft) == {"links": [], "skipped": 4}

@@ -111,6 +111,10 @@ class PlaylistLinks(Model):
     links: list[Annotated[str, Field(min_length=1, max_length=2048)]] = Field(min_length=1, max_length=20000)
 
 
+class PlaylistClipIds(Model):
+    clip_ids: list[Annotated[str, Field(min_length=1, max_length=100)]] = Field(max_length=20000)
+
+
 class PlaylistCreate(Model):
     name: str = Field(min_length=1, max_length=80)
     clip_ids: list[str] = Field(default_factory=list, max_length=20000)
@@ -404,6 +408,10 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     def create_playlist(body: PlaylistCreate, summary: bool=False):
         return db.save_playlist(body.name, body.clip_ids, summary=summary)
 
+    @app.post('/api/playlists/copy-links')
+    def copy_playlist_links(body: PlaylistClipIds):
+        return db.playlist_copy_links(body.clip_ids)
+
     @app.post('/api/playlists/resolve-links')
     def resolve_playlist_links(body: PlaylistLinks):
         return db.resolve_playlist_links(body.links)
@@ -549,20 +557,25 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             return job
 
     @app.get("/api/export")
-    def export(format: Literal["json","csv"]="csv",q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: CatalogDate | None=None,before: CatalogDate | None=None,bookmarked: bool=False,sort: CatalogSort="newest"):
+    def export(format: Literal["json","csv"]="csv",q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: CatalogDate | None=None,before: CatalogDate | None=None,bookmarked: bool=False,sort: CatalogSort="newest",grouped: bool=False):
         filters = dict(q=q, status=status, source_id=source_id, uploader=uploader,
-                       after=after, before=before, bookmarked=bookmarked, sort=sort)
-        if format == "json":
-            entries = db.clips(**filters, page_size=2147483647)["items"]
-            return JSONResponse(entries,headers={"Content-Disposition":"attachment; filename=farida-clips.json"})
+                       after=after, before=before, bookmarked=bookmarked, sort=sort, grouped=grouped)
         stream = tempfile.SpooledTemporaryFile(max_size=256 * 1024, mode="w+", encoding="utf-8", newline="")
         try:
-            stream.write("\ufeff")
-            writer = csv.writer(stream)
-            writer.writerow(("display_song_title", "raw_title", "uploader_name", "published_at", "video_bvid",
-                             "cid", "part_number", "playback_url", "inclusion_status", "songlist_attribution",
-                             "songlist_url"))
-            with db.csv_rows(**filters) as rows:
+            with db.export_rows(format, **filters) as rows:
+                if format == "json":
+                    stream.write("[")
+                    for index, entry in enumerate(rows):
+                        if index:
+                            stream.write(",")
+                        stream.write(json.dumps(entry, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+                    stream.write("]")
+                    return DownloadResponse(stream, "application/json", "farida-clips.json")
+                stream.write("\ufeff")
+                writer = csv.writer(stream)
+                writer.writerow(("display_song_title", "raw_title", "uploader_name", "published_at", "video_bvid",
+                                 "cid", "part_number", "playback_url", "inclusion_status", "songlist_attribution",
+                                 "songlist_url"))
                 for row in rows:
                     writer.writerow(csv_cell(value) for value in row)
             return DownloadResponse(stream, "text/csv; charset=utf-8", "farida-clips.csv")

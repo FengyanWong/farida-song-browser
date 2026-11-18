@@ -38,7 +38,7 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
       if(/^\/api\/playlists\/\d+$/.test(url.pathname)&&route.request().method()==='GET'){
         const response=await route.fetch();if(!response.ok())return route.fulfill({response});
         const result=await response.json();
-        result.items=result.items.map(item=>({...item,...fixtureById.get(item.id),playback_url:item.id===fixtures[2].id?null:item.playback_url}));return route.fulfill({response,json:result});
+        result.items=result.items.map(item=>({...item,...fixtureById.get(item.id),playback_url:item.playback_url}));return route.fulfill({response,json:result});
       }
       if(/^\/api\/clips\/[^/]+\/play$/.test(url.pathname)){
         plays.push(decodeURIComponent(url.pathname.split('/')[3]));
@@ -124,6 +124,10 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     const savedId=await page.locator('#playlist-select').inputValue();
     let saved=await(await fetch(base+'/api/playlists/'+savedId)).json();
     assert.deepEqual(saved.items.map(item=>item.id),fixtures.map(item=>item.id));
+    const archived=spawnSync(path.resolve('.venv/Scripts/python.exe'),['-c',
+      'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute("UPDATE parts SET active=0 WHERE id=?",(sys.argv[2],)); db.commit(); db.close()',
+      path.join(output,'数据','catalog.sqlite3'),fixtures[2].id],{encoding:'utf8',windowsHide:true});
+    assert.equal(archived.status,0,archived.stderr);
     await page.locator('#playlist-edit').click();
     await checkComposition('#playlist-search','#playlist-items');
     pass('Chinese IME keeps both lists stable until confirmation and searches all performer spellings after one redraw');
@@ -140,9 +144,10 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.match(await page.locator('#playlist-item-count').textContent(),/^1 \/ 5 首/);
     const links=[fixtures[0],fixtures[4],fixtures[3],fixtures[5]].map(item=>item.playback_url).join('\n');
     await page.locator('#playlist-copy-links').click();
-    assert.equal(await page.evaluate(()=>window.__copied),links);
+    await until(async()=>await page.evaluate(()=>window.__copied)===links);
     assert.match(await page.locator('#playlist-copy-status').textContent(),/已复制 4 个链接，跳过 1 个/);
     await page.evaluate(()=>window.__denyClipboard=true);await page.locator('#playlist-copy-links').click();
+    await page.locator('#playlist-copy-text').waitFor();
     assert.equal(await page.locator('#playlist-copy-text').inputValue(),links);
     assert.equal(await page.locator('#playlist-copy-text').isVisible(),true);
     assert.match(await page.locator('#playlist-copy-status').textContent(),/手动复制以下 4 个链接/);
@@ -394,7 +399,8 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.match(await importStatus.textContent(),/重复输入 1 行，格式无效 1 行，本机未找到 1 行，不可播放 1 行/);
     assert.equal(await pasted.inputValue(),mixed);
     assert.equal(lookups,1);assert.equal((await savedLists()).length,oldCount);
-    await page.locator('#playlist-copy-links').click();assert.equal(await page.evaluate(()=>window.__copied),links);
+    await page.evaluate(()=>window.__copied=null);await page.locator('#playlist-copy-links').click();
+    await until(async()=>await page.evaluate(()=>window.__copied)===links);
     await pasted.fill(links);await importButton.click();
     await until(async()=>(await importStatus.textContent()).includes('已加入 0 首，歌单已有 4 首'));
     assert.equal(await pasted.inputValue(),'');assert.equal(await page.locator('#playlist-items li').count(),4);
@@ -440,6 +446,25 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     await page.locator('#player-queue-search').fill('no-match-for-keyboard-test-1234');
     assert.equal(await page.locator('#player-queue button').count(),0);
     pass('The full '+all.length+'-song queue uses one tab stop, Shift+Tab returns to the browsed song, and Space plays it');
+    await page.locator('#player-queue-search').fill('');
+    const queue=page.locator('#player-queue'),draftRows=page.locator('#playlist-items');
+    const queueElements=await queue.locator('*').count();
+    assert.ok(queueElements>=5*all.length);
+    await page.locator('#player-save').click();await editor.waitFor();
+    const draftElements=await draftRows.locator('*').count();
+    assert.ok(draftElements>queueElements);
+    await close.last().click();await editor.waitFor({state:'hidden'});
+    await until(async()=>await draftRows.locator('*').count()===0);
+    await page.locator('#player-compact').click();
+    assert.equal(await queue.locator('*').count(),0);
+    await page.locator('#player-compact').click();
+    assert.equal(await queue.locator('*').count(),queueElements);
+    assert.equal(await queue.locator('[aria-current]').getAttribute('data-queue-index'),String(all.length-1));
+    await page.locator('#player-close').click();assert.equal(await queue.locator('*').count(),0);
+    await page.locator('#player-remembered').click();
+    await until(async()=>await queue.locator('*').count()===queueElements);
+    assert.equal(await queue.locator('[aria-current]').getAttribute('data-queue-index'),String(all.length-1));
+    pass('Closing the editor releases '+draftElements+' song elements; compact or stopped playback releases '+queueElements+' and restores the current song on demand');
     await page.close();await until(()=>service.exitCode!==null);assert.equal(service.exitCode,0);
     fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({checks,errors,output},null,2));
   }finally{await browser.close();if(service.exitCode===null)spawnSync('taskkill',['/PID',String(service.pid),'/T','/F'],{stdio:'ignore'});}

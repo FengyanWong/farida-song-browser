@@ -1,9 +1,11 @@
+from contextlib import contextmanager
 from copy import deepcopy
 
 import pytest
 from fastapi.testclient import TestClient
 
 from farida.app import create_app
+from farida.classifier import normalize_performer
 from farida.db import Database
 
 
@@ -15,6 +17,48 @@ def add_video(db, source, video, index, title=None):
         item['pages'][0]['part'] = title
     db.save_video(source, item, [])
     return item['bvid'] + ':100'
+
+
+def test_grouped_search_counts_once_and_hydrates_interleaved_versions_from_one_snapshot(db, source, video, monkeypatch):
+    ids = []
+    for index, group in enumerate(["Ａ", "月", "a", "星", "月", "星", "海"]):
+        item = deepcopy(video)
+        item.update(bvid=f"BV{index:010d}", title=f"法里达 翻唱《版本{index}》", pubdate=video["pubdate"] - index)
+        item["pages"] = item["pages"][:1]
+        db.save_video(source, item, ["法里达"])
+        ids.append(item["bvid"] + ":100")
+        db.annotate([ids[-1]], {"song_group": group, "notes": f"笔记{index}"})
+    connect = db.connect
+    search_calls, edits = [], []
+
+    @contextmanager
+    def edit_after_ranking():
+        with connect() as con:
+            def counted_search(text):
+                search_calls.append(text)
+                return normalize_performer(text)
+            con.create_function("search_text", 1, counted_search, deterministic=True)
+            def trace(sql):
+                if "WHERE p.id IN (SELECT value FROM json_each(" in sql:
+                    with connect() as writer:
+                        edits.append(writer.execute("UPDATE parts SET active=0 WHERE id=?", (ids[0],)).rowcount)
+                        writer.execute("UPDATE annotations SET display_song_title='刚刚修改' WHERE clip_id=?", (ids[0],))
+            con.set_trace_callback(trace)
+            yield con
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db, "connect", edit_after_ranking)
+        page = db.grouped_clips(q="法里达", page_size=2)
+    assert len(search_calls) == 7 and edits == [1]
+    assert (page["total_clips"], page["total"]) == (7, 4)
+    assert [(g["key"], g["title"], g["clip_ids"]) for g in page["groups"]] == [
+        ("a", "Ａ", [ids[0], ids[2]]), ("月", "月", [ids[1], ids[4]])]
+    assert [item["id"] for item in page["items"]] == [ids[0], ids[2], ids[1], ids[4]]
+    first = page["items"][0]
+    assert first["active"] == 1 and first["display_song_title"] == "版本0" and first["notes"] == "笔记0"
+    assert db.clip(ids[0])["active"] == 0 and db.clip(ids[0])["display_song_title"] == "刚刚修改"
+    missing = db.grouped_clips(q="法里达", page=3, page_size=2, compact=True)
+    assert missing["groups"] == missing["items"] == [] and (missing["total"], missing["total_clips"]) == (4, 6)
 
 
 def test_groups_page_complete_versions_and_keep_order(db, source, video):

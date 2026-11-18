@@ -27,13 +27,29 @@ const paths = {
 };
 export function icon(name) { return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.music}</svg>`; }
 export function hydrateIcons(root = document) { $$('[data-icon]', root).forEach(el => el.innerHTML = icon(el.dataset.icon)); }
-export async function writeClipboard(text) {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    return false;
+export async function copyClipLinks(api, clipIds, isCurrent) {
+  const lookup=api('/api/playlists/copy-links',{method:'POST',body:JSON.stringify({clip_ids:clipIds})})
+    .then(({links,skipped})=>({text:links.join('\n'),count:links.length,skipped}));
+  let copied=false;
+  if (navigator.clipboard?.write && typeof ClipboardItem==='function') {
+    // Start the clipboard operation inside the click gesture. The part numbers
+    // come from SQLite asynchronously, and a closed editor must not copy them.
+    const data=lookup.then(({text})=>{
+      if (!text || !isCurrent()) throw new Error('没有可复制的链接');
+      return new Blob([text],{type:'text/plain'});
+    });
+    data.catch(()=>{}); // Permission can be denied before the browser reads the item.
+    try {
+      await navigator.clipboard.write([new ClipboardItem({'text/plain':data})]);
+      copied=true;
+    } catch {}
   }
+  const result=await lookup;
+  if (!isCurrent()) return null;
+  if (result.text && !copied) {
+    try {await navigator.clipboard.writeText(result.text);copied=true;} catch {}
+  }
+  return isCurrent()?{...result,copied}:null;
 }
 let toastTimer;
 export function toast(message, link) {

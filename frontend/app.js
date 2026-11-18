@@ -1,4 +1,4 @@
-import { $, $$, escape as e, icon, hydrateIcons, toast, dateTime, writeClipboard } from './ui.js';
+import { $, $$, escape as e, icon, hydrateIcons, toast, dateTime, copyClipLinks } from './ui.js';
 import { Pet } from './pet.js';
 import { AccountLogin } from './account.js';
 import { AppLifetime } from './lifetime.js';
@@ -590,7 +590,7 @@ async function showDetail(id) {
   if (request!==detailRequest || state.stopping || document.querySelector('dialog[open]')) return;
   const el=$('#detail-content');
   const credit=clip.songlist_credits?.length?`<dt>歌单整理</dt><dd><a href="https://fareeda.songlist.cc/" target="_blank" rel="noopener noreferrer">CLANNADOR · 小法的歌单 ↗</a><br>${clip.songlist_credits.map(song=>`${e(song.song_title)}${song.original_artist?` · 原唱 ${e(song.original_artist)}`:''}`).join('<br>')}</dd>`:'';
-  el.innerHTML=`<div class="dialog-heading"><h2>片段详情</h2><button class="icon-button close-dialog" aria-label="关闭">${icon('x')}</button></div><h3 class="detail-title">${e(clip.display_song_title)}</h3><div class="detail-original">${e(clip.raw_title)}</div><dl class="detail-grid"><dt>UP 主</dt><dd>${e(clip.uploader_name)} · UID ${e(clip.uploader_uid)}</dd><dt>上传时间</dt><dd>${dateTime(clip.published_at)}（当前时区）</dd><dt>分 P 信息</dt><dd>P${clip.part_number} · ${e(clip.raw_part_title)} · CID ${e(clip.cid)}</dd><dt>判断依据</dt><dd data-detail-reason>${e(clip.classification_reason)}${clip.manual_fields.length?' · 含手动修正':''}</dd><dt>来源</dt><dd>${clip.sources.map(s=>e(s.display_name)).join('、')}</dd>${credit}</dl><div class="tag-list">${clip.tags.map(tag=>`<span class="badge">${e(tag)}</span>`).join('')}</div><div class="review-actions"><button class="button primary small" data-classify="included" data-id="${e(id)}">确认收录</button><button class="button secondary small" data-classify="excluded" data-id="${e(id)}">排除此片段</button><button class="button secondary small" data-classify="needs_review" data-id="${e(id)}">保留待确认</button>${clip.playback_url?`<a class="button secondary small" href="${e(clip.playback_url)}" data-open="${e(id)}" target="_blank" rel="noopener noreferrer">${icon('external')}打开原视频</a><button type="button" class="button secondary small" data-copy-url="${e(clip.playback_url)}">复制链接</button>`:''}</div><p id="detail-feedback" class="field-help" role="status" hidden></p><details><summary>修改歌名、分组与备注</summary><button type="button" class="text-button" id="detail-auto-title" ${clip.manual_fields.includes('display_song_title')?'':'hidden'}>使用自动歌名</button><form id="annotation-form" data-id="${e(id)}"><label class="field">显示歌名<input name="display_song_title" required maxlength="500" value="${e(clip.display_song_title)}"></label><label class="field">歌曲分组<input name="song_group" maxlength="200" value="${e(clip.song_group)}" placeholder="用于归拢不同演唱版本"></label><label class="field">个人备注<input name="notes" maxlength="5000" value="${e(clip.notes)}"></label><button class="button primary small">保存修正</button></form></details><details><summary>原始描述与数据来源</summary><div class="detail-description">${e(clip.description || '暂无描述')}</div><p class="detail-stats">${Object.entries(clip.statistics).map(([key,v])=>`${({view:'播放',like:'点赞',coin:'投币',favorite:'收藏',share:'分享',reply:'评论',danmaku:'弹幕'})[key]}：${v==null?'未知':v.toLocaleString()}`).join(' · ')}<br>以上为整个原视频的统计，不是此分 P 的单独统计。<br>获取于 ${dateTime(clip.stats_fetched_at)} · ${e(clip.provenance.details)}</p></details>`;
+  el.innerHTML=`<div class="dialog-heading"><h2>片段详情</h2><button class="icon-button close-dialog" aria-label="关闭">${icon('x')}</button></div><h3 class="detail-title">${e(clip.display_song_title)}</h3><div class="detail-original">${e(clip.raw_title)}</div><dl class="detail-grid"><dt>UP 主</dt><dd>${e(clip.uploader_name)} · UID ${e(clip.uploader_uid)}</dd><dt>上传时间</dt><dd>${dateTime(clip.published_at)}（当前时区）</dd><dt>分 P 信息</dt><dd>P${clip.part_number} · ${e(clip.raw_part_title)} · CID ${e(clip.cid)}</dd><dt>判断依据</dt><dd data-detail-reason>${e(clip.classification_reason)}${clip.manual_fields.length?' · 含手动修正':''}</dd><dt>来源</dt><dd>${clip.sources.map(s=>e(s.display_name)).join('、')}</dd>${credit}</dl><div class="tag-list">${clip.tags.map(tag=>`<span class="badge">${e(tag)}</span>`).join('')}</div><div class="review-actions"><button class="button primary small" data-classify="included" data-id="${e(id)}">确认收录</button><button class="button secondary small" data-classify="excluded" data-id="${e(id)}">排除此片段</button><button class="button secondary small" data-classify="needs_review" data-id="${e(id)}">保留待确认</button>${clip.playback_url?`<a class="button secondary small" href="${e(clip.playback_url)}" data-open="${e(id)}" target="_blank" rel="noopener noreferrer">${icon('external')}打开原视频</a><button type="button" class="button secondary small" data-copy-clip="${e(id)}">复制链接</button>`:''}</div><p id="detail-feedback" class="field-help" role="status" hidden></p><details><summary>修改歌名、分组与备注</summary><button type="button" class="text-button" id="detail-auto-title" ${clip.manual_fields.includes('display_song_title')?'':'hidden'}>使用自动歌名</button><form id="annotation-form" data-id="${e(id)}"><label class="field">显示歌名<input name="display_song_title" required maxlength="500" value="${e(clip.display_song_title)}"></label><label class="field">歌曲分组<input name="song_group" maxlength="200" value="${e(clip.song_group)}" placeholder="用于归拢不同演唱版本"></label><label class="field">个人备注<input name="notes" maxlength="5000" value="${e(clip.notes)}"></label><button class="button primary small">保存修正</button></form></details><details><summary>原始描述与数据来源</summary><div class="detail-description">${e(clip.description || '暂无描述')}</div><p class="detail-stats">${Object.entries(clip.statistics).map(([key,v])=>`${({view:'播放',like:'点赞',coin:'投币',favorite:'收藏',share:'分享',reply:'评论',danmaku:'弹幕'})[key]}：${v==null?'未知':v.toLocaleString()}`).join(' · ')}<br>以上为整个原视频的统计，不是此分 P 的单独统计。<br>获取于 ${dateTime(clip.stats_fetched_at)} · ${e(clip.provenance.details)}</p></details>`;
   const form=el.querySelector('#annotation-form');
   detailEditor={id,form,original:Object.fromEntries(new FormData(form)),saving:false};
   detailDialog.showModal();
@@ -669,10 +669,18 @@ document.addEventListener('click',async event=>{
     if(button.dataset.play && !(event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)) {
       event.preventDefault();await playlistPlayer.fromResults(button.dataset.play);
     }
-    if(button.dataset.copyUrl) {
-      const url=button.dataset.copyUrl;
-      if (await writeClipboard(url)) toast('已复制原视频链接。');
-      else window.prompt('复制原视频链接',url);
+    if(button.dataset.copyClip) {
+      const current=()=>detailDialog.open && button.isConnected;
+      button.disabled=true;
+      try {
+        const result=await copyClipLinks(api,[button.dataset.copyClip],current);
+        if (result) {
+          if (!result.count) toast('这个片段当前不可用，没有可复制的链接。');
+          else if (result.copied) toast('已复制原视频链接。');
+          else window.prompt('复制原视频链接',result.text);
+        }
+      } catch(error) {if(current())toast(error.message);}
+      finally {button.disabled=false;}
     }
     if(button.dataset.open && !(event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)) {
       event.preventDefault();const result=await api(`/api/clips/${encodeURIComponent(button.dataset.open)}/open`,{method:'POST'});
@@ -797,16 +805,25 @@ $('#page-jump').onfocusout=event=>{
   if(!$('#page-jump').contains(event.relatedTarget))closePageJump();
 };
 $('#sync-button').onclick=()=>startSync();$('#first-scan').onclick=()=>startSync();$('#full-scan').onclick=()=>startSync('full');
+let exportFrame;
+const exportError='导出失败，请重试。';
 $('#export-button').onclick=async()=>{
   const params=parameters();
   if (!params) { notice(searchLimitMessage,true); return; }
   const scope=catalogScope(params);
-  // A long query may be a valid video reference. Confirm it before starting a download.
-  if (params.get('q')?.length>500 && scope!==displayedCatalogScope) {
+  if (scope!==displayedCatalogScope) {
     await loadClips();
-    if (scope!==displayedCatalogScope || scope!==catalogScope(parameters())) return;
+    if (scope!==displayedCatalogScope || scope!==catalogScope(parameters()) || state.view!=='catalog') return;
   }
-  params.delete('page');params.delete('page_size');location.href='/api/export?'+params;
+  params.delete('page');params.delete('page_size');
+  // An attachment starts a native download. An HTTP error loads the frame and keeps the catalog open.
+  if ($('#notice').textContent===exportError) notice('');
+  exportFrame?.remove();
+  exportFrame=document.createElement('iframe');
+  exportFrame.hidden=true;
+  exportFrame.onload=()=>notice(exportError,true);
+  exportFrame.src='/api/export?'+params;
+  document.body.append(exportFrame);
 };
 $('#add-source').onclick=()=>showSource();
 $('#source-form').onsubmit=async event=>{
