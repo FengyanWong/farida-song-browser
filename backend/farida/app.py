@@ -29,7 +29,7 @@ from .sync import Collector
 from .lifetime import WindowLifetime
 from .playback import Playback
 from .player_state import PlayerState
-from .backup import BackupTooLarge, LIMIT, restore_validated_backup, validate_backup, write_backup
+from .backup import BackupTooLarge, LIMIT, open_latest_recovery, restore_validated_backup, validate_backup, write_backup
 
 
 CatalogDate = AwareDatetime | date
@@ -47,7 +47,7 @@ class DownloadResponse(StreamingResponse):
 
     def __init__(self, stream, media_type, filename):
         self.stream = stream
-        size = stream.tell()
+        size = stream.seek(0, 2)
         stream.seek(0)
         super().__init__(self.chunks(), media_type=media_type, headers={
             "Content-Disposition": f"attachment; filename={filename}", "Content-Length": str(size),
@@ -522,17 +522,23 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             raise
 
     @app.get("/api/player-state")
-    def player_state(compact: bool = False):
+    def player_state(compact: bool = False, summary: bool = False, resume: bool = False):
+        if resume and not summary:
+            return db.resume_state(summary=False)
         with preference_lock:
-            row = db.one(PLAYER_STATE_SQL)
+            if summary:
+                result = db.resume_state(summary=True)
+            else:
+                row = db.one(PLAYER_STATE_SQL)
             writer = None
-            if compact:
+            if compact or summary:
                 writer = secrets.token_urlsafe(16)
                 preference_writers[writer] = {}
                 if len(preference_writers) > 512:
                     preference_writers.popitem(last=False)
-        saved = PlayerState.model_validate_json(row["value"]) if row else PlayerState()
-        result = {**saved.model_dump(), "items": db.saved_queue(saved.clip_ids, compact=compact)}
+        if not summary:
+            saved = PlayerState.model_validate_json(row["value"]) if row else PlayerState()
+            result = {**saved.model_dump(), "items": db.saved_queue(saved.clip_ids, compact=compact)}
         if writer:
             result["preference_writer"] = writer
         return result
@@ -608,6 +614,22 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             except OSError as error:
                 raise HTTPException(507, "无法写入备份临时文件，请检查磁盘空间和写入权限。") from error
             cleanup.pop_all()  # The response now owns the file through download or disconnect.
+            return response
+
+    @app.get("/api/backup/recovery")
+    def recovery_backup(check: bool = False):
+        recovery = open_latest_recovery(db.path.parent / "backups")
+        if recovery is None:
+            if check:
+                return {"available": False}
+            raise HTTPException(404, "本机没有可下载的恢复前备份。")
+        name, stream = recovery
+        with ExitStack() as cleanup:
+            cleanup.enter_context(stream)
+            if check:
+                return {"available": True}
+            response = DownloadResponse(stream, "application/json", name)
+            cleanup.pop_all()
             return response
 
     @app.post("/api/restore")

@@ -26,12 +26,17 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
       if(callback)window.mediaActions.set(name,callback);else window.mediaActions.delete(name);
     };
   });
-  let restricted=false, signedOut=false, queueUploads=0;
+  let restricted=false, signedOut=false, queueUploads=0, summaryReads=0, fullReads=0, queueWriter;
   const page=await context.newPage(),checks=[],errors=[],plays=[];
   const pass=message=>{checks.push(message);console.log('Passed: '+message);};
   page.on('pageerror',error=>errors.push(error.message));
   page.on('request',request=>{
-    if (request.method()==='PUT' && new URL(request.url()).pathname==='/api/player-state') queueUploads++;
+    const url=new URL(request.url());
+    if (url.pathname!=='/api/player-state') return;
+    if (request.method()==='GET') {
+      if (url.searchParams.get('summary')==='true') summaryReads++;else fullReads++;
+    }
+    if (request.method()==='PUT') {queueUploads++;queueWriter=request.headers()['x-farida-preference-writer'];}
   });
   try{
     await page.goto('about:blank');
@@ -48,7 +53,8 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     const media=Buffer.from(encoded,'base64');assert.ok(media.length>1000);
     await until(async()=>{assert.equal(server.exitCode,null);try{return(await fetch(base+'/api/health')).ok;}catch{return false;}});
     const token=(await(await fetch(base+'/api/session')).json()).token;
-    const all=(await(await fetch(base+'/api/play-queue')).json()).items.filter(item=>item.playback_url).slice(0,3);assert.equal(all.length,3);
+    const catalog=(await(await fetch(base+'/api/play-queue')).json()).items.filter(item=>item.playback_url);
+    const all=catalog.slice(0,3);assert.equal(all.length,3);
     const playlist=await(await fetch(base+'/api/playlists',{method:'POST',headers:{'Content-Type':'application/json','X-Farida-Token':token},body:JSON.stringify({name:'迷你播放器测试',clip_ids:all.map(item=>item.id)})})).json();
     await context.route('**/*',async route=>{
       const url=new URL(route.request().url());if(url.origin!==base)return route.abort();
@@ -124,7 +130,7 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     const remembered=page.locator('#player-remembered');
     assert.equal(await remembered.isVisible(),true);
     assert.equal(await remembered.evaluate(el=>document.activeElement===el),true);
-    const uploadsBefore=queueUploads;
+    const uploadsBefore=queueUploads, readsBefore=fullReads;
     await remembered.click();await ready();
     await page.locator('#player-next').click();await ready();
     await page.locator('#player-shuffle').click();await page.locator('#player-repeat').click();
@@ -148,7 +154,7 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.equal(await page.locator('#player-shuffle').getAttribute('aria-pressed'),'true');
     assert.equal(await page.locator('#player-skip-unavailable').getAttribute('aria-pressed'),'true');
     assert.equal(await page.locator('#player-repeat').textContent(),'列表循环');
-    assert.equal(queueUploads,uploadsBefore);
+    assert.equal(queueUploads,uploadsBefore);assert.equal(fullReads,readsBefore);
     // Hold the first mode change until the old document has unloaded. Its older
     // sequence must not overwrite the final state sent when the player closes.
     let heldModeSave;
@@ -295,6 +301,80 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.equal(await remembered.isHidden(),true);assert.equal(await page.locator('#music-player').isHidden(),true);
     assert.equal(plays.length,loggedOutPlays);
     pass('Logging out hides an existing resume offer; signed-out startup keeps the saved queue idle and hidden');
+    assert.equal(summaryReads>0,true);
+    signedOut=false;restricted=false;
+    const ids=catalog.map(item=>item.id), stateURL=base+'/api/player-state';
+    const writeState=async(method,body)=>{
+      const response=await fetch(stateURL,{method,headers:{'Content-Type':'application/json','X-Farida-Token':token},body:JSON.stringify(body)});
+      assert.equal(response.status,200);return response.json();
+    };
+    const firstQueue=await writeState('PUT',{name:'初始长队列',clip_ids:ids,current_id:ids[0],position:.44});
+    const readsAtRest=fullReads, summariesAtRest=summaryReads, playsAtRest=plays.length;
+    const incoming=page.waitForResponse(r=>r.url().endsWith('/api/player-state?summary=true'));
+    await page.reload();await remembered.waitFor();
+    const summary=await (await incoming).json();
+    assert.ok(!('items' in summary)&&!('clip_ids' in summary)&&summary.preference_writer);
+    assert.ok(ids.length>=1000);assert.equal(summaryReads,summariesAtRest+1);assert.equal(fullReads,readsAtRest);
+    assert.equal(plays.length,playsAtRest);assert.equal(await remembered.textContent(),'继续播放：'+catalog[0].display_song_title);
+    pass('Reopening a 1,000-plus-song queue loads only its summary and offers the saved song without fetching queue rows or media');
+
+    const hydrate='**/api/player-state?compact=true&resume=true';
+    await page.route(hydrate,r=>r.fulfill({status:503,json:{detail:'离线模拟'}}),{times:1});
+    await remembered.click();await until(async()=>(await page.locator('#toast').textContent()).includes('再次点击'));
+    assert.equal(await remembered.isEnabled(),true);assert.equal(plays.length,playsAtRest);
+    await writeState('PATCH',{current_id:ids[1],position:.35,segment:0,shuffle:false,repeat:'off',skip_unavailable:false,sequence:1,queue_key:firstQueue.queue_key});
+    await remembered.click();
+    await until(async()=>await remembered.textContent()==='继续播放：'+catalog[1].display_song_title);
+    assert.equal(plays.length,playsAtRest);
+    await writeState('PUT',{name:'另外的队列',clip_ids:[ids[2],ids[1],ids[0]],current_id:ids[1],position:.54,shuffle:true,repeat:'one'});
+    await remembered.click();await until(async()=>(await page.locator('#toast').textContent()).includes('另外的队列'));
+    assert.equal(plays.length,playsAtRest);assert.equal(await remembered.isEnabled(),true);
+
+    // Deliberately hold a real completed GET and ignore AbortSignal to exercise stale callbacks.
+    async function holdResume(){
+      await page.evaluate(()=>{
+        const original=window.fetch.bind(window);
+        window.fetch=async(url,options)=>{
+          if(url!=='/api/player-state?compact=true&resume=true')return original(url,options);
+          window.fetch=original;
+          const response=await original(url,{...options,signal:undefined});
+          await new Promise(resolve=>{window.releaseHydration=resolve;});
+          return response;
+        };
+        window.releaseHydration=null;
+      });
+      await remembered.click();await page.waitForFunction(()=>!!window.releaseHydration);
+    }
+    const readsBeforeHold=fullReads;await holdResume();
+    assert.equal(await remembered.isDisabled(),true);
+    await remembered.evaluate(button=>button.dispatchEvent(new MouseEvent('click',{bubbles:true})));
+    assert.equal(fullReads,readsBeforeHold+1);
+    await page.evaluate(()=>window.releaseHydration());await ready();assert.equal(plays.length,playsAtRest+1);
+    assert.equal(plays.at(-1),ids[1]);assert.equal(await page.locator('#player-position').textContent(),'2 / 3');
+    assert.equal(await page.locator('#player-shuffle').getAttribute('aria-pressed'),'true');
+    assert.equal(await page.locator('#player-repeat').textContent(),'单曲循环');
+    await until(()=>queueWriter===summary.preference_writer);
+    pass('A failed queue read stays retryable; changed song and same-song replacement queue each require confirmation, double-clicks share one read, and playback keeps the original preference writer');
+
+    await page.locator('#player-close').click();await page.reload();await remembered.waitFor();
+    await holdResume();
+    await page.locator('#playlist-select').selectOption(String(playlist.id));await page.locator('#playlist-play').click();await ready();
+    const playsAfterNew=plays.length;assert.equal(plays.at(-1),all[0].id);
+    await page.evaluate(()=>window.releaseHydration());await delay(160);
+    assert.equal(plays.length,playsAfterNew);assert.equal(await page.locator('#player-title').textContent(),all[0].display_song_title);
+    await page.locator('#player-close').click();await page.reload();await remembered.waitFor();
+    await holdResume();
+    await page.route('**/api/restore',route=>route.fulfill({status:400,json:{detail:'恢复失败测试'}}),{times:1});
+    await page.locator('#backup-file').setInputFiles(backupFile);
+    await until(async()=>(await page.locator('#toast').textContent()).includes('恢复失败测试'));
+    await page.evaluate(()=>window.releaseHydration());await delay(160);
+    assert.equal(await remembered.isEnabled(),true);assert.equal(await remembered.isVisible(),true);assert.equal(plays.length,playsAfterNew);
+    await holdResume();
+    await page.locator('#account-toggle').click();await page.locator('#logout-button').click();
+    await page.locator('#login-dialog').waitFor();await page.evaluate(()=>window.releaseHydration());
+    await delay(160);assert.equal(await remembered.isHidden(),true);assert.equal(plays.length,playsAfterNew);
+    assert.deepEqual(errors,[]);
+    pass('Delayed hydration cannot replace a newly started playlist, autoplay after a failed restore, or start media after logout');
     await page.close();await until(()=>server.exitCode!==null);assert.equal(server.exitCode,0);
     fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({checks,errors,output,packaged:!!exe},null,2));
   }finally{await browser.close();if(server.exitCode===null)spawnSync('taskkill',['/PID',String(server.pid),'/T','/F'],{stdio:'ignore'});}

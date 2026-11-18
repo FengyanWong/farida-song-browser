@@ -1,6 +1,8 @@
 """Portable data-only backups. Login credentials and executable SQL are excluded."""
 import json
 import os
+import re
+import stat
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +12,12 @@ from .player_state import PlayerState
 LEGACY_TABLES = ("sources", "videos", "parts", "memberships", "annotations", "curated_songs", "user_state", "playlists", "playlist_items", "playback_state")
 TABLES = LEGACY_TABLES + ("listening_history",)
 LIMIT = 64 * 1024 * 1024
+RECOVERY_NAME = re.compile(
+    r"before-restore-([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}\+00-00)-[a-z0-9_]{8}\.json"
+)
+RECOVERY_HEADER = re.compile(
+    rb'\{"format": ?"farida-backup", ?"version": ?[12], ?"created_at": ?"[^"]{1,50}", ?"tables": ?\{'
+)
 
 
 class BackupTooLarge(ValueError):
@@ -154,6 +162,52 @@ def _replace_tables(con, data):
         )
     if con.execute("PRAGMA foreign_key_check").fetchone():
         raise ValueError("备份包含无效的歌曲或歌单引用。")
+
+
+def _is_reparse_point(info):
+    return bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def open_latest_recovery(folder):
+    """Return the newest finalized local snapshot as (safe filename, open binary file)."""
+    candidates = []
+    try:
+        folder_info = folder.lstat()
+        if not stat.S_ISDIR(folder_info.st_mode) or _is_reparse_point(folder_info):
+            return None
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                match = RECOVERY_NAME.fullmatch(entry.name)
+                if not match:
+                    continue
+                try:
+                    info = os.lstat(entry.path)
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and not _is_reparse_point(info):
+                    candidates.append((match[1], info.st_mtime_ns, entry.name, info))
+    except OSError:
+        return None
+
+    for _, _, name, expected in sorted(candidates, reverse=True):
+        try:
+            stream = open(folder / name, "rb", opener=lambda path, flags: os.open(
+                path, flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)))
+        except OSError:
+            continue
+        try:
+            actual = os.fstat(stream.fileno())
+            # Skip files replaced between enumeration and open, and incomplete older
+            # backups that were written directly to .json before atomic rename was added.
+            if (actual.st_nlink == 1 and actual.st_size >= 3 and os.path.samestat(expected, actual)
+                    and os.path.samestat(folder_info, folder.lstat()) and RECOVERY_HEADER.match(stream.read(160))):
+                stream.seek(-3, os.SEEK_END)
+                if stream.read(3) == b"]}}":
+                    return name, stream
+        except OSError:
+            pass
+        stream.close()
+    return None
 
 
 def _save_recovery(con, folder):

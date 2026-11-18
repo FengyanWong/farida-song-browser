@@ -18,7 +18,7 @@ export class PlaylistPlayer {
     this.video.addEventListener('timeupdate',()=>{if(Date.now()-(this.lastSave||0)>5000)this.remember();});
     this.video.addEventListener('pause',()=>this.remember());
     this.video.addEventListener('volumechange',()=>this.schedulePreferences());
-    window.addEventListener('pagehide',()=>{this.remember(true);this.persistPreferences();});
+    window.addEventListener('pagehide',()=>{this.cancelResumeLoad();this.remember(true);this.persistPreferences();});
     $('#play-all').onclick=()=>this.fromResults();
     $('#play-selected').onclick=()=>this.start(this.selectedClips(),'选中片段');
     $('#playlist-new').onclick=()=>this.edit();
@@ -249,27 +249,44 @@ export class PlaylistPlayer {
   async initialize() {
     const lists=this.loadPlaylists().catch(()=>toast('暂时无法读取本地歌单。刷新页面可重试。'));
     try {
-      this.saved=await this.api('/api/player-state?compact=true');
-      this.preferenceWriter=this.saved.preference_writer;this.preferenceSequence=0;
-      this.video.volume=this.saved.volume??1;this.video.muted=!!this.saved.muted;
-      this.setCompact(!!this.saved.compact,false);
+      const summary=await this.api('/api/player-state?summary=true');
+      this.preferenceWriter=summary.preference_writer;this.preferenceSequence=0;
+      this.video.volume=summary.volume??1;this.video.muted=!!summary.muted;
+      this.setCompact(!!summary.compact,false);
       this.lastPreferenceBody=JSON.stringify(this.preferences());this.preferencesReady=true;
-      this.shuffle=this.saved.shuffle;this.repeat=this.saved.repeat;this.skipUnavailable=!!this.saved.skip_unavailable;this.modeButtons();
+      if (!this.queue.length) {
+        this.saved=summary;this.applySavedModes(summary);
+      }
       this.updateResumeButton();
     } catch { /* Playback memory must not prevent opening the library. */ }
     await lists;
   }
+  applySavedModes(saved) {
+    this.shuffle=saved.shuffle;this.repeat=saved.repeat;this.skipUnavailable=!!saved.skip_unavailable;
+    this.modeButtons();
+  }
+  cancelResumeLoad() {
+    if (!this.resumeLoad) return;
+    this.resumeLoad.abort();
+    this.resumeLoad=null;
+    $('#player-remembered').disabled=false;
+  }
+  beginQueueRequest() {
+    this.cancelResumeLoad();$('#play-all').disabled=false;
+    return ++this.queueRequest;
+  }
   updateResumeButton() {
     const button=$('#player-remembered');
     const canShow=this.saved && !this.persistenceSuspended && this.canPlay() && $('#music-player').hidden;
-    const clip=canShow && (this.saved.items===this.queue ? this.queue[this.index]
-      : this.saved.items.find(item=>item.id===this.saved.current_id));
-    button.hidden=!clip;
+    const clip=canShow && (this.saved.items===this.queue ? this.queue[this.index] : this.saved.current_item);
+    if (!clip) this.cancelResumeLoad();
+    button.hidden=!clip;button.disabled=!!this.resumeLoad;
     if (clip) button.textContent='继续播放：'+clip.display_song_title;
   }
-  resumeRemembered() {
+  async resumeRemembered() {
     const saved=this.saved;
-    if (!saved || this.persistenceSuspended || !this.canPlay()) return;
+    if (!saved || this.resumeLoad || this.persistenceSuspended || !this.canPlay()) return;
+    this.beginQueueRequest();
     if (saved.items===this.queue) {
       // The queue, its progress key, shuffle history and search results are still in memory.
       this.saved=null;
@@ -279,7 +296,25 @@ export class PlaylistPlayer {
       this.recoveryAttempts=0;
       this.play(this.index,saved,!!this.logicalPlay);
     } else {
-      this.start(saved.items,saved.name,saved.current_id,saved);
+      const load=new AbortController();this.resumeLoad=load;this.updateResumeButton();
+      try {
+        const full=await this.api('/api/player-state?compact=true&resume=true',{signal:load.signal});
+        if (this.resumeLoad!==load || this.saved!==saved || this.persistenceSuspended || !this.canPlay()) return;
+        const current=full.items.find(item=>item.id===full.current_id && item.playback_url);
+        if (!current || full.current_id!==saved.current_id || full.resume_queue_key!==saved.resume_queue_key) {
+          this.saved=current?{current_id:current.id,current_item:current,resume_queue_key:full.resume_queue_key}:null;
+          toast(current?`播放记录已更新为「${full.name}」中的「${current.display_song_title}」，请再次点击继续播放。`:'已保存的歌曲当前无法播放。');
+          return;
+        }
+        this.resumeLoad=null;
+        this.applySavedModes(full);
+        this.start(full.items,full.name,full.current_id,full);
+      } catch(error) {
+        if (this.resumeLoad===load) toast('未能读取上次播放的队列，可再次点击「继续播放」。'+error.message);
+        return;
+      } finally {
+        if (this.resumeLoad===load) {this.resumeLoad=null;this.updateResumeButton();}
+      }
     }
     if (!$('#music-player').hidden) $('#player-compact').focus({preventScroll:true});
   }
@@ -358,7 +393,7 @@ export class PlaylistPlayer {
   }
   async fromResults(id) {
     if (!this.canPlay()) return;
-    const request=++this.queueRequest;
+    const request=this.beginQueueRequest();
     try {
       $('#play-all').disabled=true;
       const items=await this.results();
@@ -369,7 +404,7 @@ export class PlaylistPlayer {
   }
   start(items,name,id,resume=null) {
     if (!this.canPlay()) return;
-    ++this.queueRequest;$('#play-all').disabled=false;
+    this.beginQueueRequest();
     const seen=new Set();
     const playable=items.filter(item=>item.playback_url&&!seen.has(item.id)&&seen.add(item.id));
     if(!playable.length){toast('这个列表中还没有可播放的片段。');return;}
@@ -459,7 +494,7 @@ export class PlaylistPlayer {
     this.persistPreferences();
     // Closing removes the media source, so pagehide cannot capture this checkpoint later.
     this.remember(keepResume);
-    ++this.generation;++this.queueRequest;this.abort?.abort();this.segments=[];this.logicalPlay=null;this.handlingFailure=null;this.failed=false;
+    ++this.generation;this.beginQueueRequest();this.abort?.abort();this.segments=[];this.logicalPlay=null;this.handlingFailure=null;this.failed=false;
     this.video.pause();this.video.removeAttribute('src');this.video.load();
     panel.hidden=true;$('#play-all').disabled=false;
     if (keepResume) {
@@ -483,7 +518,7 @@ export class PlaylistPlayer {
   }
   async playSaved() {
     if (!this.canPlay()) return;
-    const request=++this.queueRequest;
+    const request=this.beginQueueRequest();
     try {
       const result=await this.api('/api/playlists/'+$('#playlist-select').value);
       if(request!==this.queueRequest)return;

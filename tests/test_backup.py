@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from copy import deepcopy
 import pytest
@@ -125,3 +126,79 @@ def test_manual_backups_exclude_credentials(db, source, video):
     assert secret not in recovery
     assert auth_file.read_text(encoding='utf-8') == secret
     assert 'sync_jobs' not in snapshot['tables']
+
+def test_download_latest_automatic_recovery_is_local_and_read_only(settings, video):
+    with TestClient(create_app(settings, scan_on_start=False)) as client:
+        db = client.app.state.db
+        folder = db.path.parent / "backups"
+        url = "/api/backup/recovery"
+        assert client.get(url, params={"check": True}).json() == {"available": False}
+        assert client.get(url).status_code == 404
+        assert not folder.exists()
+        db.save_video(db.source(1), video, [])
+        clip = video["bvid"] + ":100"
+        db.annotate([clip], {"notes": "original"})
+        initial = export_backup(db)
+        db.annotate([clip], {"notes": "first recovery"})
+        older = restore_backup(db, initial)
+        db.annotate([clip], {"notes": "second recovery"})
+        latest = restore_backup(db, initial)
+        assert older != latest
+
+        valid = (folder / latest).read_bytes()
+        stamp = "before-restore-2099-01-01T00-00-00+00-00-"
+        (folder / (stamp + "abc12345.tmp")).write_bytes(valid)
+        (folder / (stamp + "abc12345.json")).write_bytes(valid[:-10])
+        (folder / (stamp + "badshape.json")).write_bytes(b'{"unrelated": []}}')
+        (folder / "before-restore-manual.json").write_bytes(valid)
+        # A hard link with the right name must not expose another file.
+        target = db.path.parent / "unrelated.json"
+        target.write_bytes(valid)
+        os.link(target, folder / (stamp + "hardlink.json"))
+        (folder / (stamp + "isfolder.json")).mkdir()
+
+        current = export_backup(db)["tables"]
+        assert client.get(url, params={"check": True}).json() == {"available": True}
+        assert client.get(url, headers={"Host": "untrusted.invalid"}).status_code == 400
+        response = client.get(url, params={"filename": "unrelated.json"})
+        assert response.status_code == 200 and response.content == valid
+        assert response.headers["content-disposition"] == f"attachment; filename={latest}"
+        assert response.headers["content-length"] == str(len(valid))
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json()["tables"]["user_state"][0]["notes"] == "second recovery"
+        assert export_backup(db)["tables"] == current
+        (folder / latest).unlink()
+        assert client.get(url).content == (folder / older).read_bytes()
+        (folder / older).unlink()
+        assert client.get(url, params={"check": True}).json() == {"available": False}
+        assert client.get(url).status_code == 404
+
+
+def test_automatic_recovery_lookup_ignores_linked_folders(db):
+    from farida.backup import open_latest_recovery
+
+    name = restore_backup(db, export_backup(db))
+    folder = db.path.parent / "backups"
+    real = db.path.parent / "actual-backups"
+    folder.rename(real)
+    try:
+        folder.symlink_to(real, target_is_directory=True)
+    except OSError:
+        # Windows allows normal users to create directory junctions even when
+        # its developer-mode permission for symlink creation is disabled.
+        if os.name != "nt":
+            raise
+        import subprocess
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "New-Item -ItemType Junction -Path $env:FARIDA_QA_LINK -Target $env:FARIDA_QA_TARGET | Out-Null"],
+            env={**os.environ, "FARIDA_QA_LINK": str(folder), "FARIDA_QA_TARGET": str(real)},
+            check=True, capture_output=True,
+        )
+        assert open_latest_recovery(folder) is None
+        return
+    assert open_latest_recovery(folder) is None
+    folder.unlink()
+    folder.mkdir()
+    (folder / name).symlink_to(real / name)
+    assert open_latest_recovery(folder) is None

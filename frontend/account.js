@@ -8,6 +8,7 @@ export class AccountLogin {
     this.api=api;this.changed=changed;this.preview=true;this.busy=false;this.loggingOut=false;this.initialized=false;this.stopped=false;
     this.generation=0;this.revision=0;this.attempt=null;this.operations=Promise.resolve();
     this.qrObserver=globalThis.crypto?.randomUUID?.();
+    this.menuRevision=0;
     this.dialog=$('#login-dialog');
     $('#account-toggle').onclick=()=>this.toggleMenu();
     $('#login-button').onclick=()=>this.openQR();
@@ -33,7 +34,16 @@ export class AccountLogin {
     this.attempt=null;this.hideImage();this.toggleMenu(false);
   }
   toggleMenu(open=$('#account-menu').hidden) {
-    $('#account-menu').hidden=!open;$('#account-toggle').setAttribute('aria-expanded',String(open));
+    const menu=$('#account-menu'), recovery=$('#backup-recovery');
+    if (open===!menu.hidden) return;
+    menu.hidden=!open;$('#account-toggle').setAttribute('aria-expanded',String(open));
+    const revision=++this.menuRevision;
+    recovery.hidden=true;
+    if (open) {
+      this.api('/api/backup/recovery?check=true').then(result=>{
+        if (revision===this.menuRevision) recovery.hidden=!result.available;
+      }).catch(()=>{ /* Leave the link hidden while the local service is unavailable. */ });
+    }
   }
   async initialize(preview) {
     this.preview=preview;

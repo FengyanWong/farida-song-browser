@@ -153,6 +153,41 @@ async function until(test) {
     await page.clock.runFor(900);assert.equal(await page.evaluate(()=>window.petTicks),0);
     await page.evaluate(()=>window.dispatchEvent(new PageTransitionEvent('pageshow',{persisted:true})));
     await page.clock.runFor(500);assert.ok(await page.evaluate(()=>window.petTicks)>0);
+    const retryPage=await browser.newPage();
+    retryPage.on('pageerror',error=>errors.push(error.message));
+    let sessions=0,statusReads=0,authChecks=0,playlistReads=0;
+    let allowStatus;
+    const statusGate=new Promise(resolve=>{allowStatus=resolve;});
+    await retryPage.route('**/*',async route=>{
+      const url=new URL(route.request().url());
+      if(url.origin!==base)return route.abort();
+      if(url.pathname==='/api/session' && ++sessions<=2)
+        return route.fulfill({status:503,json:{detail:'本地服务正在启动'}});
+      if(url.pathname==='/api/overview'){
+        if(++statusReads===1)return route.fulfill({status:503,json:{detail:'目录正在打开'}});
+        await statusGate;
+      }
+      if(url.pathname.startsWith('/api/auth')){
+        if(url.pathname.endsWith('/check'))authChecks++;
+        return route.fulfill({json:{state:'connected',stored:true,account:{uid:'1',name:'测试'}}});
+      }
+      if(url.pathname==='/api/playlists')playlistReads++;
+      return route.continue();
+    });
+    await retryPage.goto(base+'/#sources');
+    await until(()=>sessions===2);
+    assert.equal(await retryPage.locator('#retry-session').isVisible(),true);
+    assert.deepEqual([authChecks,playlistReads],[0,0]);
+    await retryPage.locator('#retry-session').click();
+    await retryPage.locator('#sources-view').waitFor({state:'visible'});
+    await until(async()=>await retryPage.locator('#notice').textContent().then(text=>text.includes('自动重试')));
+    assert.equal(await retryPage.locator('#connection-retry').isVisible(),false);
+    allowStatus();
+    await retryPage.locator('#source-list .source-card').first().waitFor();
+    assert.equal(await retryPage.locator('#notice').isVisible(),false);
+    assert.deepEqual([sessions,authChecks,playlistReads],[3,1,1]);
+    await retryPage.close();
+    console.log('Passed: startup retries a transient session failure, keeps the requested Sources tab, and recovers its initial overview without a duplicate login check');
     await page.close();await until(()=>server.exitCode!==null);assert.equal(server.exitCode,0);
     assert.deepEqual(errors,[]);
     console.log(JSON.stringify({idleFrames,intervalMs:2160,inactiveTicks:0,backgroundOverviewRequests:0,activeAndIdlePolling:true,restoredOnPageshow:true,deniedStoragePetLayouts:[1,2],errors}));

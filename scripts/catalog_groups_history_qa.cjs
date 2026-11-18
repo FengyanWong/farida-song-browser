@@ -85,6 +85,11 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await context.addInitScript(()=>{
       Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{window.copiedUrl=text;}}});
     });
+    let recoveryChecks=0;
+    page.on('request',request=>{
+      const url=new URL(request.url());
+      if(url.pathname==='/api/backup/recovery' && url.searchParams.has('check')) recoveryChecks++;
+    });
     await page.goto(base+'/#catalog');await page.locator('#clip-rows tr').first().waitFor();
     assert.equal(await page.locator('nav [data-view]').count(),2);
     const queries=[];
@@ -345,7 +350,11 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     assert.match(await page.locator('.history-play:disabled').textContent(),/当前不可用/);
     await page.screenshot({path:path.join(output,'history-desktop.png'),fullPage:false});
     await page.locator('#listening-history-dialog .close-dialog').first().click();
+    assert.equal(recoveryChecks,0);
+    const emptyRecovery=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/backup/recovery');
     await page.locator('#account-toggle').click();
+    assert.deepEqual(await(await emptyRecovery).json(),{available:false});
+    assert.equal(await page.locator('#backup-recovery').isHidden(),true);
     const downloadPromise=page.waitForEvent('download');await page.locator('#backup-download').click();
     const download=await downloadPromise;assert.match(download.suggestedFilename(),/^farida-backup-\d{4}-\d{2}-\d{2}\.json$/);
     const backupFile=path.join(output,'manual-history-backup.json');await download.saveAs(backupFile);
@@ -382,6 +391,15 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     const recoveryHistory=recoveryFiles.map(name=>JSON.parse(fs.readFileSync(path.join(dataDir,'backups',name),'utf8')).tables.listening_history.length);
     assert.deepEqual(recoveryHistory.sort(),[0,3]);
     pass('Manual v2 backup download/restoration preserves history; legacy v1 restores without foreign-key errors and keeps a recovery copy of previous history');
+    assert.equal(recoveryChecks,1);  // Reloads and catalog polling perform no recovery checks.
+    await page.locator('#account-toggle').click();await page.locator('#backup-recovery').waitFor();
+    const priorDownload=page.waitForEvent('download');await page.locator('#backup-recovery').click();
+    const priorFile=await priorDownload;assert.ok(recoveryFiles.includes(priorFile.suggestedFilename()));
+    const priorPath=path.join(output,'downloaded-before-restore.json');await priorFile.saveAs(priorPath);
+    assert.equal(JSON.parse(fs.readFileSync(priorPath,'utf8')).tables.listening_history.length,3);
+    assert.equal((await api('/api/listening-history')).items.length,0);
+    assert.equal(recoveryChecks,2);await page.locator('#account-toggle').click();
+    pass('Restoring exposes the latest pre-restore backup in the account menu only on demand; downloading preserves the current catalog');
 
     await page.screenshot({path:path.join(output,'groups-desktop.png'),fullPage:false});
     await api('/api/listening-history','POST',{clip_id:historyIds[0]});

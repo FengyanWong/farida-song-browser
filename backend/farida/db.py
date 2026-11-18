@@ -10,6 +10,7 @@ from urllib.parse import parse_qs
 
 from .adapter import BVID, parse_source, validated_video, video_has_uploader
 from .classifier import SINGING_COLLECTION_TYPES, classify, is_singing_collection, normalize, normalize_performer
+from .player_state import PlayerState
 from .songlist import CURATOR, URL as SONGLIST_URL
 
 
@@ -654,14 +655,47 @@ class Database:
         row['songlist_credits'] = self.all('SELECT cs.song_title,cs.original_artist,cs.language,cs.style,cs.fetched_at,s.canonical_url FROM curated_songs cs JOIN sources s ON s.id=cs.source_id WHERE cs.bvid=?', (row['video_bvid'],))
         return row
 
-    def saved_queue(self, clip_ids, *, compact=False):
+    def resume_state(self, *, summary):
+        # Removing clip_ids before applying the small checkpoint avoids sending the whole
+        # array through Python just to show the current song and preferences at startup.
+        value = "json_remove(s.value,'$.clip_ids')" if summary else "s.value"
+        with self.connect() as con:
+            con.execute("BEGIN")
+            row = con.execute(f"""
+                SELECT json_patch({value},COALESCE(p.value,'{{}}')) AS value,
+                       CASE WHEN json_array_length(s.value,'$.clip_ids')>0 THEN
+                         COALESCE(p.queue_key,json_array(json_extract(s.value,'$.name'),json_extract(s.value,'$.clip_ids')))
+                       END AS queue_identity
+                FROM playback_state s LEFT JOIN playback_progress p ON p.id=s.id WHERE s.id=1
+            """).fetchone()
+            saved = PlayerState.model_validate_json(row["value"]) if row else PlayerState()
+            identity = row["queue_identity"] if row else None
+            result = saved.model_dump(exclude={"clip_ids"} if summary else set())
+            # Restored/legacy queues have no progress key. Their ordered IDs and name
+            # identify the queue without creating or exposing a progress write token.
+            result["resume_queue_key"] = hashlib.sha256(identity.encode("utf-8")).hexdigest() if identity else None
+            if summary:
+                current = None
+                if saved.current_id is not None:
+                    current = con.execute("SELECT p.id,a.display_song_title" + CLIP_FROM + f"""
+                        WHERE p.id=? AND {PLAYABLE} AND EXISTS(
+                            SELECT 1 FROM playback_state s,json_each(s.value,'$.clip_ids') i
+                            WHERE s.id=1 AND i.value=p.id)
+                    """, (saved.current_id,)).fetchone()
+                result["current_item"] = dict(current) if current else None
+            else:
+                result["items"] = self.saved_queue(saved.clip_ids, compact=True, connection=con)
+            return result
+
+    def saved_queue(self, clip_ids, *, compact=False, connection=None):
         if not clip_ids:
             return []
         select = QUEUE_SELECT if compact else CLIP_SELECT
         # json_each accepts the entire saved queue as one parameter, including
         # lists larger than SQLite's variable limit. Read duplicates just once.
-        rows = self.all(select + f" WHERE {PLAYABLE} AND p.id IN (SELECT value FROM json_each(?))",
-                        (encode(clip_ids),))
+        sql = select + f" WHERE {PLAYABLE} AND p.id IN (SELECT value FROM json_each(?))"
+        params = (encode(clip_ids),)
+        rows = self.all(sql, params) if connection is None else [dict(row) for row in connection.execute(sql, params)]
         by_id = {row['id']: row if compact else self.clip_row(row) for row in rows}
         return [by_id[clip_id] for clip_id in clip_ids if clip_id in by_id]
 

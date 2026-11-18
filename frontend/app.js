@@ -15,13 +15,16 @@ const clipFilters = {included:'已收录',bookmarked:'星标收藏',needs_review
 const labels = {queued:'等待采集',running:'采集中',paused:'访问受限',failed:'采集未完成',interrupted:'上次运行中断',cancelled:'已取消',completed:'已完成'};
 const sourceTypes = {uploader:'UP 主',season:'合集',series:'系列列表',favorites:'收藏夹',search:'标签发现',songlist:'整理歌单'};
 let pollTimer, lastOverview, polling = false, refreshOnReturn = false;
+let connecting=false, sessionRetried=false, sessionRetryTimer, startupOverviewError;
 function schedulePoll(delay) {
   clearTimeout(pollTimer);
   if (!state.stopping && !document.hidden) pollTimer = setTimeout(poll, delay);
 }
 document.addEventListener('visibilitychange', () => {
   clearTimeout(pollTimer);
-  if (!document.hidden && state.token && !state.stopping) {
+  if (!document.hidden && !state.stopping && !state.token && !$('#connection-retry').hidden) {
+    initializeApp();
+  } else if (!document.hidden && state.token && !state.stopping) {
     refreshOnReturn = true;
     schedulePoll(0);
   }
@@ -141,6 +144,8 @@ async function loadOverview() {
   if (request !== overviewRequest || state.stopping) return;
   schedulePoll(o.jobs.some(j=>['running','queued'].includes(j.state)) ? 1500 : 10000);
   $('#connection-label').textContent='本地运行 · 自动保存';$('.status-dot').style.background='var(--green)';
+  if (startupOverviewError && $('#notice').textContent===startupOverviewError) notice('');
+  startupOverviewError=null;
   const signature = JSON.stringify(o);
   if (signature === lastOverview) return;
   lastOverview = signature;
@@ -666,20 +671,44 @@ async function poll() {
     schedulePoll(active ? 1500 : 10000);
   }
 }
-try {
-  const session=await api('/api/session');
+async function initializeApp() {
+  if(connecting || state.token || state.stopping)return;
+  connecting=true;clearTimeout(sessionRetryTimer);
+  const retry=$('#retry-session');
+  retry.disabled=true;
+  let session;
+  try {
+    session=await api('/api/session');
+  } catch {
+    $('#connection-retry').hidden=false;
+    if(!sessionRetried) {
+      sessionRetried=true;
+      sessionRetryTimer=setTimeout(()=>{if(!document.hidden)initializeApp();},1200);
+    }
+    return;
+  } finally {
+    connecting=false;retry.disabled=false;
+  }
+  $('#connection-retry').hidden=true;
   state.token=session.token;
   state.preview=!!session.preview_mode;
   if(session.close_with_page)appLifetime.start(state.token);
   $('#preview-notice').hidden=!state.preview;
   $$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);
   accountLogin.initialize(state.preview);
-  await Promise.all([loadOverview(), playlistPlayer.initialize()]);
+  const overview=loadOverview().catch(error=>{
+    startupOverviewError='暂时无法读取采集状态，将自动重试。'+error.message;
+    notice(startupOverviewError,true);
+    $('#connection-label').textContent='正在重试本地连接';
+    $('.status-dot').style.background='var(--danger)';
+    schedulePoll(1500);
+  });
+  await Promise.all([overview,playlistPlayer.initialize()]);
   readRoute();
   initialViewReady=true;
-} catch(error) {
-  notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);
 }
+$('#retry-session').onclick=initializeApp;
+await initializeApp();
 
 const backupImportLimit=64*1024*1024;
 $('#backup-download').onclick=async()=>{
@@ -707,11 +736,11 @@ $('#backup-file').onchange=async event=>{
     playlistPlayer.persistenceSuspended=true;
     playlistPlayer.updateResumeButton();
     await playlistPlayer.saveChain;
-    const result=await api('/api/restore',{method:'POST',body:file});
+    await api('/api/restore',{method:'POST',body:file});
     playlistPlayer.preferencesReady=false;
     clearTimeout(playlistPlayer.preferencesTimer);
     playlistPlayer.stop();
-    alert('恢复完成。恢复前备份已保存到本机 backups 文件夹：'+result.safety_backup);
+    alert('恢复完成。你可以在右上角的账号菜单下载上次恢复前的备份。');
     location.reload();
   } catch(error){
     playlistPlayer.persistenceSuspended=false;
