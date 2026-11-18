@@ -136,6 +136,66 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     await page.locator('#player-toggle').click();
     pass('An old playback lookup cannot replace the song after Next is pressed');
 
+    await page.locator('#player-close').click();
+    await page.locator('#search').fill('');
+    await delay(500);await startClick('#play-all');
+    await page.waitForFunction(()=>document.querySelector('#song-video').currentTime>0);
+    await page.evaluate(()=>document.querySelector('#song-video').pause());
+    await page.locator('#player-repeat').click();await page.locator('#player-repeat').click();
+    const repeated=requests.at(-1),repeatCount=requests.length;
+    await page.locator('#player-toggle').click();await until(()=>requests.length>repeatCount);
+    assert.equal(requests.at(-1),repeated);
+    await page.waitForFunction(()=>document.querySelector('#song-video').currentTime>0);
+    await page.evaluate(()=>document.querySelector('#song-video').pause());
+    await page.locator('#player-repeat').click();await page.locator('#player-repeat').click();
+    const wrapStart=requests.length;
+    await page.locator('#player-queue button').last().click();
+    await until(()=>requests.length>=wrapStart+2);
+    assert.equal(requests.at(-1),all[0].id);
+    await page.waitForFunction(()=>document.querySelector('#song-video').currentTime>0);
+    await page.evaluate(()=>document.querySelector('#song-video').pause());
+    await page.locator('#player-repeat').click();await page.locator('#player-repeat').click();
+    pass('List repeat wraps from the last song to the first after a real ended event');
+    await page.locator('#player-shuffle').click();
+    const shuffled=[requests.at(-1)];
+    for(let i=0;i<3;i++){
+      await startClick('#player-next');
+      await page.waitForFunction(()=>document.querySelector('#song-video').currentTime>0);
+      await page.evaluate(()=>document.querySelector('#song-video').pause());
+      shuffled.push(requests.at(-1));
+    }
+    assert.equal(new Set(shuffled).size,4);
+    await startClick('#player-prev');assert.equal(requests.at(-1),shuffled[2]);
+    await page.waitForFunction(()=>document.querySelector('#song-video').currentTime>0);
+    await page.evaluate(()=>{const v=document.querySelector('#song-video');v.currentTime=.5;v.pause();});
+    const lastId=requests.at(-1);
+    await until(async()=>{const saved=await(await fetch(base+'/api/player-state')).json();return saved.current_id===lastId&&saved.position>=.4;});
+    const memoryRequests=requests.length;
+    await page.reload();await page.locator('#player-remembered').waitFor({state:'visible'});
+    assert.equal(requests.length,memoryRequests);
+    await startClick('#player-remembered');assert.equal(requests.at(-1),lastId);
+    await page.waitForFunction(()=>document.querySelector('#song-video').currentTime>=.4);
+    await page.evaluate(()=>document.querySelector('#song-video').pause());
+    assert.equal(await page.locator('#player-shuffle').getAttribute('aria-pressed'),'true');
+    pass('Single-song repeat uses real ended events; shuffle visits different songs; Previous follows history; reload remembers song, position and modes without autoplay');
+
+    await page.locator('#account-toggle').click();
+    const downloaded=page.waitForEvent('download');await page.locator('#backup-download').click();
+    const download=await downloaded;const backupPath=path.join(output,'backup.json');await download.saveAs(backupPath);
+    const backup=JSON.parse(fs.readFileSync(backupPath,'utf8'));assert.equal(backup.format,'farida-backup');
+    assert.ok(backup.tables.playlists.length>0);assert.ok(!('credentials' in backup.tables));
+    const token=(await(await fetch(base+'/api/session')).json()).token;
+    await fetch(base+'/api/clips/'+encodeURIComponent(lastId)+'/bookmark',{method:'PATCH',headers:{'Content-Type':'application/json','X-Farida-Token':token},body:JSON.stringify({bookmarked:true})});
+    page.on('dialog',async dialog=>dialog.accept());
+    await page.locator('#backup-file').setInputFiles(backupPath);
+    await page.waitForEvent('load');await page.locator('#clip-rows tr').first().waitFor();
+    const restored=await(await fetch(base+'/api/backup')).json();
+    assert.deepEqual(restored.tables.user_state,backup.tables.user_state);
+    assert.deepEqual(restored.tables.playlists,backup.tables.playlists);
+    pass('Chinese backup download and confirmed restore preserve playlists and restore favorites from an actual file');
+    await startClick('#player-remembered');await page.waitForFunction(()=>document.querySelector('#song-video').currentTime>0);
+    await page.evaluate(()=>document.querySelector('#song-video').pause());
+
     await page.setViewportSize({width:390,height:844});
     await page.screenshot({path:path.join(output,'player-mobile.png'),fullPage:true});
     assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));

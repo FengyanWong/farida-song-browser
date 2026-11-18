@@ -1,36 +1,53 @@
-import { $, $$, escape as e, icon, hydrateIcons, toast, dateTime } from './ui.js';
+import { $, $$, escape as e, icon, hydrateIcons, toast, dateTime, writeClipboard } from './ui.js';
 import { Pet } from './pet.js';
 import { AccountLogin } from './account.js';
 import { AppLifetime } from './lifetime.js';
 import { PlaylistPlayer } from './player.js';
+import { MiniPlayer } from './mini-player.js';
+import { connectMediaControls } from './media-controls.js';
 
 hydrateIcons();
 const pet = new Pet(); pet.initialize();
 const appLifetime = new AppLifetime();
-const state = {view:'catalog',filter:'included',page:1,pageSize:40,overview:null,clips:null,token:null,preview:false,stopping:false,selected:new Set(),editSource:null,request:0};
+const state = {view:'catalog',filter:'included',page:1,pageSize:40,overview:null,clips:null,token:null,preview:false,stopping:false,selected:new Set(),expandedGroups:new Set(),grouped:false,editSource:null,request:0};
 const failedCovers = new Set();
 const clipFilters = {included:'已收录',bookmarked:'星标收藏',needs_review:'待确认',all:'全部候选',excluded:'已排除'};
 const labels = {queued:'等待采集',running:'采集中',paused:'访问受限',failed:'采集未完成',interrupted:'上次运行中断',cancelled:'已取消',completed:'已完成'};
 const sourceTypes = {uploader:'UP 主',season:'合集',series:'系列列表',favorites:'收藏夹',search:'标签发现',songlist:'整理歌单'};
-let pollTimer;
-function schedulePoll(delay) { clearTimeout(pollTimer); if(!state.stopping)pollTimer=setTimeout(poll,delay); }
+let pollTimer, lastOverview, polling = false, refreshOnReturn = false;
+function schedulePoll(delay) {
+  clearTimeout(pollTimer);
+  if (!state.stopping && !document.hidden) pollTimer = setTimeout(poll, delay);
+}
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(pollTimer);
+  if (!document.hidden && state.token && !state.stopping) {
+    refreshOnReturn = true;
+    schedulePoll(0);
+  }
+});
 
 async function api(path, options={}) {
   const response=await fetch(path,{...options,headers:{'Content-Type':'application/json','X-Farida-Token':state.token || '',...options.headers}});
   let data;try {data=await response.json();}catch {throw new Error('本地服务返回异常，请重新启动应用。');}
-  if (!response.ok) {const error=new Error(typeof data.detail==='string'?data.detail:'请检查输入内容后重试。');error.status=response.status;throw error;}
+  if (!response.ok) {const error=new Error(typeof data.detail==='string'?data.detail:'请检查输入内容后重试。');error.status=response.status;error.category=response.headers.get('X-Farida-Error');throw error;}
   return data;
 }
 function notice(message, error=false) { const el=$('#notice');el.textContent=message;el.hidden=!message;el.classList.toggle('error',error); }
 const accountLogin = new AccountLogin(api, async()=>{notice('');await refresh();});
 const playlistPlayer = new PlaylistPlayer(api, parameters, ()=>state.clips?.items.filter(clip=>state.selected.has(clip.id))||[]);
+const miniPlayer = new MiniPlayer(playlistPlayer);
+connectMediaControls(playlistPlayer);
 async function quitApp() {
   if(state.stopping)return;
   state.stopping=true;clearTimeout(pollTimer);
   $$('[data-quit-app]').forEach(button=>button.disabled=true);
   try {
+    await playlistPlayer.persistPreferences();
+    await playlistPlayer.remember();
     await api('/api/shutdown',{method:'POST'});
     appLifetime.stop();
+    pet.setPageActive(false);
     playlistPlayer.stop();
     accountLogin.stop();
     $$('dialog[open]').forEach(dialog=>dialog.close());
@@ -51,6 +68,7 @@ function parameters() {
   const inputs={q:'#search',source_id:'#source-filter',uploader:'#uploader-filter',after:'#after',before:'#before'};
   for(const [key,selector] of Object.entries(inputs)) if($(selector).value) result.set(key,$(selector).value);
   if(state.filter==='bookmarked')result.set('bookmarked','true');
+  if(state.grouped)result.set('grouped','true');
   return result;
 }
 function saveRoute() {
@@ -79,7 +97,13 @@ function optionList(selector, rows, getValue, getLabel, first) {
   if([...el.options].some(o=>o.value===selected))el.value=selected;
 }
 async function loadOverview() {
-  state.overview=await api('/api/overview');const o=state.overview;
+  const o = await api('/api/overview?compact=true');
+  schedulePoll(o.jobs.some(j=>['running','queued'].includes(j.state)) ? 1500 : 10000);
+  $('#connection-label').textContent='本地运行 · 自动保存';$('.status-dot').style.background='var(--green)';
+  const signature = JSON.stringify(o);
+  if (signature === lastOverview) return;
+  lastOverview = signature;
+  state.overview = o;
   $('#nav-included').textContent=o.included;
   for(const option of $('#clip-filter').options)option.textContent=`${clipFilters[option.value]} (${option.value==='all'?o.entries:o[option.value]})`;
   $('#count-included').textContent=o.included.toLocaleString();$('#count-submissions').textContent=o.submissions.toLocaleString();
@@ -88,8 +112,6 @@ async function loadOverview() {
   optionList('#source-filter',o.sources,s=>s.id,s=>s.display_name,'全部来源');
   optionList('#uploader-filter',o.uploaders,s=>s.uid,s=>s.name,'全部 UP 主');
   renderJob();if(state.view==='sources')renderSources();
-  $('#connection-label').textContent='本地运行 · 自动保存';$('.status-dot').style.background='var(--green)';
-  schedulePoll(o.jobs.some(j=>['running','queued'].includes(j.state))?1500:10000);
 }
 async function loadClips() {
   const request=++state.request;
@@ -120,15 +142,23 @@ document.addEventListener('error',event=>{
   const img=event.target,cover=img.parentElement;
   failedCovers.add(img.src);cover.title='封面暂时无法加载';cover.setAttribute('aria-label','封面暂时无法加载');img.remove();
 },true);
-function renderClips() {
-  const result=state.clips;
-  $('#clip-rows').innerHTML=result.items.map(clip=>{
+function clipRow(clip) {
     const dates=dateTime(clip.published_at).split(' ');
     const target=clip.playback_url;
     const title=target?`<a class="row-title" href="${e(target)}" target="_blank" rel="noopener noreferrer" data-play="${e(clip.id)}" title="在此页面播放">${e(clip.display_song_title)}</a>`:`<span class="row-title">${e(clip.display_song_title)}</span>`;
     const status=clip.inclusion_status!=='included'?`<span class="badge ${clip.inclusion_status==='needs_review'?'warn':'muted'}">${clip.inclusion_status==='needs_review'?'待确认':'已排除'}</span>`:'';
     return `<tr><td class="check-col"><input type="checkbox" data-select="${e(clip.id)}" aria-label="选择 ${e(clip.display_song_title)}" ${state.selected.has(clip.id)?'checked':''}></td><td><div class="clip-content">${coverImage(clip.thumbnail_url)}<div class="clip-text">${title}<div class="row-subtitle">${clip.part_count>1?`<span class="part-badge">P${clip.part_number}</span>`:''}<span class="original-title" title="${e(clip.raw_title)}">${clip.raw_title!==clip.display_song_title?e(clip.raw_title):''}</span>${status}${clip.has_curated_credit?'<span class="badge">歌单 · CLANNADOR</span>':''}${!target?'<span class="badge warn">当前不可用</span>':''}</div></div></div></td><td class="row-uploader-cell"><span class="row-uploader" title="UID ${e(clip.uploader_uid)}">${e(clip.uploader_name)}</span></td><td class="row-date">${e(dates[0])}<small>${e(dates.slice(1).join(' '))}</small></td><td><div class="row-actions"><button class="icon-button ${clip.bookmarked?'active':''}" data-bookmark="${e(clip.id)}" aria-label="${clip.bookmarked?'取消收藏':'收藏'} ${e(clip.display_song_title)}" title="${clip.bookmarked?'取消收藏':'收藏'}">${icon('star')}</button><button class="icon-button" data-detail="${e(clip.id)}" aria-label="查看 ${e(clip.display_song_title)} 的详情" title="详情与修正">${icon('more')}</button></div></td></tr>`;
-  }).join('');
+}
+function renderClips() {
+  const result=state.clips;
+  const currentIds=new Set(result.items.map(clip=>clip.id));
+  for(const id of state.selected)if(!currentIds.has(id))state.selected.delete(id);
+  const byId=new Map(result.items.map(clip=>[clip.id,clip]));
+  $('#clip-rows').innerHTML=state.grouped?(result.groups||[]).map((group,index)=>{
+    const members=group.clip_ids.map(id=>byId.get(id)).filter(Boolean),expanded=state.expandedGroups.has(group.key);
+    const uploaders=[...new Set(members.map(clip=>clip.uploader_name))].join('、');
+    return `<tr class="song-group-row"><td class="check-col"><input type="checkbox" data-select-group="${index}" aria-label="选择 ${e(group.title)} 的全部 ${group.count} 个版本"></td><td colspan="4"><div class="song-group-heading"><button class="song-group-toggle" data-group="${index}" aria-expanded="${expanded}" aria-label="${expanded?'收起':'展开'} ${e(group.title)} 的 ${group.count} 个版本">${icon(expanded?'chevron-down':'chevron-right')}<span><b>${e(group.title)}</b><small title="${e(uploaders)}">${group.count} 个版本 · ${e(uploaders)}</small></span></button><button class="icon-button" data-play-group="${index}" aria-label="播放 ${e(group.title)} 的所有版本" title="播放这些版本">${icon('play')}</button></div></td></tr>${expanded?members.map(clipRow).join(''):''}`;
+  }).join(''):result.items.map(clipRow).join('');
   const empty=$('#empty-state');empty.hidden=result.total>0;
   if(!result.total) {
     const o=state.overview || {}, filtered=$('#search').value||$('#source-filter').value||$('#after').value||$('#before').value||$('#uploader-filter').value;
@@ -137,40 +167,57 @@ function renderClips() {
     $('h2',empty).textContent=heading;$('p',empty).innerHTML=description;
     $('#first-scan').hidden=!!(filtered||o.entries||state.filter!=='included');
   }
-  $('#result-count').textContent=`${result.total.toLocaleString()} 个片段${result.total?` · 显示 ${(state.page-1)*state.pageSize+1}–${Math.min(state.page*state.pageSize,result.total)}`:''}`;
+  $('#result-count').textContent=`${state.grouped?`${result.total.toLocaleString()} 首歌 · ${(result.total_clips??result.items.length).toLocaleString()} 个版本`:`${result.total.toLocaleString()} 个片段`}${result.total?` · 显示 ${(state.page-1)*state.pageSize+1}–${Math.min(state.page*state.pageSize,result.total)}`:''}`;
   $('#page-number').textContent=`${state.page} / ${Math.max(1,Math.ceil(result.total/state.pageSize))}`;
   $('#prev-page').disabled=state.page===1;$('#next-page').disabled=state.page*state.pageSize>=result.total;
   updateSelection();
 }
 function errorText(error) {
   if(!error)return '';
-  if(error.category==='restricted')return `哔哩哔哩限制了访问${error.upstream_code?`（${error.upstream_code}）`:error.http_status?`（HTTP ${error.http_status}）`:''}。已暂停。可在右上角账号菜单检查登录；若已登录，请稍后再试。`;
+  if(error.category==='restricted')return 'B站暂时限制访问，采集已暂停。已保存的歌曲仍可使用。请稍后点击「继续任务」；若登录已失效，可在右上角重新登录。';
   if(error.category==='authentication')return '登录已失效，请在右上角账号菜单重新登录后再采集。';
-  if(error.category==='network')return '网络连接失败，已保存的内容仍然可用。';
+  if(error.category==='network')return '无法连接来源网站。请检查网络后点击「继续任务」，已保存的歌曲不会丢失。';
   if(error.category==='pagination')return '分页未完整结束；已保存进度，尚不能确认完整覆盖。';
   if(error.category==='identity')return '返回的身份与配置不一致，请检查来源 UID。';
   if(error.category==='video_identity')return '某条投稿的主投稿人或联合创作者未能与来源核对，已保存进度。';
-  if(error.category==='schema')return '哔哩哔哩返回的数据格式有变化，已停止此次采集并保留已有内容。';
-  if(error.category==='server')return '哔哩哔哩服务暂时不可用，请稍后继续任务。';
-  if(error.category==='retry_later')return '哔哩哔哩要求稍后重试，已暂停采集。';
+  if(error.category==='schema')return '来源网站返回的数据格式有变化，已保留采集进度。若持续失败，需要更新应用。';
+  if(error.category==='server')return '来源网站暂时不可用，请稍后点击「继续任务」。';
+  if(error.category==='retry_later')return '来源网站要求稍后重试，采集已暂停。请稍后点击「继续任务」。';
   if(error.category==='internal')return '本地采集出现错误，已保存进度。可重新启动应用，或查看使用说明中的排查方法。';
   return error.message || '采集未完成，已保存进度。';
+}
+function jobAdditions(job) {
+  const checkpoints=Object.values(job?.checkpoints||{});
+  if(!checkpoints.length||checkpoints.some(cp=>cp.added_clips==null))return '新增数未记录';
+  return `新增 ${checkpoints.reduce((n,cp)=>n+cp.added_clips,0)} 个片段（已收录 ${checkpoints.reduce((n,cp)=>n+(cp.added_included||0),0)}）`;
 }
 function renderJob() {
   const jobs=state.overview?.jobs || [];const active=jobs.find(j=>['running','queued'].includes(j.state));
   const blocked=!!active||!accountLogin.canCollect();
   $('#sync-button').disabled=blocked;$('#first-scan').disabled=blocked;$('#full-scan').disabled=blocked;
-  const banner=$('#job-banner');banner.hidden=!active;
+  const banner=$('#job-banner');banner.hidden=!jobs.length;
   if(active) {
     const running=Object.entries(active.checkpoints).find(([,p])=>p.state==='running');
     const source=state.overview.sources.find(s=>String(s.id)===running?.[0]);
     const progress=running?.[1];
-    banner.innerHTML=`<span class="spinner"></span><span>${active.mode==='full'?'完整采集':'采集更新'} · ${e(source?.display_name || '准备中')} ${progress?.current_page?`· 第 ${progress.current_page} 页`:''} · 已处理 ${active.processed} 个视频</span><button class="button secondary small" data-cancel="${e(active.id)}" ${active.cancel_requested?'disabled':''}>${active.cancel_requested?'正在取消…':'取消采集'}</button>`;
+    banner.innerHTML=`<span class="spinner"></span><span>${active.mode==='full'?'完整采集':'采集更新'} · ${e(source?.display_name || '准备中')} ${progress?.current_page?`· 第 ${progress.current_page} 页`:''} · 已检查 ${active.processed} 个视频 · ${jobAdditions(active)}</span><button class="button secondary small" data-cancel="${e(active.id)}" ${active.cancel_requested?'disabled':''}>${active.cancel_requested?'正在取消…':'取消采集'}</button>`;
     pet.setStatus('running');
-  } else if(jobs[0] && ['paused','failed','interrupted'].includes(jobs[0].state)) {
-    if(jobs[0].errors[0])notice(errorText(jobs[0].errors[0]));
-    pet.setStatus('failed');
-  } else pet.setStatus(state.view==='catalog' && state.filter==='needs_review'?'waiting':'idle');
+  } else if(jobs[0]) {
+    const job=jobs[0],failed=['paused','failed','interrupted'].includes(job.state);
+    const error=job.errors[0];
+    const message=error?errorText(error):job.state==='interrupted'?'上次应用退出时采集未完成，已保存进度。':job.state==='cancelled'?'采集已取消，已保存的歌曲仍然保留。':'';
+    banner.innerHTML=`<span><b>${e(labels[job.state]||job.state)}</b> · ${jobAdditions(job)}${message?`<br><small>${e(message)}</small>`:''}</span>${['paused','failed','interrupted','cancelled'].includes(job.state)?`<button class="button secondary small" data-resume="${e(job.id)}" ${blocked?'disabled':''}>继续任务</button>`:''}`;
+    pet.setStatus(failed?'failed':state.view==='catalog'&&state.filter==='needs_review'?'waiting':'idle');
+  } else pet.setStatus('idle');
+}
+function collectionStatus(source) {
+  const status=source.collection_status||{state:'idle'};
+  const names={idle:'尚未采集',queued:'等待采集',running:'正在采集',completed:'更新完成',paused:status.error?.category==='authentication'?'需要重新登录':status.error?.category==='restricted'?'访问受限，已暂停':'采集已暂停',failed:'未完成',cancelled:'已取消',interrupted:'上次采集中断',not_started:'本次尚未执行'};
+  const detail=status.state==='not_started'?'任务在前序来源停止，此来源未开始采集。':status.state==='queued'?'等待前序来源完成。':status.state==='running'?`已检查 ${status.processed} 个视频${status.current_page?` · 第 ${status.current_page} 页`:''}`:'';
+  const scope=source.source_type==='search'?'标签搜索仅检查限定页数，不代表全部视频。':status.mode==='incremental'&&source.source_type!=='songlist'?'本次检查最近投稿，完整历史需使用「完整扫描」。':'';
+  const counted=status.added_clips!=null;
+  const additions=counted?`新增 ${status.added_clips} 个片段 · 其中 ${status.added_included||0} 个已收录${status.skipped?` · 跳过 ${status.skipped} 个不可访问视频`:''}`:status.last_attempt_at?'旧任务未记录新增数':'';
+  return `<div class="source-dates collection-result"><span class="badge ${status.state==='completed'?'ok':['failed','paused','interrupted'].includes(status.state)?'warn':''}">${e(names[status.state]||'未完成')}</span><br><span>上次成功更新：${dateTime(status.last_success_at)}</span>${status.last_attempt_at?`<br><span>最近尝试：${dateTime(status.last_attempt_at)}</span>`:''}${detail?`<br>${e(detail)}`:''}${additions?`<br><span title="仅计算这次任务新增到本机的片段；重复视频与恢复重放不会重复计数。">${e(additions)}</span>`:''}${scope?`<br><small>${e(scope)}</small>`:''}</div>`;
 }
 function skippedVideos(job) {
   const items=[...new Map(Object.values(job?.checkpoints || {}).flatMap(cp=>cp.unavailable || []).map(item=>[item.bvid,item])).values()];
@@ -183,13 +230,12 @@ function renderSources() {
   const active=state.overview.jobs.some(j=>['running','queued'].includes(j.state))||!accountLogin.canCollect();
   $('#source-list').innerHTML=state.overview.sources.map(source=>{
     const verified=source.verification_status==='verified',search=source.source_type==='search',curated=source.source_type==='songlist';
-    const latestJob=state.overview.jobs.find(job=>job.checkpoints?.[String(source.id)]);
-    const skipped=latestJob?skippedVideos({checkpoints:{[source.id]:latestJob.checkpoints[String(source.id)]}}):'';
+    const skipped=skippedVideos({checkpoints:{[source.id]:{unavailable:source.collection_status?.unavailable||[]}}});
     const subtitle=curated?'CLANNADOR 整理':search?'法里达 + 直播切片':`UID ${e(source.uid)}`;
     const dates=curated?`${source.listed_songs || 0} 首歌 · ${source.linked_songs || 0} 个 BV 链接<br>歌单读取：${dateTime(source.list_fetched_at)}<br>每次更新重读歌单，补齐新增视频。<br><a href="https://fareeda.songlist.cc/" target="_blank" rel="noopener noreferrer">查看原歌单 ↗</a>`:search?`上次标签发现：${dateTime(source.last_discovery_at)}<br>仅保留实际标签同时匹配的歌唱内容；其他候选待确认。`:`完整扫描：${source.last_complete_scan_at?dateTime(source.last_complete_scan_at):'尚未完成'}<br>最近更新：${dateTime(source.last_refresh_at)}`;
-    return `<article class="source-card ${source.enabled?'':'disabled'}"><div class="source-card-top"><span class="source-avatar">${search?icon('search'):e(source.display_name[0])}</span><div><h3>${e(source.display_name)}</h3><small>${subtitle}${source.resolved_name && source.resolved_name!==source.display_name?` · 当前名称 ${e(source.resolved_name)}`:''}</small></div>${!search&&!curated?`<button class="icon-button" data-edit-source="${source.id}" title="编辑来源" aria-label="编辑 ${e(source.display_name)}" ${active?'disabled':''}>${icon('settings')}</button>`:''}</div><div class="source-meta"><span class="badge">${sourceTypes[source.source_type]}</span><span class="badge ${verified?'ok':'warn'}">${curated?(verified?'歌单已读取':'等待读取'):search?'有限搜索发现':verified?'身份已核对':'身份待核对'}</span>${!source.enabled?'<span class="badge muted">已停用</span>':''}</div><div class="source-stats"><span>${source.submissions} 个原视频</span><span>${source.entries} 个片段</span></div><div class="source-dates">${dates}</div>${skipped}${source.last_error?`<div class="source-error">${e(errorText(source.last_error))}</div>`:''}<div class="source-actions"><button class="button small" data-scan-source="${source.id}" ${active||!source.enabled?'disabled':''}>${curated?'更新歌单':search?'发现片段':'采集更新'}</button>${!search&&!curated?`<button class="button small" data-full-source="${source.id}" ${active||!source.enabled?'disabled':''}>完整扫描</button>`:''}<button class="text-button" data-toggle-source="${source.id}" ${active?'disabled':''}>${source.enabled?'停用':'启用'}</button></div></article>`;
+    return `<article class="source-card ${source.enabled?'':'disabled'}"><div class="source-card-top"><span class="source-avatar">${search?icon('search'):e(source.display_name[0])}</span><div><h3>${e(source.display_name)}</h3><small>${subtitle}${source.resolved_name && source.resolved_name!==source.display_name?` · 当前名称 ${e(source.resolved_name)}`:''}</small></div>${!search&&!curated?`<button class="icon-button" data-edit-source="${source.id}" title="编辑来源" aria-label="编辑 ${e(source.display_name)}" ${active?'disabled':''}>${icon('settings')}</button>`:''}</div><div class="source-meta"><span class="badge">${sourceTypes[source.source_type]}</span><span class="badge ${verified?'ok':'warn'}">${curated?(verified?'歌单已读取':'等待读取'):search?'有限搜索发现':verified?'身份已核对':'身份待核对'}</span>${!source.enabled?'<span class="badge muted">已停用</span>':''}</div><div class="source-stats"><span>${source.submissions} 个原视频</span><span>${source.entries} 个片段</span></div><div class="source-dates">${dates}</div>${collectionStatus(source)}${skipped}${source.collection_status?.error?`<div class="source-error">${e(errorText(source.collection_status.error))}</div>`:''}<div class="source-actions">${source.collection_status?.can_resume?`<button class="button small" data-resume="${e(source.collection_status.job_id)}" ${active||!source.enabled?'disabled':''}>继续任务</button>`:''}<button class="button small" data-scan-source="${source.id}" ${active||!source.enabled?'disabled':''}>${curated?'更新歌单':search?'发现片段':'采集更新'}</button>${!search&&!curated?`<button class="button small" data-full-source="${source.id}" ${active||!source.enabled?'disabled':''}>完整扫描</button>`:''}<button class="text-button" data-toggle-source="${source.id}" ${active?'disabled':''}>${source.enabled?'停用':'启用'}</button></div></article>`;
   }).join('');
-  $('#job-history').innerHTML=state.overview.jobs.length?state.overview.jobs.map(job=>`<div class="history-item"><span class="badge ${job.state==='completed'?'ok':job.state==='running'?'':'warn'}">${labels[job.state] || e(job.state)}</span><span>${job.mode==='full'?'完整采集':'最近更新'} · ${job.processed} 个视频</span><span class="history-time">${dateTime(job.started_at)}</span>${['failed','paused','interrupted','cancelled'].includes(job.state)?`<button class="button small" data-resume="${e(job.id)}" ${active?'disabled':''}>继续任务</button>`:''}${job.errors.length?`<div class="history-error">${e(errorText(job.errors[0]))}</div>`:''}${skippedVideos(job)}</div>`).join(''):'<div class="history-empty">还没有采集记录</div>';
+  $('#job-history').innerHTML=state.overview.jobs.length?state.overview.jobs.map(job=>`<div class="history-item"><span class="badge ${job.state==='completed'?'ok':job.state==='running'?'':'warn'}">${labels[job.state] || e(job.state)}</span><span>${job.mode==='full'?'完整采集':'最近更新'} · ${job.processed} 个视频 · ${jobAdditions(job)}</span><span class="history-time">${dateTime(job.started_at)}</span>${['failed','paused','interrupted','cancelled'].includes(job.state)?`<button class="button small" data-resume="${e(job.id)}" ${active?'disabled':''}>继续任务</button>`:''}${job.errors.length?`<div class="history-error">${e(errorText(job.errors[0]))}</div>`:''}${skippedVideos(job)}</div>`).join(''):'<div class="history-empty">还没有采集记录</div>';
 }
 async function startSync(mode='incremental',sourceIds=[]) {
   try {notice('');await api('/api/sync',{method:'POST',body:JSON.stringify({mode,source_ids:sourceIds})});await loadOverview();toast('采集任务已启动，内容会逐条保存。');}
@@ -199,10 +245,16 @@ async function refresh() {try {await loadOverview();if(state.view!=='sources')aw
 function clearSelection() {state.selected.clear();updateSelection();}
 function updateSelection() {
   $('#bulk-bar').hidden=!state.selected.size;$('#selected-count').textContent=`已选择 ${state.selected.size} 项`;
-  const items=state.clips?.items || [];$('#select-page').checked=items.length>0 && items.every(i=>state.selected.has(i.id));
+  const items=state.clips?.items || [],selected=items.filter(i=>state.selected.has(i.id)).length;
+  $('#select-page').checked=items.length>0 && selected===items.length;
+  $('#select-page').indeterminate=selected>0 && selected<items.length;
+  $$('[data-select-group]').forEach(input=>{
+    const ids=state.clips.groups[Number(input.dataset.selectGroup)].clip_ids,count=ids.filter(id=>state.selected.has(id)).length;
+    input.checked=ids.length>0&&count===ids.length;input.indeterminate=count>0&&count<ids.length;
+  });
   $$('[data-select]').forEach(el=>el.checked=state.selected.has(el.dataset.select));
 }
-function filtersChanged() {state.page=1;clearSelection();loadClips();}
+function filtersChanged() {state.page=1;state.expandedGroups.clear();clearSelection();loadClips();}
 function showSource(source) {
   state.editSource=source || null;$('#source-name').value=source?.display_name || '';$('#source-url').value=source?.canonical_url || '';
   $('#singing-collection').checked=!!source?.singing_collection;$('#source-form-error').textContent='';$('#source-dialog-title').textContent=source?'编辑来源':'添加来源';$('#source-dialog').showModal();
@@ -210,7 +262,7 @@ function showSource(source) {
 async function showDetail(id) {
   const clip=await api('/api/clips/'+encodeURIComponent(id));const el=$('#detail-content');
   const credit=clip.songlist_credits?.length?`<dt>歌单整理</dt><dd><a href="https://fareeda.songlist.cc/" target="_blank" rel="noopener noreferrer">CLANNADOR · 小法的歌单 ↗</a><br>${clip.songlist_credits.map(song=>`${e(song.song_title)}${song.original_artist?` · 原唱 ${e(song.original_artist)}`:''}`).join('<br>')}</dd>`:'';
-  el.innerHTML=`<div class="dialog-heading"><h2>片段详情</h2><button class="icon-button close-dialog" aria-label="关闭">${icon('x')}</button></div><h3 class="detail-title">${e(clip.display_song_title)}</h3><div class="detail-original">${e(clip.raw_title)}</div><dl class="detail-grid"><dt>UP 主</dt><dd>${e(clip.uploader_name)} · UID ${e(clip.uploader_uid)}</dd><dt>上传时间</dt><dd>${dateTime(clip.published_at)}（当前时区）</dd><dt>分 P 信息</dt><dd>P${clip.part_number} · ${e(clip.raw_part_title)} · CID ${e(clip.cid)}</dd><dt>判断依据</dt><dd>${e(clip.classification_reason)}${clip.manual_fields.length?' · 含手动修正':''}</dd><dt>来源</dt><dd>${clip.sources.map(s=>e(s.display_name)).join('、')}</dd>${credit}</dl><div class="tag-list">${clip.tags.map(tag=>`<span class="badge">${e(tag)}</span>`).join('')}</div><div class="review-actions"><button class="button primary small" data-classify="included" data-id="${e(id)}">确认收录</button><button class="button secondary small" data-classify="excluded" data-id="${e(id)}">排除此片段</button><button class="button secondary small" data-classify="needs_review" data-id="${e(id)}">保留待确认</button>${clip.playback_url?`<a class="button secondary small" href="${e(clip.playback_url)}" data-open="${e(id)}" target="_blank" rel="noopener noreferrer">${icon('external')}打开原视频</a>`:''}</div><details><summary>修改歌名、分组与备注</summary><form id="annotation-form" data-id="${e(id)}"><label class="field">显示歌名<input name="display_song_title" required maxlength="500" value="${e(clip.display_song_title)}"></label><label class="field">歌曲分组<input name="song_group" maxlength="200" value="${e(clip.song_group)}" placeholder="用于归拢不同演唱版本"></label><label class="field">个人备注<input name="notes" maxlength="5000" value="${e(clip.notes)}"></label><button class="button primary small">保存修正</button></form></details><details><summary>原始描述与数据来源</summary><div class="detail-description">${e(clip.description || '暂无描述')}</div><p class="detail-stats">${Object.entries(clip.statistics).map(([key,v])=>`${({view:'播放',like:'点赞',coin:'投币',favorite:'收藏',share:'分享',reply:'评论',danmaku:'弹幕'})[key]}：${v==null?'未知':v.toLocaleString()}`).join(' · ')}<br>以上为整个原视频的统计，不是此分 P 的单独统计。<br>获取于 ${dateTime(clip.stats_fetched_at)} · ${e(clip.provenance.details)}</p></details>`;
+  el.innerHTML=`<div class="dialog-heading"><h2>片段详情</h2><button class="icon-button close-dialog" aria-label="关闭">${icon('x')}</button></div><h3 class="detail-title">${e(clip.display_song_title)}</h3><div class="detail-original">${e(clip.raw_title)}</div><dl class="detail-grid"><dt>UP 主</dt><dd>${e(clip.uploader_name)} · UID ${e(clip.uploader_uid)}</dd><dt>上传时间</dt><dd>${dateTime(clip.published_at)}（当前时区）</dd><dt>分 P 信息</dt><dd>P${clip.part_number} · ${e(clip.raw_part_title)} · CID ${e(clip.cid)}</dd><dt>判断依据</dt><dd>${e(clip.classification_reason)}${clip.manual_fields.length?' · 含手动修正':''}</dd><dt>来源</dt><dd>${clip.sources.map(s=>e(s.display_name)).join('、')}</dd>${credit}</dl><div class="tag-list">${clip.tags.map(tag=>`<span class="badge">${e(tag)}</span>`).join('')}</div><div class="review-actions"><button class="button primary small" data-classify="included" data-id="${e(id)}">确认收录</button><button class="button secondary small" data-classify="excluded" data-id="${e(id)}">排除此片段</button><button class="button secondary small" data-classify="needs_review" data-id="${e(id)}">保留待确认</button>${clip.playback_url?`<a class="button secondary small" href="${e(clip.playback_url)}" data-open="${e(id)}" target="_blank" rel="noopener noreferrer">${icon('external')}打开原视频</a><button type="button" class="button secondary small" data-copy-url="${e(clip.playback_url)}">复制链接</button>`:''}</div><details><summary>修改歌名、分组与备注</summary><form id="annotation-form" data-id="${e(id)}"><label class="field">显示歌名<input name="display_song_title" required maxlength="500" value="${e(clip.display_song_title)}"></label><label class="field">歌曲分组<input name="song_group" maxlength="200" value="${e(clip.song_group)}" placeholder="用于归拢不同演唱版本"></label><label class="field">个人备注<input name="notes" maxlength="5000" value="${e(clip.notes)}"></label><button class="button primary small">保存修正</button></form></details><details><summary>原始描述与数据来源</summary><div class="detail-description">${e(clip.description || '暂无描述')}</div><p class="detail-stats">${Object.entries(clip.statistics).map(([key,v])=>`${({view:'播放',like:'点赞',coin:'投币',favorite:'收藏',share:'分享',reply:'评论',danmaku:'弹幕'})[key]}：${v==null?'未知':v.toLocaleString()}`).join(' · ')}<br>以上为整个原视频的统计，不是此分 P 的单独统计。<br>获取于 ${dateTime(clip.stats_fetched_at)} · ${e(clip.provenance.details)}</p></details>`;
   if(!$('#detail-dialog').open)$('#detail-dialog').showModal();
 }
 
@@ -219,8 +271,22 @@ document.addEventListener('click',async event=>{
   try {
     if(button.matches('.close-dialog'))button.closest('dialog').close();
     if(button.dataset.view)setView(button.dataset.view);
+    if(button.dataset.group!==undefined){
+      const group=state.clips.groups[Number(button.dataset.group)];
+      state.expandedGroups.has(group.key)?state.expandedGroups.delete(group.key):state.expandedGroups.add(group.key);
+      renderClips();$(`[data-group="${button.dataset.group}"]`).focus();
+    }
+    if(button.dataset.playGroup!==undefined){
+      const group=state.clips.groups[Number(button.dataset.playGroup)],ids=new Set(group.clip_ids);
+      playlistPlayer.start(state.clips.items.filter(item=>ids.has(item.id)),group.title+' · 不同版本');
+    }
     if(button.dataset.play && !(event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)) {
       event.preventDefault();await playlistPlayer.fromResults(button.dataset.play);
+    }
+    if(button.dataset.copyUrl) {
+      const url=button.dataset.copyUrl;
+      if (await writeClipboard(url)) toast('已复制原视频链接。');
+      else window.prompt('复制原视频链接',url);
     }
     if(button.dataset.open && !(event.ctrlKey||event.metaKey||event.shiftKey||event.altKey)) {
       event.preventDefault();const result=await api(`/api/clips/${encodeURIComponent(button.dataset.open)}/open`,{method:'POST'});
@@ -229,7 +295,18 @@ document.addEventListener('click',async event=>{
     if(button.dataset.bookmark){const clip=state.clips.items.find(c=>c.id===button.dataset.bookmark);await api(`/api/clips/${encodeURIComponent(clip.id)}/bookmark`,{method:'PATCH',body:JSON.stringify({bookmarked:!clip.bookmarked})});await refresh();}
     if(button.dataset.detail)await showDetail(button.dataset.detail);
     if(button.dataset.classify){await api(`/api/clips/${encodeURIComponent(button.dataset.id)}/annotation`,{method:'PATCH',body:JSON.stringify({inclusion_status:button.dataset.classify})});$('#detail-dialog').close();clearSelection();await refresh();toast('已保存你的决定，后续采集会保留。');}
-    if(button.dataset.bulk){await api('/api/review/bulk',{method:'PATCH',body:JSON.stringify({ids:[...state.selected],inclusion_status:button.dataset.bulk})});clearSelection();await refresh();toast('已保存选中片段的决定。');}
+    if(button.dataset.bulk){
+      const ids=[...state.selected];$$('[data-bulk]').forEach(el=>el.disabled=true);let saved=0;
+      try {
+        for(let offset=0;offset<ids.length;offset+=100){
+          const batch=ids.slice(offset,offset+100);
+          await api('/api/review/bulk',{method:'PATCH',body:JSON.stringify({ids:batch,inclusion_status:button.dataset.bulk})});
+          batch.forEach(id=>state.selected.delete(id));saved+=batch.length;updateSelection();
+        }
+        await refresh();toast(`已保存 ${saved} 个片段的决定。`);
+      } catch(error){if(saved)toast(`已保存 ${saved} 个片段，其余仍保持选中。`);throw error;}
+      finally{$$('[data-bulk]').forEach(el=>el.disabled=false);}
+    }
     if(button.dataset.cancel){await api(`/api/sync/${button.dataset.cancel}/cancel`,{method:'POST'});await loadOverview();}
     if(button.dataset.resume){notice('');await api(`/api/sync/${button.dataset.resume}/resume`,{method:'POST'});await loadOverview();}
     if(button.dataset.scanSource)await startSync('incremental',[Number(button.dataset.scanSource)]);
@@ -242,9 +319,16 @@ document.addEventListener('submit',async event=>{
   if(event.target.id!=='annotation-form')return;event.preventDefault();
   try{await api(`/api/clips/${encodeURIComponent(event.target.dataset.id)}/annotation`,{method:'PATCH',body:JSON.stringify(Object.fromEntries(new FormData(event.target)))});$('#detail-dialog').close();await refresh();toast('修正已保存。');}catch(error){toast(error.message);}
 });
-document.addEventListener('change',event=>{if(event.target.dataset.select){event.target.checked?state.selected.add(event.target.dataset.select):state.selected.delete(event.target.dataset.select);updateSelection();}});
+document.addEventListener('change',event=>{
+  if(event.target.dataset.selectGroup!==undefined){
+    state.clips.groups[Number(event.target.dataset.selectGroup)].clip_ids.forEach(id=>event.target.checked?state.selected.add(id):state.selected.delete(id));updateSelection();
+  }
+  if(event.target.dataset.select){event.target.checked?state.selected.add(event.target.dataset.select):state.selected.delete(event.target.dataset.select);updateSelection();}});
 $('#select-page').onchange=event=>{state.clips?.items.forEach(clip=>event.target.checked?state.selected.add(clip.id):state.selected.delete(clip.id));updateSelection();};
 $('#clear-selection').onclick=clearSelection;
+try{state.grouped=localStorage.getItem('farida-grouped')==='true';}catch{}
+$('#group-songs').checked=state.grouped;
+$('#group-songs').onchange=()=>{state.grouped=$('#group-songs').checked;try{localStorage.setItem('farida-grouped',String(state.grouped));}catch{}filtersChanged();};
 $('#filter-button').onclick=()=>{const panel=$('#extra-filters');panel.hidden=!panel.hidden;$('#filter-button').setAttribute('aria-expanded',String(!panel.hidden));};
 $('#reset-filters').onclick=()=>{['#search','#source-filter','#uploader-filter','#after','#before'].forEach(s=>$(s).value='');$('#sort').value='newest';$('#clip-filter').value=state.filter='included';saveRoute();renderJob();filtersChanged();};
 $('#clip-filter').onchange=()=>{state.filter=$('#clip-filter').value;saveRoute();renderJob();filtersChanged();};
@@ -263,5 +347,80 @@ $('#source-form').onsubmit=async event=>{
 };
 document.addEventListener('keydown',event=>{if(event.key==='/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName) && !document.querySelector('dialog[open]')){event.preventDefault();if(state.view==='sources')setView('catalog');$('#search').focus();}});
 window.addEventListener('hashchange',readRoute);
-async function poll(){if(state.stopping)return;if(document.hidden){schedulePoll(10000);return;}try{const active=state.overview?.jobs.some(j=>['running','queued'].includes(j.state));await loadOverview();await accountLogin.refresh();if(active && state.view!=='sources')await loadClips();}catch{if(state.stopping)return;$('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';schedulePoll(10000);}}
+async function poll() {
+  if (state.stopping || document.hidden || polling) return;
+  polling = true;
+  const wasCollecting = state.overview?.jobs.some(job=>['running','queued'].includes(job.state));
+  try {
+    await loadOverview();
+    if (document.hidden || state.stopping) return;
+    await accountLogin.refresh();
+    if (document.hidden || state.stopping) return;
+    if ((wasCollecting || refreshOnReturn) && state.view !== 'sources') await loadClips();
+    refreshOnReturn = false;
+  } catch {
+    if (state.stopping) return;
+    $('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';
+  } finally {
+    polling = false;
+    const active = state.overview?.jobs.some(job=>['running','queued'].includes(job.state));
+    schedulePoll(active ? 1500 : 10000);
+  }
+}
 try {const session=await api('/api/session');state.token=session.token;state.preview=!!session.preview_mode;if(session.close_with_page)appLifetime.start(state.token);$('#preview-notice').hidden=!state.preview;$$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);accountLogin.initialize(state.preview);await loadOverview();await playlistPlayer.initialize();readRoute();}catch(error){notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);}
+
+$('#backup-download').onclick=async()=>{
+  try {
+    await playlistPlayer.persistPreferences();
+    await playlistPlayer.remember();
+    const data=await api('/api/backup');
+    const url=URL.createObjectURL(new Blob([JSON.stringify(data)],{type:'application/json'}));
+    const link=document.createElement('a');link.href=url;link.download='farida-backup-'+new Date().toISOString().slice(0,10)+'.json';link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);toast('备份已下载，不含登录凭据。');
+  }catch(error){toast(error.message);}
+};
+$('#backup-restore').onclick=()=>$('#backup-file').click();
+$('#backup-file').onchange=async event=>{
+  const file=event.target.files[0];event.target.value='';if(!file)return;
+  if(file.size>64*1024*1024){toast('备份不能超过 64 MB。');return;}
+  if(!confirm('恢复将替换本机的歌曲目录、来源、收藏、备注和歌单。应用会先保存一份恢复前备份；登录信息不变。继续？'))return;
+  $('#backup-restore').disabled=true;
+  try {
+    playlistPlayer.stop();await playlistPlayer.saveChain;
+    const body=await file.text();
+    const result=await api('/api/restore',{method:'POST',body});
+    // Reload must not write the pre-restore volume/layout over the restored settings.
+    playlistPlayer.persistenceSuspended=true;playlistPlayer.preferencesReady=false;clearTimeout(playlistPlayer.preferencesTimer);
+    alert('恢复完成。恢复前备份已保存到本机 backups 文件夹：'+result.safety_backup);
+    location.reload();
+  } catch(error){toast(error.message);}
+  finally{$('#backup-restore').disabled=false;}
+};
+
+
+let listeningHistory=[],historyRequest=0;
+async function loadListeningHistory() {
+  const request=++historyRequest;$('#listening-history-error').textContent='';
+  try {
+    const result=await api('/api/listening-history');if(request!==historyRequest)return;
+    listeningHistory=result.items;
+    $('#listening-history-list').innerHTML=listeningHistory.map((clip,index)=>`<li><button class="history-play" data-history-play="${index}" ${clip.playback_url?'':'disabled'}><span><b>${e(clip.display_song_title)}</b><small>${e(clip.uploader_name)} · ${dateTime(clip.last_played_at)}</small></span>${clip.playback_url?icon('play'):'<small>当前不可用</small>'}</button></li>`).join('');
+    $('#listening-history-empty').hidden=!!listeningHistory.length;
+    $('#listening-history-clear').disabled=!listeningHistory.length;
+    $('#listening-history-count').textContent=`最近 ${listeningHistory.length} 首 · 仅保存在此电脑`;
+  }catch(error){if(request===historyRequest)$('#listening-history-error').textContent=error.message;}
+}
+$('#listening-history-open').onclick=()=>{$('#listening-history-dialog').showModal();loadListeningHistory();};
+$('#listening-history-refresh').onclick=loadListeningHistory;
+$('#listening-history-list').onclick=event=>{
+  const button=event.target.closest('[data-history-play]');if(!button||button.disabled)return;
+  const clip=listeningHistory[Number(button.dataset.historyPlay)];
+  $('#listening-history-dialog').close();playlistPlayer.start(listeningHistory,'最近播放',clip.id);
+};
+$('#listening-history-clear').onclick=async()=>{
+  if(!confirm('清空最近播放记录？歌曲、歌单和收藏会保留。'))return;
+  $('#listening-history-clear').disabled=true;
+  try{await api('/api/listening-history',{method:'DELETE'});await loadListeningHistory();toast('最近播放记录已清空。');}
+  catch(error){$('#listening-history-error').textContent=error.message;$('#listening-history-clear').disabled=false;}
+};
+document.addEventListener('farida-history-change',()=>{if($('#listening-history-dialog').open)loadListeningHistory();});

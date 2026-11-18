@@ -40,18 +40,24 @@ async function storedPet(value, write=false) {
 export class Pet {
   constructor() {
     this.node = $('#pet-sprite'); this.version = 2; this.row = 0; this.frame = 0;
-    this.manualUntil = 0; this.pointerUntil = 0; this.status = 'idle'; this.lastTick = 0;
+    this.manualUntil = 0; this.pointerUntil = 0; this.status = 'idle'; this.pageActive = true;
     this.motion = localStorage.getItem('pet-motion') !== 'false';
     this.visible = localStorage.getItem('pet-visible') !== 'false';
     this.reduced = matchMedia('(prefers-reduced-motion: reduce)');
     this.node.addEventListener('click', () => this.gesture(3));
     this.node.addEventListener('dblclick', () => this.gesture(4));
-    document.addEventListener('pointermove', e => this.pointer(e));
+    this.onPointer = e => this.pointer(e);
+    document.addEventListener('visibilitychange', () => this.resetAnimation());
+    window.addEventListener('pagehide', () => this.setPageActive(false));
+    window.addEventListener('pageshow', () => this.setPageActive(true));
+    this.reduced.addEventListener('change', () => this.resetAnimation());
+    this.resize = new ResizeObserver(() => { if (this.visible && this.pageActive && !document.hidden) this.paint(); });
+    this.resize.observe(this.node);
     $('#pet-settings').onclick = () => $('#pet-dialog').showModal();
     $('#pet-files').onchange = e => this.import(e.target.files);
     $('#pet-visible').checked = this.visible; $('#pet-motion').checked = this.motion;
-    $('#pet-visible').onchange = e => { this.visible = e.target.checked; localStorage.setItem('pet-visible',this.visible); this.node.hidden = !this.visible; };
-    $('#pet-motion').onchange = e => { this.motion = e.target.checked; localStorage.setItem('pet-motion',this.motion); };
+    $('#pet-visible').onchange = e => { this.visible = e.target.checked; localStorage.setItem('pet-visible',this.visible); this.node.hidden = !this.visible; this.resetAnimation(); };
+    $('#pet-motion').onchange = e => { this.motion = e.target.checked; localStorage.setItem('pet-motion',this.motion); this.resetAnimation(); };
     $('#pet-reset').onclick = async () => {
       try { await storedPet(null,true); this.apply({name:'Frida',version:2,url:'/assets/frida.webp'}); $('#pet-message').textContent = '已恢复默认 Frida。'; }
       catch { toast('无法保存宠物设置，请检查浏览器存储权限。'); }
@@ -63,9 +69,6 @@ export class Pet {
       const saved = await storedPet();
       this.apply(saved ? {...saved,url:URL.createObjectURL(saved.blob)} : {name:'Frida',version:2,url:'/assets/frida.webp'});
     } catch { this.apply({name:'Frida',version:2,url:'/assets/frida.webp'}); }
-    this.timer = setInterval(() => this.tick(),50);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) this.lastTick = 0; });
-    window.addEventListener('pagehide', () => clearInterval(this.timer),{once:true});
   }
   apply(pet) {
     if (this.url?.startsWith('blob:')) URL.revokeObjectURL(this.url);
@@ -73,7 +76,7 @@ export class Pet {
     this.node.style.backgroundImage = `url("${this.url}")`;
     this.node.setAttribute('aria-label',`和 ${this.name} 打招呼`);
     this.node.title = `点击挥手，双击跳跃 · ${this.name}`;
-    $('#pet-name').textContent = this.name; this.row = 0; this.frame = 0; this.paint();
+    $('#pet-name').textContent = this.name; this.resetAnimation();
   }
   paint() {
     const scale = this.node.clientWidth / 192;
@@ -83,24 +86,67 @@ export class Pet {
     this.node.style.backgroundSize = `${1536*scale}px ${ (this.version === 2 ? 2288 : 1872)*scale}px`;
     this.node.style.backgroundPosition = `${-this.frame*192*scale}px ${-this.row*208*scale}px`;
   }
-  gesture(row) { this.row=row; this.frame=0; this.manualUntil=performance.now()+STATES[row].reduce((a,b)=>a+b,0); this.lastTick=performance.now(); this.paint(); }
-  setStatus(status) { this.status=status; $('#pet-status').textContent = ({idle:'陪你收集喜欢的歌声',running:'正在慢慢收集歌声…',waiting:'等你确认这些片段',failed:'采集暂停，歌声还在',review:'一起找找喜欢的歌'})[status] || '陪你收集喜欢的歌声'; }
+  setPageActive(active) {
+    this.pageActive = active;
+    this.resetAnimation();
+  }
+  canAnimate() {
+    return this.url && this.pageActive && this.visible && !document.hidden && this.motion && !this.reduced.matches;
+  }
+  resetAnimation() {
+    clearTimeout(this.timer);
+    this.manualUntil = this.pointerUntil = 0;
+    document.removeEventListener('pointermove', this.onPointer);
+    if (!this.url || !this.pageActive || document.hidden || !this.visible) return;
+    if (this.canAnimate()) {
+      if (this.version === 2) document.addEventListener('pointermove', this.onPointer, {passive: true});
+      this.row = this.statusRow();
+      this.frame = 0;
+      this.schedule(STATES[this.row][0]);
+    } else {
+      this.row = this.frame = 0;
+    }
+    this.paint();
+  }
+  schedule(delay) {
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.tick(), Math.ceil(delay));
+  }
+  statusRow() { return ({idle:0,running:7,waiting:6,failed:5,review:8})[this.status] ?? 0; }
+  gesture(row) {
+    if (!this.canAnimate()) return;
+    this.row = row; this.frame = 0; this.pointerUntil = 0;
+    this.manualUntil = performance.now() + STATES[row].reduce((sum, duration) => sum + duration, 0);
+    this.paint(); this.schedule(STATES[row][0]);
+  }
+  setStatus(status) {
+    if (this.status === status) return;
+    this.status = status;
+    $('#pet-status').textContent = ({idle:'陪你收集喜欢的歌声',running:'正在慢慢收集歌声…',waiting:'等你确认这些片段',failed:'采集暂停，歌声还在',review:'一起找找喜欢的歌'})[status] || '陪你收集喜欢的歌声';
+    if (this.canAnimate() && performance.now() >= this.manualUntil) this.resetAnimation();
+  }
   pointer(e) {
-    if (this.version !== 2 || !this.motion || this.reduced.matches || this.status === 'running' || performance.now() < this.manualUntil) return;
-    const rect = this.node.getBoundingClientRect(), dx=e.clientX-(rect.left+rect.width/2),dy=e.clientY-(rect.top+rect.height/2);
-    if (Math.hypot(dx,dy)<45 || Math.hypot(dx,dy)>500) return;
-    const index=directionIndex(dx,dy); this.row=9+Math.floor(index/8); this.frame=index%8; this.pointerUntil=performance.now()+900; this.paint();
+    if (this.status === 'running' || performance.now() < this.manualUntil) return;
+    const rect = this.node.getBoundingClientRect();
+    const dx = e.clientX - (rect.left + rect.width/2), dy = e.clientY - (rect.top + rect.height/2);
+    const distance = Math.hypot(dx,dy);
+    if (distance < 45 || distance > 500) return;
+    const index = directionIndex(dx,dy);
+    if (!this.pointerUntil) this.schedule(900);
+    this.pointerUntil = performance.now() + 900;
+    const row = 9 + Math.floor(index/8), frame = index % 8;
+    if (this.row === row && this.frame === frame) return;
+    this.row = row; this.frame = frame; this.paint();
   }
   tick() {
-    if (document.hidden || !this.visible) return;
-    const stamp=performance.now();
-    if (!this.motion || this.reduced.matches) { this.row=0;this.frame=0;this.paint();return; }
-    if (stamp<this.pointerUntil && stamp>this.manualUntil) return;
-    const desired=({idle:0,running:7,waiting:6,failed:5,review:8})[this.status] ?? 0;
-    if (stamp>this.manualUntil && this.row!==desired) {this.row=desired;this.frame=0;this.lastTick=stamp;}
-    const frames=STATES[this.row] || STATES[0];
-    if (stamp-this.lastTick>=frames[this.frame]) { this.frame=(this.frame+1)%frames.length;this.lastTick=stamp; }
-    this.paint();
+    if (!this.canAnimate()) return;
+    const stamp = performance.now();
+    if (this.pointerUntil > stamp) { this.schedule(this.pointerUntil - stamp); return; }
+    this.pointerUntil = 0;
+    const row = this.manualUntil > stamp ? this.row : this.statusRow();
+    this.frame = this.row === row ? (this.frame + 1) % STATES[row].length : 0;
+    this.row = row;
+    this.paint(); this.schedule(STATES[row][this.frame]);
   }
   async import(files) {
     const message=$('#pet-message'); message.textContent='正在检查精灵图…';

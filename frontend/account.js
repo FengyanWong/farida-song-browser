@@ -44,6 +44,7 @@ export class AccountLogin {
     const revision=++this.revision;
     try {
       const auth=await this.api('/api/auth');if(revision!==this.revision)return;
+      if (JSON.stringify(auth) === JSON.stringify(this.auth)) return;
       const previous=this.auth?.state;this.render(auth);
       if(!this.preview&&previous!==auth.state)await this.settle(auth);
     }catch{ /* A local service outage is reported by the main connection status. */ }

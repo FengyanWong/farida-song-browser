@@ -27,6 +27,14 @@ const paths = {
 };
 export function icon(name) { return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.music}</svg>`; }
 export function hydrateIcons(root = document) { $$('[data-icon]', root).forEach(el => el.innerHTML = icon(el.dataset.icon)); }
+export async function writeClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
 let toastTimer;
 export function toast(message, link) {
   const el = $('#toast');
@@ -36,8 +44,9 @@ export function toast(message, link) {
   }
   el.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => el.hidden = true, link ? 15000 : 4000);
 }
+const displayTime = new Intl.DateTimeFormat('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});
 export function dateTime(value) {
   if (!value) return '尚无记录';
   const date = new Date(value);
-  return Number.isNaN(date.valueOf()) ? '未知时间' : new Intl.DateTimeFormat('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(date);
+  return Number.isNaN(date.valueOf()) ? '未知时间' : displayTime.format(date);
 }

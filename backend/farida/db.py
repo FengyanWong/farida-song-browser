@@ -1,12 +1,38 @@
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs
 
-from .adapter import parse_source, validated_video, video_has_uploader
+from .adapter import BVID, parse_source, validated_video, video_has_uploader
 from .classifier import classify, normalize
 from .songlist import URL as SONGLIST_URL
+
+
+VIDEO_LINK = re.compile(
+    r"(?:https?://)?(?:www\.|m\.)?bilibili\.com/video/(BV[0-9A-Za-z]{10})/?"
+    r"(?:\?([^#\s]*))?(?:#[^\s]*)?"
+)
+
+
+def video_reference(query):
+    """Recognize a local catalog lookup by BV ID or standard Bilibili video URL."""
+    query = query.strip()
+    if BVID.fullmatch(query):
+        return query, None
+    match = VIDEO_LINK.fullmatch(query)
+    if not match:
+        return None
+    bvid, query_string = match.groups()
+    parts = parse_qs(query_string or "", keep_blank_values=True).get("p")
+    if parts is None:
+        return bvid, None
+    # A malformed or conflicting part must never select a different recording.
+    if len(parts) != 1 or not re.fullmatch(r"[0-9]{1,9}", parts[0]):
+        return bvid, 0
+    return bvid, int(parts[0])
 
 
 def now():
@@ -63,6 +89,17 @@ CREATE TABLE IF NOT EXISTS playlist_items (
  clip_id TEXT NOT NULL REFERENCES parts(id), position INTEGER NOT NULL,
  PRIMARY KEY(playlist_id,clip_id)
 );
+CREATE TABLE IF NOT EXISTS playback_state (
+ id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS playback_progress (
+ id INTEGER PRIMARY KEY REFERENCES playback_state(id) ON DELETE CASCADE,
+ queue_key TEXT NOT NULL, sequence INTEGER NOT NULL, value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS listening_history (
+ clip_id TEXT PRIMARY KEY REFERENCES parts(id), last_played_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS listening_recent ON listening_history(last_played_at DESC);
 CREATE TABLE IF NOT EXISTS sync_jobs (
  id TEXT PRIMARY KEY, source_ids TEXT NOT NULL, mode TEXT NOT NULL,
  state TEXT NOT NULL, checkpoints TEXT NOT NULL DEFAULT '{}', processed INTEGER NOT NULL DEFAULT 0,
@@ -84,15 +121,46 @@ CREATE INDEX IF NOT EXISTS membership_video ON memberships(video_bvid);
 CREATE UNIQUE INDEX IF NOT EXISTS single_active_job ON sync_jobs((1)) WHERE state IN ('queued','running');
 """
 
+CLIP_FROM = """ FROM parts p
+ JOIN videos v ON v.bvid=p.video_bvid
+ JOIN annotations a ON a.clip_id=p.id
+ LEFT JOIN user_state u ON u.clip_id=p.id """
+
+PLAYABLE = "p.active=1 AND v.verification_status='verified' AND v.availability_status='available'"
+PLAYBACK_URL = (f"CASE WHEN {PLAYABLE} THEN 'https://www.bilibili.com/video/' || p.video_bvid "
+                "|| '/?p=' || p.part_number END AS playback_url")
+
+# The catalog includes details and annotations; a queue needs only the player fields.
+QUEUE_COLUMNS = ("p.id,p.video_bvid,p.cid,p.part_number,a.display_song_title,v.uploader_name,"
+                 "p.duration_seconds,v.raw_title,p.raw_part_title," + PLAYBACK_URL)
+QUEUE_SELECT = "SELECT " + QUEUE_COLUMNS + CLIP_FROM
+
+# Only combine a long queue with its small checkpoint when a caller reads it.
+PLAYER_STATE_SQL = """SELECT s.id, CASE WHEN p.id IS NULL THEN s.value
+ ELSE json_patch(s.value,p.value) END AS value FROM playback_state s
+ LEFT JOIN playback_progress p ON s.id=p.id WHERE s.id=1"""
+
 CLIP_SELECT = """SELECT p.*,(SELECT COUNT(*) FROM parts siblings WHERE siblings.video_bvid=p.video_bvid AND siblings.active=1) AS part_count,
  v.uploader_uid,v.uploader_name,v.raw_title,v.description,v.tags,
  v.thumbnail_url,v.published_at,v.availability_status,v.verification_status,v.statistics,
  v.stats_fetched_at,v.stats_scope,v.fetched_at,v.provenance,
  a.display_song_title,a.song_group,a.inclusion_status,a.classification_reason,a.classification_version,a.manual_fields,
  COALESCE(u.bookmarked,0) AS bookmarked,COALESCE(u.notes,'') AS notes,
- EXISTS(SELECT 1 FROM curated_songs cs WHERE cs.bvid=v.bvid) AS has_curated_credit
- FROM parts p JOIN videos v ON v.bvid=p.video_bvid JOIN annotations a ON a.clip_id=p.id
- LEFT JOIN user_state u ON u.clip_id=p.id """
+ EXISTS(SELECT 1 FROM curated_songs cs WHERE cs.bvid=v.bvid) AS has_curated_credit,""" + PLAYBACK_URL + CLIP_FROM
+
+
+def clip_order(sort):
+    columns = {
+        "newest": "v.published_at DESC",
+        "oldest": "v.published_at ASC",
+        "title": "fold(a.display_song_title) ASC",
+        "uploader": "fold(v.uploader_name) ASC",
+        # The first source that recorded the video determines discovery for
+        # all of its parts. Later refreshes or additional sources cannot move it.
+        "discovered": "(SELECT MIN(julianday(m.first_seen_at)) FROM memberships m "
+                      "WHERE m.video_bvid=p.video_bvid) DESC NULLS LAST, v.published_at DESC",
+    }
+    return columns[sort] + ", p.video_bvid, p.part_number"
 
 
 class Database:
@@ -139,7 +207,7 @@ class Database:
         with self.connect() as con:
             return con.execute(sql, args).lastrowid
 
-    def sources(self):
+    def sources(self, include_status=False):
         rows = self.all("""SELECT s.*, (SELECT COUNT(*) FROM memberships m WHERE m.source_id=s.id) AS submissions,
             (SELECT COUNT(*) FROM memberships m JOIN parts p ON p.video_bvid=m.video_bvid WHERE m.source_id=s.id AND p.active=1) AS entries,
             (SELECT COUNT(*) FROM curated_songs cs WHERE cs.source_id=s.id) AS listed_songs,
@@ -149,7 +217,47 @@ class Database:
         for row in rows:
             row["required_tags"] = json.loads(row["required_tags"])
             row["last_error"] = json.loads(row["last_error"]) if row["last_error"] else None
+        if include_status:
+            for row in rows:
+                row["collection_status"] = self.collection_status(row)
         return rows
+
+    def collection_status(self, source):
+        """Describe the latest selected task even when its source never ran."""
+        row = self.one("""SELECT * FROM sync_jobs j WHERE EXISTS
+            (SELECT 1 FROM json_each(j.source_ids) WHERE value=?)
+            AND (json_extract(j.checkpoints, ?) IS NULL OR json_extract(j.checkpoints, ?)=?)
+            ORDER BY (state IN ('queued','running')) DESC,heartbeat DESC,rowid DESC LIMIT 1""",
+            (source['id'], f'$."{source["id"]}".source_url', f'$."{source["id"]}".source_url', source['canonical_url']))
+        successful = [source.get(key) for key in ('last_refresh_at','last_complete_scan_at','last_discovery_at') if source.get(key)]
+        result = {'state': 'idle', 'last_success_at': max(successful) if successful else None,
+                  'last_attempt_at': None, 'finished_at': None, 'processed': 0, 'added_clips': None,
+                  'added_included': None, 'skipped': 0, 'error': None, 'job_id': None, 'mode': None,
+                  'current_page': None, 'scope': None, 'can_resume': False, 'unavailable': []}
+        if not row:
+            return result
+        job = self.decode_job(row)
+        cp = job['checkpoints'].get(str(source['id']), {})
+        phase = cp.get('state')
+        active = job['state'] in {'queued', 'running'}
+        if phase == 'completed':
+            state = 'completed'
+        elif phase == 'running':
+            state = 'running' if active else job['state']
+        elif phase == 'failed':
+            state = 'paused' if job['state'] == 'paused' else 'failed'
+        else:
+            state = 'queued' if active else 'not_started'
+        error = next((item for item in reversed(job['errors']) if item.get('source_id') == source['id']), None)
+        if not error and phase == 'running' and job['state'] == 'failed':
+            error = next((item for item in reversed(job['errors']) if item.get('category') == 'internal'), None)
+        result.update(state=state, last_attempt_at=cp.get('attempted_at', job['started_at'] if cp and phase != 'pending' else None),
+                      finished_at=cp.get('finished_at') or (job.get('finished_at') if not active else None),
+                      processed=cp.get('processed', 0), added_clips=cp.get('added_clips'),
+                      added_included=cp.get('added_included'), skipped=len(cp.get('unavailable', [])),
+                      error=error, job_id=job['id'], mode=job['mode'], current_page=cp.get('current_page'),
+                      scope=cp.get('scope'), unavailable=cp.get('unavailable', []), can_resume=state != 'completed' and job['state'] in {'failed','paused','interrupted','cancelled'})
+        return result
 
     def source(self, source_id):
         return next((s for s in self.sources() if s["id"] == source_id), None)
@@ -189,7 +297,7 @@ class Database:
                             [(source['id'], row['id'], row['song_title'], row['original_artist'], row['language'], row['style'], row['bvid'], stamp)
                              for row in rows])
 
-    def save_video(self, source, data, tags, cached=None):
+    def save_video(self, source, data, tags, cached=None, collection_job=None):
         validated_video(data, data["bvid"])
         stamp = now()
         bvid = data["bvid"]
@@ -206,6 +314,8 @@ class Database:
             for field in ("fetched_at", "stats_fetched_at", "provenance"):
                 fields[field] = cached[field]
         with self.connect() as con:
+            added_clips = added_included = 0
+            existing_ids = {row[0] for row in con.execute("SELECT id FROM parts WHERE video_bvid=?", (bvid,))}
             curated = con.execute('SELECT song_title FROM curated_songs WHERE bvid=?', (bvid,)).fetchall()
             con.execute("INSERT INTO videos(" + ",".join(fields) + ") VALUES(" + ",".join("?" for _ in fields) + ") ON CONFLICT(bvid) DO UPDATE SET " + ",".join(f"{k}=excluded.{k}" for k in fields if k != "bvid"), list(fields.values()))
             con.execute("INSERT INTO memberships VALUES(?,?,?,?) ON CONFLICT(source_id,video_bvid) DO UPDATE SET last_seen_at=excluded.last_seen_at", (source["id"],bvid,stamp,stamp))
@@ -216,6 +326,9 @@ class Database:
                 con.execute("INSERT INTO parts(id,video_bvid,cid,part_number,raw_part_title,duration_seconds,active) VALUES(?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET part_number=excluded.part_number,raw_part_title=excluded.raw_part_title,duration_seconds=excluded.duration_seconds,active=1", (clip_id,bvid,str(part["cid"]),part["page"],part.get("part", ""),part.get("duration")))
                 song_names = {row['song_title'] for row in curated if len(data['pages']) == 1 or normalize(part.get('part', '').strip('《》')) == normalize(row['song_title'])}
                 title,status,reason,version = classify(data,part,tags,source,curated_song=next(iter(song_names)) if len(song_names) == 1 else None)
+                if clip_id not in existing_ids:
+                    added_clips += 1
+                    added_included += int(status == "included")
                 previous = con.execute("SELECT * FROM annotations WHERE clip_id=?", (clip_id,)).fetchone()
                 if previous:
                     manual = json.loads(previous["manual_fields"])
@@ -229,18 +342,34 @@ class Database:
                     con.execute("UPDATE annotations SET display_song_title=?,inclusion_status=?,classification_reason=?,classification_version=? WHERE clip_id=?", (title,status,reason,version,clip_id))
                 else:
                     con.execute("INSERT INTO annotations(clip_id,display_song_title,inclusion_status,classification_reason,classification_version) VALUES(?,?,?,?,?)", (clip_id,title,status,reason,version))
+            if collection_job:
+                job, cp = collection_job
+                if 'added_clips' in cp:
+                    cp['added_clips'] += added_clips
+                    cp['added_included'] += added_included
+                    # Count new local IDs in the same transaction as saving them.
+                    # Resume replay cannot double count a committed clip.
+                    con.execute("UPDATE sync_jobs SET checkpoints=? WHERE id=?", (encode(job['checkpoints']),job['id']))
         return len(data["pages"])
 
-    def reuse_video(self, source, video):
+    def reuse_video(self, source, video, collection_job=None):
         # Reclassification and a new membership are not a fresh upstream retrieval.
-        self.save_video(source, json.loads(video["raw_metadata"]), json.loads(video["tags"]), cached=video)
+        self.save_video(source, json.loads(video["raw_metadata"]), json.loads(video["tags"]), cached=video, collection_job=collection_job)
 
     def filters(self, q="", status="included", source_id=None, uploader=None, after=None, before=None, bookmarked=False, **_):
         clauses, args = ["p.active=1"], []
         if status != "all":
             clauses.append("a.inclusion_status=?")
             args.append(status)
-        if q:
+        reference = video_reference(q) if q else None
+        if reference:
+            bvid, part = reference
+            clauses.append("v.bvid=?")
+            args.append(bvid)
+            if part is not None:
+                clauses.append("p.part_number=?")
+                args.append(part)
+        elif q:
             folded = normalize(q).replace("farida", "法里达")
             folded = folded.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             clauses.append("replace(fold(a.display_song_title || ' ' || a.song_group || ' ' || v.raw_title || ' ' || p.raw_part_title || ' ' || v.uploader_name || ' ' || v.tags),'farida','法里达') LIKE ? ESCAPE '\\'")
@@ -265,18 +394,70 @@ class Database:
     def clip_row(row):
         for key in ("tags","statistics","provenance","manual_fields"):
             row[key] = json.loads(row[key])
-        row["playback_url"] = f"https://www.bilibili.com/video/{row['video_bvid']}/?p={row['part_number']}" if row["active"] and row["verification_status"] == "verified" and row["availability_status"] == "available" else None
         row['songlist_attribution'] = 'CLANNADOR' if row['has_curated_credit'] else ''
         row['songlist_url'] = SONGLIST_URL if row['has_curated_credit'] else ''
         return row
 
     def clips(self, page=1, page_size=40, sort="newest", **filters):
         where,args = self.filters(**filters)
-        order = {"newest": "v.published_at DESC", "oldest": "v.published_at ASC", "title": "fold(a.display_song_title) ASC", "uploader": "fold(v.uploader_name) ASC"}[sort]
+        order = clip_order(sort)
         with self.connect() as con:
             total = con.execute("SELECT COUNT(*) FROM (" + CLIP_SELECT + where + ")", args).fetchone()[0]
-            rows = con.execute(CLIP_SELECT + where + f" ORDER BY {order},p.video_bvid,p.part_number LIMIT ? OFFSET ?", [*args,page_size,(page-1)*page_size]).fetchall()
+            rows = con.execute(CLIP_SELECT + where + f" ORDER BY {order} LIMIT ? OFFSET ?", [*args,page_size,(page-1)*page_size]).fetchall()
         return {"items": [self.clip_row(dict(row)) for row in rows], "total": total, "page": page, "page_size": page_size}
+
+    def grouped_clips(self, page=1, page_size=40, sort="newest", **filters):
+        """Page complete song groups, retaining every matching recording."""
+        where, args = self.filters(**filters)
+        order = clip_order(sort)
+        # Rank compact IDs first so descriptions and other metadata are only
+        # loaded for recordings that belong to this page.
+        group_key = "COALESCE(NULLIF(fold(a.song_group),''), NULLIF(fold(a.display_song_title),''), p.id)"
+        rank = (f"SELECT p.id, {group_key} AS group_key, "
+                f"ROW_NUMBER() OVER (ORDER BY {order}) AS ordinal"
+                + CLIP_FROM + where)
+        page_query = ("WITH ranked AS (" + rank + "), selected AS ("
+                      "SELECT group_key, MIN(ordinal) AS first_ordinal FROM ranked GROUP BY group_key "
+                      "ORDER BY first_ordinal LIMIT ? OFFSET ?) "
+                      + CLIP_SELECT.replace("SELECT p.*", "SELECT ranked.group_key,p.*", 1)
+                      + " JOIN ranked ON ranked.id=p.id JOIN selected ON selected.group_key=ranked.group_key"
+                      + " ORDER BY selected.first_ordinal, ranked.ordinal")
+        with self.connect() as con:
+            con.execute("BEGIN")
+            counts = con.execute(f"SELECT COUNT(*) AS clips, COUNT(DISTINCT {group_key}) AS groups"
+                                 + CLIP_FROM + where, args).fetchone()
+            rows = con.execute(page_query, [*args, page_size, (page-1)*page_size]).fetchall()
+        groups, items = {}, []
+        for row in rows:
+            item = dict(row)
+            key = item.pop('group_key')
+            group = groups.setdefault(key, {'key': key, 'title': item['song_group'].strip() or item['display_song_title'],
+                                            'count': 0, 'clip_ids': []})
+            group['count'] += 1
+            group['clip_ids'].append(item['id'])
+            items.append(self.clip_row(item))
+        return {'groups': list(groups.values()), 'items': items, 'total': counts['groups'],
+                'total_clips': counts['clips'], 'page': page, 'page_size': page_size}
+
+    def listening_history(self):
+        return self.all("SELECT h.last_played_at," + QUEUE_COLUMNS + CLIP_FROM +
+                        " JOIN listening_history h ON h.clip_id=p.id "
+                        "ORDER BY h.last_played_at DESC,p.id LIMIT 100")
+
+    def record_listening(self, clip_id):
+        timestamp = datetime.now(timezone.utc).isoformat(timespec='microseconds')
+        with self.connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            row = con.execute("SELECT " + PLAYBACK_URL + CLIP_FROM + " WHERE p.id=?", (clip_id,)).fetchone()
+            if row is None:
+                raise KeyError(clip_id)
+            if not row['playback_url']:
+                raise ValueError('此片段当前不可播放。')
+            con.execute('INSERT INTO listening_history(clip_id,last_played_at) VALUES(?,?) '
+                        'ON CONFLICT(clip_id) DO UPDATE SET last_played_at=excluded.last_played_at', (clip_id,timestamp))
+            con.execute('DELETE FROM listening_history WHERE clip_id NOT IN '
+                        '(SELECT clip_id FROM listening_history ORDER BY last_played_at DESC,clip_id LIMIT 100)')
+        return {'saved': True}
 
     def clip(self, clip_id):
         row = self.one(CLIP_SELECT + " WHERE p.id=?", (clip_id,))
@@ -287,18 +468,21 @@ class Database:
         row['songlist_credits'] = self.all('SELECT cs.song_title,cs.original_artist,cs.language,cs.style,cs.fetched_at,s.canonical_url FROM curated_songs cs JOIN sources s ON s.id=cs.source_id WHERE cs.bvid=?', (row['video_bvid'],))
         return row
 
-    @staticmethod
-    def queue_row(row):
-        clip = Database.clip_row(dict(row))
-        return {key: clip[key] for key in ('id', 'video_bvid', 'cid', 'part_number', 'display_song_title',
-                                          'uploader_name', 'duration_seconds', 'playback_url')}
+    def saved_queue(self, clip_ids, *, compact=False):
+        if not clip_ids:
+            return []
+        select = QUEUE_SELECT if compact else CLIP_SELECT
+        # json_each accepts the entire saved queue as one parameter, including
+        # lists larger than SQLite's variable limit. Read duplicates just once.
+        rows = self.all(select + f" WHERE {PLAYABLE} AND p.id IN (SELECT value FROM json_each(?))",
+                        (encode(clip_ids),))
+        by_id = {row['id']: row if compact else self.clip_row(row) for row in rows}
+        return [by_id[clip_id] for clip_id in clip_ids if clip_id in by_id]
 
     def playback_queue(self, sort='newest', **filters):
         where, args = self.filters(**filters)
-        order = {'newest': 'v.published_at DESC', 'oldest': 'v.published_at ASC',
-                 'title': 'fold(a.display_song_title) ASC', 'uploader': 'fold(v.uploader_name) ASC'}[sort]
-        return [self.queue_row(row) for row in self.all(CLIP_SELECT + where +
-                f' ORDER BY {order},p.video_bvid,p.part_number', args)]
+        order = clip_order(sort)
+        return self.all(QUEUE_SELECT + where + f' ORDER BY {order}', args)
 
     def playlists(self):
         return self.all('SELECT l.*,COUNT(i.clip_id) AS count FROM playlists l LEFT JOIN playlist_items i '
@@ -308,8 +492,8 @@ class Database:
         result = self.one('SELECT * FROM playlists WHERE id=?', (playlist_id,))
         if not result:
             raise KeyError(playlist_id)
-        result['items'] = [self.queue_row(row) for row in self.all(CLIP_SELECT +
-            ' JOIN playlist_items pi ON pi.clip_id=p.id WHERE pi.playlist_id=? ORDER BY pi.position', (playlist_id,))]
+        result['items'] = self.all(QUEUE_SELECT +
+            ' JOIN playlist_items pi ON pi.clip_id=p.id WHERE pi.playlist_id=? ORDER BY pi.position', (playlist_id,))
         return result
 
     def save_playlist(self, name=None, clip_ids=None, playlist_id=None):
@@ -329,10 +513,13 @@ class Database:
                 con.execute('UPDATE playlists SET name=? WHERE id=?', (name, playlist_id))
             if clip_ids is not None:
                 ids = list(dict.fromkeys(clip_ids))
-                # Validate first; one unknown clip rolls back the entire edit.
-                for clip_id in ids:
-                    if not con.execute('SELECT 1 FROM parts WHERE id=?', (clip_id,)).fetchone():
-                        raise ValueError('歌单包含不存在的片段，请刷新列表。')
+                missing = con.execute(
+                    "SELECT 1 FROM json_each(?) requested "
+                    "LEFT JOIN parts p ON p.id=requested.value WHERE p.id IS NULL LIMIT 1",
+                    (encode(ids),),
+                ).fetchone()
+                if missing:
+                    raise ValueError('歌单包含不存在的片段，请刷新列表。')
                 con.execute('DELETE FROM playlist_items WHERE playlist_id=?', (playlist_id,))
                 con.executemany('INSERT INTO playlist_items(playlist_id,clip_id,position) VALUES(?,?,?)',
                                 [(playlist_id, clip_id, position) for position, clip_id in enumerate(ids)])
@@ -365,13 +552,20 @@ class Database:
             raise KeyError(clip_id)
         self.execute("INSERT INTO user_state(clip_id,bookmarked) VALUES(?,?) ON CONFLICT(clip_id) DO UPDATE SET bookmarked=excluded.bookmarked", (clip_id,int(value)))
 
-    def overview(self):
+    def overview(self, compact=False):
+        jobs = self.jobs(10)
+        if compact:
+            # Only the collector/resume endpoint needs the checkpoint traversal history.
+            for job in jobs:
+                for checkpoint in job['checkpoints'].values():
+                    checkpoint.pop('seen', None)
+                    checkpoint.pop('page_hashes', None)
         counts = self.one("""SELECT COUNT(*) AS entries,COUNT(DISTINCT p.video_bvid) AS submissions,
             SUM(a.inclusion_status='included') AS included,SUM(a.inclusion_status='needs_review') AS needs_review,
             SUM(a.inclusion_status='excluded') AS excluded,COUNT(DISTINCT NULLIF(a.song_group,'')) AS song_groups,
             SUM(COALESCE(u.bookmarked,0)) AS bookmarked
             FROM parts p JOIN annotations a ON p.id=a.clip_id LEFT JOIN user_state u ON p.id=u.clip_id WHERE p.active=1""")
-        return {**{k: v or 0 for k,v in counts.items()}, "uploaders": self.all("SELECT uploader_uid AS uid,uploader_name AS name,COUNT(*) AS submissions FROM videos GROUP BY uploader_uid ORDER BY uploader_name"), "sources": self.sources(), "jobs": self.jobs(10)}
+        return {**{k: v or 0 for k,v in counts.items()}, "uploaders": self.all("SELECT uploader_uid AS uid,uploader_name AS name,COUNT(*) AS submissions FROM videos GROUP BY uploader_uid ORDER BY uploader_name"), "sources": self.sources(include_status=True), "jobs": jobs}
 
     def job(self, job_id):
         row = self.one("SELECT * FROM sync_jobs WHERE id=?", (job_id,))
@@ -384,7 +578,7 @@ class Database:
         return row
 
     def jobs(self, limit=20):
-        return [self.decode_job(r) for r in self.all("SELECT * FROM sync_jobs ORDER BY started_at DESC,rowid DESC LIMIT ?", (limit,))]
+        return [self.decode_job(r) for r in self.all("SELECT * FROM sync_jobs ORDER BY (state IN ('queued','running')) DESC,heartbeat DESC,rowid DESC LIMIT ?", (limit,))]
 
     def save_job(self, job):
-        self.execute("UPDATE sync_jobs SET state=?,checkpoints=?,processed=?,errors=?,finished_at=?,heartbeat=? WHERE id=?", (job["state"],encode(job["checkpoints"]),job["processed"],encode(job["errors"]),job.get("finished_at"),now(),job["id"]))
+        self.execute("UPDATE sync_jobs SET state=?,checkpoints=?,processed=?,errors=?,finished_at=?,heartbeat=? WHERE id=?", (job["state"],encode(job["checkpoints"]),job["processed"],encode(job["errors"]),job.get("finished_at"),datetime.now(timezone.utc).isoformat(timespec="microseconds"),job["id"]))

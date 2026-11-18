@@ -139,7 +139,9 @@ async def test_restriction_pauses_entire_job(db,settings,video):
     worker=Collector(db,settings,lambda _:adapter)
     job=worker.start([1,2,3,4],"full");await worker.task
     saved=db.job(job["id"])
-    assert saved["state"]=="paused" and len(saved["checkpoints"])==1
+    assert saved["state"]=="paused"
+    assert saved["checkpoints"]["1"]["state"]=="failed"
+    assert all(saved["checkpoints"][str(sid)]["state"]=="pending" and saved["checkpoints"][str(sid)]["attempted_at"] is None for sid in (2,3,4))
     assert db.source(1)["last_error"]["upstream_code"]==-352
     assert db.source(1)["verification_status"]=="pending"
 

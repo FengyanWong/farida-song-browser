@@ -32,9 +32,12 @@ class Collector:
             source = self.db.source(source_id)
             if not source or not source["enabled"]:
                 raise ValueError("所选来源不存在或已停用")
+        checkpoints = {str(sid): {"page":1,"seen":[],"page_hashes":{},"state":"pending",
+                       "processed":0,"unavailable":[],"source_url":self.db.source(sid)["canonical_url"],
+                       "added_clips":0,"added_included":0,"attempted_at":None} for sid in source_ids}
         job_id = uuid.uuid4().hex
         try:
-            self.db.execute("INSERT INTO sync_jobs(id,source_ids,mode,state,started_at,heartbeat) VALUES(?,?,?,'queued',?,?)", (job_id,encode(source_ids),mode,now(),now()))
+            self.db.execute("INSERT INTO sync_jobs(id,source_ids,mode,state,checkpoints,started_at,heartbeat) VALUES(?,?,?,'queued',?,?,?)", (job_id,encode(source_ids),mode,encode(checkpoints),now(),now()))
         except sqlite3.IntegrityError:
             raise ValueError("已有采集任务正在运行") from None
         self.task = asyncio.create_task(self.run(job_id))
@@ -110,10 +113,12 @@ class Collector:
             for source_id in job["source_ids"]:
                 self.check_cancel(job)
                 source = self.db.source(source_id)
-                cp = job["checkpoints"].setdefault(str(source_id), {"page":1,"seen":[],"page_hashes":{},"state":"pending","processed":0,"unavailable":[],"source_url":source["canonical_url"]})
+                cp = job["checkpoints"].setdefault(str(source_id), {"page":1,"seen":[],"page_hashes":{},"state":"pending","processed":0,"unavailable":[],"source_url":source["canonical_url"],"added_clips":0,"added_included":0})
                 if cp["state"] == "completed":
                     continue
                 cp["state"] = "running"
+                cp["attempted_at"] = now()
+                cp.pop("finished_at", None)
                 self.db.save_job(job)
                 try:
                     identity = await adapter.resolve_source(source)
@@ -130,6 +135,7 @@ class Collector:
                     await self.scan_source(adapter, source, job, cp)
                 except UpstreamError as exc:
                     cp["state"] = "failed"
+                    cp["finished_at"] = now()
                     error = {"source_id":source_id, **exc.as_dict()}
                     job["errors"].append(error)
                     self.db.execute("UPDATE sources SET last_error=? WHERE id=?", (encode(error),source_id))
@@ -201,7 +207,7 @@ class Collector:
                     if kind == "uploader" and not video_has_uploader(data, source["uid"]):
                         raise UpstreamError("video_identity", f"Video {bvid} has no owner or coauthor matching source UID {source['uid']}")
                     if use_cached:
-                        self.db.reuse_video(source, existing)
+                        self.db.reuse_video(source, existing, collection_job=(job, cp))
                     else:
                         try:
                             tags = await adapter.get_video_tags(bvid)
@@ -210,7 +216,7 @@ class Collector:
                                 raise UpstreamError("schema", "Video is available, but its tag metadata is unavailable; scan remains incomplete", status=exc.status, code=exc.code) from None
                             raise
                         self.check_cancel(job)
-                        self.db.save_video(source, data, tags)
+                        self.db.save_video(source, data, tags, collection_job=(job, cp))
                 except UpstreamError as exc:
                     if exc.category != "unavailable":
                         raise
@@ -239,6 +245,7 @@ class Collector:
                 raise UpstreamError("pagination", "Full scan reached the safety page limit")
         self.check_cancel(job)
         cp["state"] = "completed"
+        cp["finished_at"] = now()
         if kind == "search":
             # Search is always bounded discovery, even if its visible result pages terminate.
             self.db.execute("UPDATE sources SET last_discovery_at=?,last_error=NULL WHERE id=?", (now(),source["id"]))

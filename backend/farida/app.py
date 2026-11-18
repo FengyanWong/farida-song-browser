@@ -1,6 +1,9 @@
 import asyncio
+from collections import OrderedDict
+from threading import Lock
 import csv
 import io
+import json
 import secrets
 import sqlite3
 import webbrowser
@@ -20,10 +23,14 @@ from .config import Settings
 from . import __version__
 from .resources import resource_root
 from .auth import BilibiliLogin
-from .db import Database
+from .db import Database, PLAYER_STATE_SQL
 from .sync import Collector
 from .lifetime import WindowLifetime
 from .playback import Playback
+from .backup import export_backup, restore_backup, LIMIT
+
+
+CatalogSort = Literal["newest", "oldest", "title", "uploader", "discovered"]
 
 
 class Model(BaseModel):
@@ -69,6 +76,41 @@ class PlaylistUpdate(Model):
     clip_ids: list[str] | None = Field(default=None, max_length=20000)
 
 
+class PlayerState(Model):
+    clip_ids: list[str] = Field(default_factory=list, max_length=20000)
+    current_id: str | None = Field(default=None, max_length=100)
+    name: str = Field(default="播放队列", max_length=200)
+    position: float = Field(default=0, ge=0, le=86400, allow_inf_nan=False)
+    segment: int = Field(default=0, ge=0, le=99)
+    shuffle: bool = False
+    skip_unavailable: bool = False
+    repeat: Literal["off", "all", "one"] = "off"
+    volume: float = Field(default=1, ge=0, le=1, allow_inf_nan=False)
+    muted: bool = False
+    compact: bool = False
+
+
+class PlayerProgress(Model):
+    queue_key: str = Field(min_length=1, max_length=64)
+    sequence: int = Field(gt=0, le=2**53-1)
+    current_id: str = Field(min_length=1, max_length=100)
+    position: float = Field(ge=0, le=86400, allow_inf_nan=False)
+    segment: int = Field(ge=0, le=99)
+    shuffle: bool
+    repeat: Literal["off", "all", "one"]
+    skip_unavailable: bool
+
+
+class PlayerPreferences(Model):
+    volume: float = Field(ge=0, le=1, allow_inf_nan=False)
+    muted: bool
+    compact: bool
+
+
+class ListeningEvent(Model):
+    clip_id: str = Field(min_length=1, max_length=100)
+
+
 class SyncRequest(Model):
     source_ids: list[int] = Field(default_factory=list,max_length=100)
     mode: Literal["full","incremental"] = "incremental"
@@ -84,6 +126,9 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         await collector.stop()
     login = BilibiliLogin(settings, transport=auth_transport, before_change=before_account_change)
     token = secrets.token_urlsafe(32)
+    # Active page IDs bound reordered unload writes and are revoked on restore.
+    preference_writers = OrderedDict()
+    preference_lock = Lock()
     startup_pending = scan_on_start
     lifetime = WindowLifetime(shutdown_callback, grace_seconds=window_grace_seconds,
                               startup_timeout=browser_start_timeout) if shutdown_callback and not preview_mode else None
@@ -172,7 +217,7 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
 
     @app.get("/api/health")
     def health():
-        return {"status":"ok","application":"farida-song-browser","version":__version__}
+        return {"status":"stopping" if lifetime and lifetime.stopped else "ok","application":"farida-song-browser","version":__version__}
 
     @app.get("/api/session")
     def session():
@@ -221,8 +266,8 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         return JSONResponse({"status": "stopping"}, background=BackgroundTask(lifetime.shutdown))
 
     @app.get("/api/overview")
-    def overview():
-        return db.overview()
+    def overview(compact: bool=False):
+        return db.overview(compact=compact)
 
     def real_login_only():
         if preview_mode:
@@ -264,19 +309,33 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         return await login.logout()
 
     @app.get("/api/clips")
-    def clips(q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: date | None=None,before: date | None=None,bookmarked: bool=False,sort: Literal["newest","oldest","title","uploader"]="newest",page: int=1,page_size: int=40):
+    def clips(q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: date | None=None,before: date | None=None,bookmarked: bool=False,sort: CatalogSort="newest",page: int=1,page_size: int=40,grouped: bool=False):
         if page < 1 or not 1 <= page_size <= 100 or len(q)>500 or (after and before and after>before):
             raise ValueError("分页、日期范围或搜索参数无效")
-        return db.clips(q=q,status=status,source_id=source_id,uploader=uploader,after=after,before=before,bookmarked=bookmarked,sort=sort,page=page,page_size=page_size)
+        query = db.grouped_clips if grouped else db.clips
+        return query(q=q,status=status,source_id=source_id,uploader=uploader,after=after,before=before,bookmarked=bookmarked,sort=sort,page=page,page_size=page_size)
 
     @app.get('/api/play-queue')
     def play_queue(q: str='', status: Literal['included','excluded','needs_review','all']='included', source_id: int | None=None,
                    uploader: str | None=None, after: date | None=None, before: date | None=None, bookmarked: bool=False,
-                   sort: Literal['newest','oldest','title','uploader']='newest'):
+                   sort: CatalogSort='newest'):
         if len(q) > 500 or (after and before and after > before):
             raise ValueError('日期范围或搜索参数无效')
         return {'items': db.playback_queue(q=q, status=status, source_id=source_id, uploader=uploader,
                                           after=after, before=before, bookmarked=bookmarked, sort=sort)}
+
+    @app.get('/api/listening-history')
+    def listening_history():
+        return {'items': db.listening_history()}
+
+    @app.post('/api/listening-history')
+    def record_listening(body: ListeningEvent):
+        return db.record_listening(body.clip_id)
+
+    @app.delete('/api/listening-history')
+    def clear_listening_history():
+        db.execute('DELETE FROM listening_history')
+        return {'cleared': True}
 
     @app.get('/api/playlists')
     def playlists():
@@ -307,11 +366,15 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             if await request.is_disconnected():
                 return Response(status_code=499)
             if login.status()['state'] != 'connected':
-                raise HTTPException(401, '请先验证哔哩哔哩登录后播放。')
+                raise HTTPException(401, '请先验证哔哩哔哩登录后播放。', headers={'X-Farida-Error': 'authentication'})
             clip = db.clip(clip_id)
             if not clip:
                 raise KeyError(clip_id)
             return await playback.prepare(clip)
+
+    @app.get('/api/playback/status/{key}')
+    def playback_failure_status(key: str):
+        return playback.failure_status(key)
 
     @app.get('/api/playback/media/{key}')
     async def play_media(key: str, request: Request):
@@ -404,7 +467,7 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             return job
 
     @app.get("/api/export")
-    def export(format: Literal["json","csv"]="csv",q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: date | None=None,before: date | None=None,bookmarked: bool=False,sort: Literal["newest","oldest","title","uploader"]="newest"):
+    def export(format: Literal["json","csv"]="csv",q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: date | None=None,before: date | None=None,bookmarked: bool=False,sort: CatalogSort="newest"):
         if len(q)>500 or (after and before and after>before):
             raise ValueError("无效的筛选条件")
         # The same query covers the complete stored selection, not just the UI page.
@@ -419,6 +482,110 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             # Prevent spreadsheet formula execution from upstream/user titles.
             writer.writerow([("'" + str(entry.get(k) or "")) if str(entry.get(k) or "").lstrip().startswith(("=","+","-","@","\t","\r")) else entry.get(k) for k in keys])
         return Response("\ufeff"+output.getvalue(),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":"attachment; filename=farida-clips.csv"})
+
+    @app.get("/api/player-state")
+    def player_state(compact: bool = False):
+        with preference_lock:
+            row = db.one(PLAYER_STATE_SQL)
+            writer = None
+            if compact:
+                writer = secrets.token_urlsafe(16)
+                preference_writers[writer] = {}
+                if len(preference_writers) > 512:
+                    preference_writers.popitem(last=False)
+        saved = PlayerState.model_validate_json(row["value"]) if row else PlayerState()
+        result = {**saved.model_dump(), "items": db.saved_queue(saved.clip_ids, compact=compact)}
+        if writer:
+            result["preference_writer"] = writer
+        return result
+
+    @app.put("/api/player-state")
+    def save_player_state(body: PlayerState, request: Request):
+        queue_key = secrets.token_urlsafe(16)
+        writer = request.headers.get("X-Farida-Preference-Writer")
+        with preference_lock, db.connect() as con:
+            if writer is not None:
+                if writer not in preference_writers:
+                    raise HTTPException(409, "本机数据已恢复或页面已过期，请刷新页面。")
+                # This page sends preferences separately. A delayed initial queue
+                # write must preserve a newer compact/volume change, even across tabs.
+                con.execute("BEGIN IMMEDIATE")
+                row = con.execute("SELECT value FROM playback_state WHERE id=1").fetchone()
+                latest = PlayerState.model_validate_json(row['value']) if row else PlayerState()
+                body = body.model_copy(update=latest.model_dump(include={'volume','muted','compact'}))
+            con.execute("INSERT INTO playback_state(id,value) VALUES(1,?) "
+                        "ON CONFLICT(id) DO UPDATE SET value=excluded.value", (body.model_dump_json(),))
+            con.execute("INSERT OR REPLACE INTO playback_progress(id,queue_key,sequence,value) "
+                        "VALUES(1,?,0,'{}')", (queue_key,))
+        return {"saved": True, "queue_key": queue_key}
+
+    @app.patch('/api/player-state')
+    def save_player_progress(body: PlayerProgress):
+        checkpoint = body.model_dump_json(exclude={'queue_key', 'sequence'})
+        # A delayed page-close request must not replace a newer checkpoint or another queue.
+        with db.connect() as con:
+            result = con.execute("UPDATE playback_progress SET sequence=?,value=? "
+                                 "WHERE id=1 AND queue_key=? AND sequence<?",
+                                 (body.sequence, checkpoint, body.queue_key, body.sequence))
+            return {'saved': result.rowcount == 1}
+
+    @app.patch('/api/player-preferences')
+    def save_player_preferences(body: PlayerPreferences, request: Request):
+        writer = request.headers.get('X-Farida-Preference-Writer')
+        sequence = request.headers.get('X-Farida-Preference-Sequence', '')
+        if writer is not None and not (sequence.isascii() and sequence.isdigit() and 1 <= len(sequence) <= 16):
+            raise HTTPException(422, '无效的播放器设置序号。')
+        values = body.model_dump()
+        if writer is not None:
+            fields = set(request.headers.get('X-Farida-Preference-Fields', 'volume,muted,compact').split(','))
+            if not fields.issubset(values):
+                raise HTTPException(422, '无效的播放器设置字段。')
+        with preference_lock:
+            if writer is not None:
+                revisions = preference_writers.get(writer)
+                if revisions is None:
+                    return {'saved': False}
+                values = {key: values[key] for key in fields if int(sequence) > revisions.get(key, 0)}
+                if not values:
+                    return {'saved': False}
+            with db.connect() as con:
+                con.execute('BEGIN IMMEDIATE')
+                row = con.execute('SELECT value FROM playback_state WHERE id=1').fetchone()
+                saved = PlayerState.model_validate_json(row['value']) if row else PlayerState()
+                updated = saved.model_copy(update=values)
+                con.execute('INSERT INTO playback_state(id,value) VALUES(1,?) '
+                            'ON CONFLICT(id) DO UPDATE SET value=excluded.value', (updated.model_dump_json(),))
+            if writer is not None:
+                revisions.update(dict.fromkeys(values, int(sequence)))
+                preference_writers.move_to_end(writer)
+        return {'saved': True}
+
+    @app.get("/api/backup")
+    def backup():
+        return JSONResponse(export_backup(db), headers={"Content-Disposition": "attachment; filename=farida-backup.json"})
+
+    @app.post("/api/restore")
+    async def restore(request: Request):
+        nonlocal startup_pending
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > LIMIT:
+                raise HTTPException(413, "备份超过 64 MB。")
+        try:
+            data = json.loads(raw)
+            for row in data.get("tables", {}).get("playback_state", []):
+                PlayerState.model_validate_json(row["value"])
+            async with login.lock:
+                startup_pending = False
+                await collector.stop()
+                await playback.clear()
+                with preference_lock:
+                    safety = restore_backup(db, data)
+                    preference_writers.clear()
+            return {"restored": True, "safety_backup": safety}
+        except (ValueError, TypeError, KeyError, AttributeError, sqlite3.DatabaseError) as error:
+            raise HTTPException(400, "备份无效，未恢复数据。请检查文件格式。") from error
 
     frontend = resource_root() / "frontend"
     app.mount("/",StaticFiles(directory=frontend,html=True),name="frontend")

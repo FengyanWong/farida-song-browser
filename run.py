@@ -1,5 +1,6 @@
 """Start the local collector and open its UI in the system default browser."""
 import argparse
+import http.client
 import json
 import os
 import socket
@@ -7,8 +8,6 @@ import sys
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
 import webbrowser
 from pathlib import Path
 
@@ -65,18 +64,37 @@ def entrypoint():
     return result
 
 
-def healthy(url):
+def healthy(port):
+    # A loopback probe needs neither system proxies nor an HTTPS trust store.
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
     try:
-        with urllib.request.urlopen(url + "/api/health",timeout=1) as response:
-            return json.load(response).get("application") == "farida-song-browser"
-    except (OSError,ValueError,urllib.error.URLError):
+        connection.request("GET", "/api/health")
+        response = connection.getresponse()
+        if response.status != 200:
+            return False
+        data = json.loads(response.read(4096))
+        return (isinstance(data, dict) and data.get("application") == "farida-song-browser"
+                and data.get("status") == "ok")
+    except (OSError, ValueError, http.client.HTTPException):
         return False
+    finally:
+        connection.close()
 
 
-def open_when_ready(url):
+def read_port(path):
+    try:
+        port = int(path.read_text(encoding="utf-8").strip())
+        if 1024 <= port <= 65535:
+            return port
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def open_when_ready(port):
     for _ in range(100):
-        if healthy(url):
-            webbrowser.open_new_tab(url)
+        if healthy(port):
+            webbrowser.open_new_tab(f"http://127.0.0.1:{port}")
             return
         time.sleep(0.1)
 
@@ -90,6 +108,30 @@ def port_available(port):
             return True
         except OSError:
             return False
+
+
+def acquire_catalog_lock(data_dir, on_running, timeout=30):
+    """Wait for a closing server to release its lock; reuse a live instance."""
+    lock = (data_dir / "collector.lock").open("a+b")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock
+        except OSError:
+            if on_running():
+                lock.close()
+                return None
+            if time.monotonic() >= deadline:
+                lock.close()
+                raise RuntimeError("上一个应用仍在退出，请稍后重新打开。")
+            time.sleep(0.25)
 
 
 def main():
@@ -107,52 +149,41 @@ def main():
         settings.data_dir=args.data_dir.resolve()
     settings.data_dir.mkdir(parents=True,exist_ok=True)
     configure_output(settings.data_dir)
-    try:
-        import uvicorn
-        from farida.app import create_app
-        from farida.catalog_snapshot import seed_new_catalog
-        from farida.resources import resource_root
-    except ImportError:
-        print("Dependencies are not installed. Run Start Farida.cmd, or: python -m pip install -r requirements.txt")
-        return 1
-    remembered_port=settings.data_dir/'ui-port.txt'
-    try:
-        preferred=int(remembered_port.read_text(encoding='utf-8').strip())
-        if not 1024<=preferred<=65535:preferred=8765
-    except (OSError,ValueError):
-        preferred=8765
-    port=args.port if args.port is not None else preferred
-    url = f"http://127.0.0.1:{port}"
-    if healthy(url):
-        print(f"Farida is already running: {url}")
+    remembered_port = settings.data_dir / "ui-port.txt"
+    port = args.port or read_port(remembered_port) or 8765
+
+    def reuse_running():
+        running_port = read_port(remembered_port)
+        if running_port is None or not healthy(running_port):
+            return False
         if not args.no_browser:
-            webbrowser.open_new_tab(url)
+            webbrowser.open_new_tab(f"http://127.0.0.1:{running_port}")
+        return True
+
+    lock = acquire_catalog_lock(settings.data_dir, reuse_running)
+    if lock is None:
         return 0
     if not port_available(port):
         if args.port is not None:
             print(f"Port {port} is already used by another application. Omit --port to select a free port automatically.")
+            lock.close()
             return 1
         port=next((candidate for candidate in range(port+1,min(port+51,65536)) if port_available(candidate)),None)
         if port is None:
             print('No free local port was found. Close an unused application and try again.')
+            lock.close()
             return 1
-        url=f'http://127.0.0.1:{port}'
-    # Hold an OS lock for the process lifetime. A crash releases it automatically.
-    lock = (settings.data_dir / "collector.lock").open("a+b")
+    url = f"http://127.0.0.1:{port}"
     try:
-        if os.name == "nt":
-            import msvcrt
-            lock.seek(0);lock.write(b"0");lock.flush();lock.seek(0)
-            msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
-        else:
-            import fcntl
-            fcntl.flock(lock,fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        print("This catalog is already open in another Farida process. Close that process first.")
-        lock.close()
-        return 1
-    remembered_port.write_text(str(port),encoding='utf-8')
-    try:
+        try:
+            import uvicorn
+            from farida.app import create_app
+            from farida.catalog_snapshot import seed_new_catalog
+            from farida.resources import resource_root
+        except ImportError:
+            print("Dependencies are not installed. Run Start Farida.cmd, or: python -m pip install -r requirements.txt")
+            return 1
+        remembered_port.write_text(str(port), encoding="utf-8")
         if seed_new_catalog(settings.db_path, resource_root() / "data" / "catalog.json"):
             print("已载入随应用提供的歌切目录。", flush=True)
         print(f"法里达 · 歌切收藏 {__version__}: {url}\n数据目录: {settings.data_dir}\n关闭最后一个应用网页后约 5 秒自动退出，也可在账号菜单选择“退出应用”。",flush=True)
@@ -164,7 +195,7 @@ def main():
         server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, access_log=False,
                                              log_level="warning", use_colors=False, ws="wsproto", timeout_graceful_shutdown=5))
         if not args.no_browser:
-            threading.Thread(target=open_when_ready,args=(url,),daemon=True).start()
+            threading.Thread(target=open_when_ready,args=(port,),daemon=True).start()
         server.run()
     finally:
         lock.close()

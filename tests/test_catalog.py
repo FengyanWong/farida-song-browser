@@ -145,3 +145,22 @@ def test_english_performer_alias_matches_both_scripts(db,source,video):
     db.save_video(source,video,[])
     assert db.clips(q='法里达')['total']==2
     assert db.clips(q='farida')['total']==2
+
+
+@pytest.mark.parametrize("query,expected_parts", [
+    ("BV1br4y1R7BP", [1, 2]),
+    (" https://www.bilibili.com/video/BV1br4y1R7BP/?p=2&from=share ", [2]),
+    ("https://m.bilibili.com/video/BV1br4y1R7BP?share_source=copy#details", [1, 2]),
+    ("https://www.bilibili.com/video/BV1br4y1R7BP?p=0", []),
+    ("https://www.bilibili.com/video/BV1br4y1R7BP?p=1&p=2", []),
+    ("https://example.com/video/BV1br4y1R7BP", []),
+    ("BV1BR4Y1R7BP", []),
+])
+def test_search_bv_and_shared_part_links(db, source, video, query, expected_parts):
+    db.save_video(source, video, [])
+    plain = db.clips(q=query)["items"]
+    grouped = db.grouped_clips(q=query)["items"]
+    queue = db.playback_queue(q=query)
+    for items in (plain, grouped, queue):
+        assert sorted(item["part_number"] for item in items) == expected_parts
+    assert db.clips(q=query, bookmarked=True)["total"] == 0

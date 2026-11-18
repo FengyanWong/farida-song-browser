@@ -17,6 +17,10 @@ from .auth import USER_AGENT
 from .session import SessionStore
 
 
+def playback_error(status, message, category):
+    return HTTPException(status, message, headers={'X-Farida-Error': category})
+
+
 def media_url(value):
     """Only accept HTTPS media hosts returned by Bilibili's playback API."""
     try:
@@ -29,7 +33,7 @@ def media_url(value):
             raise ValueError()
         return value
     except (TypeError, ValueError, AttributeError):
-        raise HTTPException(502, '哔哩哔哩返回了无法识别的播放地址，请打开原视频。') from None
+        raise playback_error(502, '哔哩哔哩返回了无法识别的播放地址，请打开原视频。', 'upstream') from None
 
 
 class Playback:
@@ -51,13 +55,13 @@ class Playback:
 
     async def prepare(self, clip):
         if not clip['playback_url']:
-            raise HTTPException(409, '此视频或分 P 当前不可用，可以选择下一首或打开原视频。')
+            raise playback_error(409, '此视频或分 P 当前不可用，可以选择下一首或打开原视频。', 'unavailable')
         async with self.lock:
             if time.monotonic() < self.blocked_until:
-                raise HTTPException(429, '哔哩哔哩暂时限制了播放请求，请稍后重试。')
+                raise playback_error(429, '哔哩哔哩暂时限制了播放请求，请稍后重试。', 'restricted')
             identity = self.identity()
             if identity is None:
-                raise HTTPException(401, '请先登录哔哩哔哩后播放。')
+                raise playback_error(401, '请先登录哔哩哔哩后播放。', 'authentication')
             adapter = BilibiliAdapter(self.settings, transport=self.transport)
             adapter.last_request = self.last_request
             try:
@@ -66,22 +70,28 @@ class Playback:
                     'fnval': 1, 'fnver': 0, 'platform': 'html5',
                 })
             except UpstreamError as error:
-                if error.category == 'restricted':
+                if error.category in {'restricted', 'retry_later'}:
                     self.blocked_until = time.monotonic() + 60
-                    raise HTTPException(429, '哔哩哔哩暂时限制了播放请求，已暂停队列，请稍后重试。') from None
+                    raise playback_error(429, '哔哩哔哩暂时限制了播放请求，已暂停队列，请稍后重试。', 'restricted') from None
                 if error.category == 'authentication':
-                    raise HTTPException(401, '哔哩哔哩登录已失效，请重新登录后播放。') from None
+                    raise playback_error(401, '哔哩哔哩登录已失效，请重新登录后播放。', 'authentication') from None
                 if error.category == 'unavailable':
-                    raise HTTPException(409, '此视频当前不可播放，可以选择下一首或打开原视频。') from None
-                raise HTTPException(502, '暂时无法读取视频，请稍后重试或打开原视频。') from None
+                    raise playback_error(409, '此视频当前不可播放，可以选择下一首或打开原视频。', 'unavailable') from None
+                raise playback_error(502, '暂时无法读取视频，请稍后重试或打开原视频。',
+                                     'network' if error.category in {'network', 'server'} else 'upstream') from None
             finally:
                 self.last_request = adapter.last_request
                 await adapter.close()
-            if not isinstance(data, dict) or data.get('is_preview') or data.get('is_drm'):
-                raise HTTPException(409, '此视频需要在哔哩哔哩原网页中播放。')
+            if not isinstance(data, dict):
+                raise playback_error(502, '哔哩哔哩返回了异常播放信息，请打开原视频。', 'upstream')
+            if data.get('is_preview') or data.get('is_drm'):
+                raise playback_error(409, '此视频需要在哔哩哔哩原网页中播放。', 'unsupported')
             parts = data.get('durl')
-            if not isinstance(parts, list) or not parts or len(parts) > 100 or not str(data.get('format', '')).startswith('mp4'):
-                raise HTTPException(409, '此视频暂不支持页面内播放，请打开原视频。')
+            format_name = data.get('format')
+            if isinstance(format_name, str) and format_name and not format_name.startswith('mp4'):
+                raise playback_error(409, '此视频暂不支持页面内播放，请打开原视频。', 'unsupported')
+            if not isinstance(format_name, str) or not format_name or not isinstance(parts, list) or not parts or len(parts) > 100:
+                raise playback_error(502, '哔哩哔哩返回了不完整的播放信息，请打开原视频。', 'upstream')
             # Validate the complete response before making any stream available.
             urls = [media_url(part.get('url')) if isinstance(part, dict) else media_url(None) for part in parts]
             expiry = time.monotonic() + 7200
@@ -94,10 +104,25 @@ class Playback:
                 self.leases.popitem(last=False)
             return {'segments': segments, 'quality': data.get('quality'), 'original_url': clip['playback_url']}
 
+    def failure_status(self, key):
+        """Report a media failure without requesting the CDN again."""
+        lease = self.leases.get(key)
+        identity = self.identity()
+        if identity is None:
+            return {'category': 'authentication', 'message': '请重新登录后继续播放。'}
+        if not lease or lease['expires'] < time.monotonic():
+            return {'category': 'network', 'message': '播放地址已过期，请重试当前歌曲。'}
+        if lease['identity'] != identity:
+            return {'category': 'authentication', 'message': '登录状态已改变，请重新登录后继续。'}
+        return lease.get('failure', {})
+
     async def stream(self, key, byte_range=None):
         lease = self.leases.get(key)
         if not lease or lease['expires'] < time.monotonic() or lease['identity'] != self.identity():
-            raise HTTPException(410, '播放地址已过期，请重试当前歌曲。')
+            raise playback_error(410, '播放地址已过期，请重试当前歌曲。', self.failure_status(key).get('category', 'network'))
+        if time.monotonic() < self.blocked_until:
+            lease['failure'] = {'category': 'restricted', 'message': '哔哩哔哩暂时限制了播放请求，已暂停队列，请稍后重试。'}
+            raise playback_error(429, lease['failure']['message'], 'restricted')
         if byte_range and (len(byte_range) > 80 or not re.fullmatch(r'bytes=(?:\d+-\d*|-\d+)', byte_range)):
             raise HTTPException(416, '无效的视频读取范围。')
         headers = {'User-Agent': USER_AGENT, 'Referer': 'https://www.bilibili.com/', 'Accept-Encoding': 'identity'}
@@ -109,7 +134,8 @@ class Playback:
             upstream = await client.send(client.build_request('GET', lease['url'], headers=headers), stream=True)
         except httpx.RequestError:
             await client.aclose()
-            raise HTTPException(502, '视频连接失败，请重试或打开原视频。') from None
+            lease['failure'] = {'category': 'network', 'message': '视频连接失败，请重试或打开原视频。'}
+            raise playback_error(502, lease['failure']['message'], 'network') from None
 
         async def close():
             await upstream.aclose()
@@ -117,7 +143,12 @@ class Playback:
 
         if upstream.status_code not in {200, 206, 416}:
             await close()
-            raise HTTPException(502, '哔哩哔哩暂时无法提供此视频，请重试或打开原视频。')
+            category = 'restricted' if upstream.status_code == 429 else 'network'
+            message = '哔哩哔哩暂时限制了播放请求，已暂停队列，请稍后重试。' if category == 'restricted' else '视频连接暂时失效，请重试或打开原视频。'
+            if category == 'restricted':
+                self.blocked_until = time.monotonic() + 60
+            lease['failure'] = {'category': category, 'message': message}
+            raise playback_error(429 if category == 'restricted' else 502, message, category)
         response_headers = {'Cache-Control': 'no-store', 'Accept-Ranges': 'bytes'}
         for name in ('content-length', 'content-range'):
             value = upstream.headers.get(name)
@@ -130,7 +161,10 @@ class Playback:
         content_type = upstream.headers.get('content-type', '').split(';')[0].lower()
         if content_type not in {'video/mp4', 'application/octet-stream', 'binary/octet-stream'}:
             await close()
-            raise HTTPException(502, '视频服务返回了异常内容，请打开原视频。')
+            lease['failure'] = {'category': 'upstream', 'message': '视频服务返回了异常内容，请打开原视频。'}
+            raise playback_error(502, lease['failure']['message'], 'upstream')
+
+        lease.pop('failure', None)
 
         async def chunks():
             try:
@@ -138,6 +172,9 @@ class Playback:
                     if lease['generation'] != self.generation:
                         break
                     yield chunk
+            except httpx.RequestError:
+                lease['failure'] = {'category': 'network', 'message': '视频连接中断，请重试或打开原视频。'}
+                raise
             finally:
                 await close()
 

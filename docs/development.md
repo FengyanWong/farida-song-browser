@@ -34,12 +34,25 @@ EXE 的诊断输出保存在数据目录下的 `launcher.log`。备份前先退�
 
 播放器使用原生 `<video>`，在实际 `ended` 事件后切换下一段或下一首，不按歌曲时长倒计时。
 只有当前歌曲会请求播放信息；取消过时请求，遇到限流暂停队列。暂不支持的格式保留打开原视频入口。
+临时连接故障最多自动刷新一次播放地址，并恢复当前分段与位置；手动重试也保留进度。
+开启「跳过失效」后只跳过已确认不可用或不支持的歌曲；整队列不可用时停止，避免循环请求。
+媒体错误分类通过本地 `/api/playback/status/{key}` 查询，不额外请求哔哩哔哩。
 `backend/farida/playback.py` 通过已登录账号获取 MP4 播放信息；Cookie 只发送给 Bilibili API。
 浏览器只接收临时本机媒体地址。后端验证 CDN 主机、转发单段 Range 请求，并在内存中流式传输，
 不保存视频文件、不向 CDN 发送账号 Cookie。退出或切换账号会撤销本机播放地址。
 
 `scripts/playback_browser_qa.cjs` 使用 Playwright 与 Edge，在独立数据目录中生成短测试视频，模拟播放接口并验证真实结束事件。
 第一个参数可指定 Playwright 包路径，第二个参数可指定最终 EXE；不传 EXE 时测试源码启动器。
+
+## 本机设置与备份
+
+`playback_state` 保存队列与偏好，`playback_progress` 记录当前播放位置。读取进度和导出备份时合并两者。
+最近播放按歌曲去重，保留最近 100 首，只在浏览器实际开始播放后记录。
+迷你播放条复用同一个视频元素，出现与收起均不会重新请求媒体或创建第二路声音。
+歌单拖动使用原列表索引，筛选时也保留隐藏歌曲；原有上下移按钮仍可使用。
+
+手动 JSON 备份格式 v2 包含最近播放，兼容恢复不含历史记录的 v1 文件。
+恢复前会生成恢复副本；不包含登录凭据。自动每日备份尚未启用。
 
 ## 构建 Windows EXE
 
@@ -50,7 +63,7 @@ py -3.12 -m venv .build-venv
 .\.build-venv\Scripts\python.exe -m pip install -r requirements-build.txt
 .\.build-venv\Scripts\python.exe -X utf8 scripts\build_windows.py
 .\.build-venv\Scripts\python.exe -X utf8 scripts\download_dependency_sources.py
-.\.build-venv\Scripts\python.exe -X utf8 scripts\smoke_exe.py release\FaridaSongBrowser-0.0.5-windows-x64.exe
+.\.build-venv\Scripts\python.exe -X utf8 scripts\smoke_exe.py release\FaridaSongBrowser-0.0.10-windows-x64.exe
 ```
 
 产物在 `release/`：单文件 EXE、ZIP、公开目录与链接清单、依赖源码包及 SHA-256 校验值。

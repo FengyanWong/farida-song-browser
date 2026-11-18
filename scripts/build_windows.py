@@ -4,6 +4,7 @@ import importlib.metadata as metadata
 import json
 import os
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
@@ -98,9 +99,14 @@ def main():
                "--collect-submodules", "uvicorn", "--hidden-import", "anyio._backends._asyncio",
                "--hidden-import", "wsproto",
                "--exclude-module", "PIL", "--exclude-module", "tkinter", "--exclude-module", "pytest"]
-    for source, target in [(ROOT / "frontend", "frontend"), (ROOT / "data", "data"),
+    for source, target in [(ROOT / "frontend", "frontend"), (ROOT / "data/catalog.json", "data"),
                            (ROOT / "LICENSE", "."), (ROOT / "THIRD_PARTY_NOTICES.md", "."), (licenses, "licenses")]:
         command += ["--add-data", f"{source}:{target}"]
+    # Some Python distributions load an extra certificate policy beside ssl.py.
+    # Preserve that policy when freezing the interpreter for HTTPS requests.
+    runtime_ca_policy = Path(ssl.__file__).with_name("codex-rejected-cas.pem")
+    if runtime_ca_policy.is_file():
+        command += ["--add-data", f"{runtime_ca_policy}:."]
     for package in runtime_packages():
         command += ["--copy-metadata", package]
     subprocess.run([*command, str(ROOT / "run.py")], cwd=ROOT, check=True)

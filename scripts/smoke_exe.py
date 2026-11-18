@@ -13,14 +13,39 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from threading import Thread
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 from farida import __version__
 
 
-def main():
+@contextmanager
+def offline_proxy():
+    destinations = []
+
+    class DenyTunnel(BaseHTTPRequestHandler):
+        def do_CONNECT(self):
+            destinations.append(self.path)
+            self.send_error(403)
+
+        def log_message(self, format, *args):
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), DenyTunnel) as proxy:
+        worker = Thread(target=proxy.serve_forever)
+        worker.start()
+        try:
+            yield f"http://127.0.0.1:{proxy.server_port}", destinations
+        finally:
+            proxy.shutdown()
+            worker.join()
+
+
+def main(proxy_url, destinations):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable", type=Path)
     args = parser.parse_args()
@@ -44,18 +69,35 @@ def main():
     environment = os.environ.copy()
     for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "FARIDA_COOKIE_FILE", "FARIDA_DATA_DIR"):
         environment.pop(key, None)
+    # Exercise the embedded TLS setup with the bundled CA files. The proxy
+    # records only tunnel destinations and never connects to the internet.
+    for key in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        environment.pop(key, None)
+    environment.update(HTTP_PROXY=proxy_url, HTTPS_PROXY=proxy_url, ALL_PROXY=proxy_url,
+                       NO_PROXY="localhost,127.0.0.1,::1")
     windows = Path(environment.get("SYSTEMROOT", "C:/Windows"))
     environment["SYSTEMROOT"] = str(windows)
     environment["WINDIR"] = str(windows)
     environment["PATH"] = str(windows / "System32")
     checks = ['EXE uses the Windows GUI subsystem (no console window)']
 
+    def cleanup_process_tree(process):
+        # A one-file PyInstaller EXE runs the Python application in a child.
+        # Keep the parent alive until taskkill can identify its descendants.
+        if process.poll() is None:
+            taskkill = windows / "System32" / "taskkill.exe"
+            subprocess.run([str(taskkill), "/PID", str(process.pid), "/T", "/F"],
+                           capture_output=True, timeout=15, check=False)
+        process.wait(timeout=15)
+
+    local = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
     def request(path, body=None, method=None):
         headers = {}
         if body is not None:
             headers = {"Content-Type": "application/json", "X-Farida-Token": request.token}
             body = json.dumps(body).encode()
-        with urllib.request.urlopen(urllib.request.Request(base + path, data=body, headers=headers, method=method), timeout=10) as response:
+        with local.open(urllib.request.Request(base + path, data=body, headers=headers, method=method), timeout=10) as response:
             raw = response.read()
             return json.loads(raw) if "application/json" in response.headers.get("Content-Type", "") else raw
 
@@ -103,14 +145,25 @@ def main():
                         assert error.code == 401
                     else:
                         raise AssertionError("A fresh install must require login before collection")
+                    try:
+                        request("/api/auth/qr", {}, method="POST")
+                    except urllib.error.HTTPError as error:
+                        assert error.code == 400, "QR login did not handle the offline proxy refusal"
+                    else:
+                        raise AssertionError("The offline proxy must deny the QR login tunnel")
+                    assert destinations == ["passport.bilibili.com:443"], destinations
+                    checks.append("Packaged QR login initializes its HTTPS client and reaches the loopback proxy")
                     # Only this isolated test catalog is changed.
                     request(f"/api/clips/{clip['id']}/bookmark", {"bookmarked": True}, method="PATCH")
                     checks += ["Standalone EXE starts without Python on PATH", "Chinese executable and data paths work",
                                "Bundled UI, covers layout, and Frida load", "Full public catalog and attribution are present",
                                "No inherited login, bookmarks, or jobs", "Signed-out collection is blocked"]
-                    second = subprocess.run([str(executable), '--no-browser', '--port', str(port), '--data-dir', str(data)],
-                                            cwd=program, env=environment, stdout=log, stderr=log, timeout=20)
-                    assert second.returncode == 0 and process.poll() is None
+                    second = subprocess.Popen([str(executable), '--no-browser', '--port', str(port), '--data-dir', str(data)],
+                                              cwd=program, env=environment, stdout=log, stderr=log)
+                    try:
+                        assert second.wait(timeout=20) == 0 and process.poll() is None
+                    finally:
+                        cleanup_process_tree(second)
                     assert request('/api/session')['token'] == request.token
                     checks.append('Launching again reuses the running service without replacing it')
                 else:
@@ -121,9 +174,7 @@ def main():
                 assert process.wait(timeout=20) == 0
                 checks.append(f'Run {run}: quit endpoint gracefully stops the EXE while signed out')
             finally:
-                if process.poll() is None:
-                    subprocess.run([str(windows / "System32/taskkill.exe"), "/PID", str(process.pid), "/T", "/F"], capture_output=True, check=False)
-                process.wait(timeout=15)
+                cleanup_process_tree(process)
     diagnostic = (data / 'launcher.log').read_text(encoding='utf-8')
     assert '法里达' in diagnostic and 'Traceback' not in diagnostic
     checks.append('Windowless output is retained in a UTF-8 local log')
@@ -133,4 +184,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with offline_proxy() as (proxy_url, destinations):
+        main(proxy_url, destinations)
