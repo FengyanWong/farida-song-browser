@@ -375,6 +375,41 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     await delay(160);assert.equal(await remembered.isHidden(),true);assert.equal(plays.length,playsAfterNew);
     assert.deepEqual(errors,[]);
     pass('Delayed hydration cannot replace a newly started playlist, autoplay after a failed restore, or start media after logout');
+    signedOut=false;
+    await writeState('PUT',{name:'完整收藏',clip_ids:ids,current_id:ids.at(-1),position:.25,shuffle:false,repeat:'off'});
+    await page.reload();await remembered.waitFor();
+    assert.equal(await remembered.textContent(),'继续播放：'+catalog.at(-1).display_song_title);
+    await page.evaluate(()=>{document.querySelector('#song-video').loop=true;});
+    const writes=[];
+    const trackCheckpoint=request=>{
+      if(new URL(request.url()).pathname==='/api/player-state' && ['PATCH','PUT'].includes(request.method()))
+        writes.push({method:request.method(),body:request.postDataJSON()});
+    };
+    page.on('request',trackCheckpoint);
+    await remembered.click();await until(()=>plays.at(-1)===ids.at(-1));await ready();
+    assert.equal(await page.locator('#player-position').textContent(),ids.length+' / '+ids.length);
+    await until(()=>writes.some(write=>write.method==='PUT'));
+    await page.locator('#player-shuffle').click();
+    await page.evaluate(()=>{window.previousRandom=Math.random;Math.random=()=>0;});
+    await page.locator('#player-next').click();await until(()=>plays.at(-1)===ids[0]);await ready();
+    await page.evaluate(()=>{Math.random=window.previousRandom;});
+    await until(async()=>{const current=await state();return current.current_id===ids[0] && current.shuffle;});
+    await page.locator('#player-prev').click();await until(()=>plays.at(-1)===ids.at(-1));await ready();
+    await page.locator('#player-close').click();await remembered.waitFor();
+    await until(async()=>{const current=await state();return current.current_id===ids.at(-1) && current.shuffle;});
+    const savedFull=await state();
+    assert.deepEqual(savedFull.clip_ids,ids);
+    assert.ok(savedFull.position>0);
+    assert.deepEqual(writes.filter(write=>write.method==='PUT').map(write=>write.body.clip_ids),[ids]);
+    const patches=writes.filter(write=>write.method==='PATCH');
+    assert.ok(patches.some(write=>write.body.current_id===ids[0]));
+    assert.ok(patches.every(write=>!Object.hasOwn(write.body,'clip_ids')));
+    page.off('request',trackCheckpoint);
+    const playsBeforeReopen=plays.length;
+    await page.reload();await remembered.waitFor();
+    assert.equal(await remembered.textContent(),'继续播放：'+catalog.at(-1).display_song_title);
+    assert.equal(plays.length,playsBeforeReopen);
+    pass('The entire '+ids.length+'-song catalog keeps its original order through shuffle, previous and close; one full checkpoint and small progress updates restore the last song without autoplay');
     await page.close();await until(()=>server.exitCode!==null);assert.equal(server.exitCode,0);
     fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({checks,errors,output,packaged:!!exe},null,2));
   }finally{await browser.close();if(server.exitCode===null)spawnSync('taskkill',['/PID',String(server.pid),'/T','/F'],{stdio:'ignore'});}

@@ -380,7 +380,14 @@ export class PlaylistPlayer {
       return this.saveChain;
     }
     this.lastSave=Date.now();
-    const queueSave=this.queueSave;
+    let queueSave=this.queueSave, replacingSavedWindow=false;
+    // Keep every song live. Persist one contiguous window containing the current song.
+    if (this.index<queueSave.start || this.index>=queueSave.start+maxPlaylistItems) {
+      replacingSavedWindow=!!queueSave.key;
+      const block=Math.floor(this.index/maxPlaylistItems)*maxPlaylistItems;
+      const start=Math.min(block,this.queue.length-maxPlaylistItems);
+      queueSave=this.queueSave={key:null,sequence:0,start};
+    }
     const sequence=++queueSave.sequence;
     const progress={current_id:current.id,...this.position(),shuffle:this.shuffle,
       repeat:this.repeat,skip_unavailable:this.skipUnavailable};
@@ -392,16 +399,19 @@ export class PlaylistPlayer {
         await this.api('/api/player-state',{method:'PATCH',body,keepalive});
       }else{
         // Send the full order only when establishing a queue (including a resumed queue).
-        const body=JSON.stringify({name,clip_ids:queue.map(item=>item.id),...progress,...preferences});
+        const savedQueue=queue.length>maxPlaylistItems ? queue.slice(queueSave.start,queueSave.start+maxPlaylistItems) : queue;
+        const body=JSON.stringify({name,clip_ids:savedQueue.map(item=>item.id),...progress,...preferences});
         const headers=this.preferenceWriter?{'X-Farida-Preference-Writer':this.preferenceWriter}:{};
         const result=await this.api('/api/player-state',{method:'PUT',body,headers,keepalive:keepalive&&body.length<50000});
         queueSave.key=result.queue_key;
       }
     };
-    if(keepalive&&queueSave.key){
-      const finalSave=save().catch(()=>{});
-      this.saveChain=Promise.all([this.saveChain,finalSave]).then(()=>{});
-      return finalSave;
+    // Old checkpoints are scoped to their key. They cannot overwrite a replacement window.
+    // An unacknowledged full write still has to finish before another full write starts.
+    if(replacingSavedWindow || (keepalive&&queueSave.key)){
+      const immediate=save().catch(()=>{});
+      this.saveChain=Promise.all([this.saveChain,immediate]).then(()=>{});
+      return immediate;
     }
     this.saveChain=this.saveChain.then(save).catch(()=>{});
     return this.saveChain;
@@ -429,7 +439,7 @@ export class PlaylistPlayer {
     if(!playable.length){toast('这个列表中还没有可播放的片段。');return;}
     if(id&&!playable.some(item=>item.id===id)){toast('此片段当前不可播放。');return;}
     this.remember();this.segments=[];
-    this.queueSave={key:null,sequence:0};
+    this.queueSave={key:null,sequence:0,start:0};
     this.saved=null;
     this.queue=playable;this.name=name;this.visited=new Set();this.history=[];this.unavailable=new Set();
     $('#player-remembered').hidden=true;
@@ -437,7 +447,10 @@ export class PlaylistPlayer {
     $('#player-queue-search').value='';$('#player-queue-clear').hidden=true;
     this.index=-1;this.renderQueue();
     $('#music-player').hidden=false;
-    if(items.length>playable.length)toast(`已跳过 ${items.length-playable.length} 个不可用或重复片段。`);
+    const messages=[];
+    if(items.length>playable.length)messages.push(`已跳过 ${items.length-playable.length} 个不可用或重复片段。`);
+    if(playable.length>maxPlaylistItems)messages.push('本次可播放全部歌曲。重新打开时将恢复上次位置及附近最多 20,000 首。');
+    if(messages.length)toast(messages.join(''));
     this.play(id?playable.findIndex(item=>item.id===id):0,resume);
   }
   async play(index,resume=null,recovering=false) {
@@ -595,26 +608,27 @@ export class PlaylistPlayer {
     window.addEventListener('beforeunload', this.warnBeforeUnload);
   }
   setDraft(list, add=[]) {
-    const items = list?.items ?? [];
+    const original=list?.items ?? [];
+    const items=!list?.id && original.length>maxPlaylistItems ? original.slice(0,maxPlaylistItems) : original;
     this.editing = {id:list?.id ?? null, revision:list?.revision, savedName:list?.name ?? '',
                     savedIds:items.map(item=>item.id), items:[...items]};
-    this.addItems(add);
+    const overflow=original.length-items.length+this.addItems(add).overflow;
     $('#playlist-import').open=false;
     $('#playlist-import-text').value='';
     $('#playlist-import-status').textContent='';
     this.updateEditorActions();
     $('#playlist-search').value='';$('#playlist-search-clear').hidden=true;
     $('#playlist-name').value=this.editing.savedName;
-    $('#playlist-error').textContent='';
+    $('#playlist-error').textContent=overflow?`歌单最多 20,000 首，另有 ${overflow} 首未加入。`:'';
     $('#playlist-dialog-title').textContent=this.editing.id?'编辑歌单':'新建歌单';
     this.renderEditing();
   }
-  addItems(items, limit=Infinity) {
+  addItems(items) {
     const current=this.editing.items, ids=new Set(current.map(item=>item.id));
     let added=0, existing=0, overflow=0;
     for (const item of items) {
       if (ids.has(item.id)) { existing++; continue; }
-      if (current.length>=limit) { overflow++; continue; }
+      if (current.length>=maxPlaylistItems) { overflow++; continue; }
       current.push(item);ids.add(item.id);added++;
     }
     return {added,existing,overflow};
@@ -635,7 +649,7 @@ export class PlaylistPlayer {
     try {
       const result=await this.api('/api/playlists/resolve-links',{method:'POST',body:JSON.stringify({links})});
       if (edit!==this.editing || !$('#playlist-dialog').open) return;
-      const {added,existing,overflow}=this.addItems(result.items,maxPlaylistItems);
+      const {added,existing,overflow}=this.addItems(result.items);
       if (added) this.renderEditing();
       const counts=[`已加入 ${added} 首`];
       if (existing) counts.push(`歌单已有 ${existing} 首`);
@@ -662,7 +676,13 @@ export class PlaylistPlayer {
     try {
       const items=await this.results();
       if (!this.currentEditor(edit)) return;
-      this.addItems(items);this.renderEditing();
+      const {added,overflow}=this.addItems(items);
+      if(added)this.renderEditing();
+      if(overflow) {
+        const message=`歌单最多 20,000 首，另有 ${overflow} 首未加入。`;
+        if(edit.conflict)toast(message);
+        else $('#playlist-error').textContent=message;
+      }
     } catch(error) {if(this.currentEditor(edit))$('#playlist-error').textContent=error.message;}
     finally {
       edit.resolving=false;
