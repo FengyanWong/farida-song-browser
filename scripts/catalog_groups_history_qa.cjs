@@ -518,6 +518,57 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await page.locator('#player-close').click();
     pass('Collapsed group selection includes hidden recordings; indeterminate selection stays correct; saved playlist and group playback use all 50 real queue IDs');
 
+    const orderedView=await context.newPage();
+    try {
+      // Keep each chosen position stable while inspecting the real playback queue.
+      await orderedView.addInitScript(()=>{HTMLMediaElement.prototype.play=async()=>{};});
+      await orderedView.goto(base+'/#catalog');
+      await orderedView.locator('.song-group-row').first().waitFor();
+      await orderedView.locator('#filter-button').click();
+      const sorted=orderedView.waitForResponse(r=>{const url=new URL(r.url());return url.pathname==='/api/clips' && url.searchParams.get('sort')==='uploader';});
+      await orderedView.locator('#sort').selectOption('uploader');await sorted;
+      const grouped=await api('/api/clips?sort=uploader&grouped=true&page_size=100');
+      const flat=await api('/api/clips?sort=uploader&page_size=100');
+      const ids=grouped.items.map(item=>item.id);
+      assert.notDeepEqual(ids,flat.items.map(item=>item.id));
+      await orderedView.locator('#play-all').click();
+      const link=orderedView.locator('#player-original'), position=orderedView.locator('#player-position');
+      await until(async()=>await link.getAttribute('href')===grouped.items[0].playback_url);
+      assert.equal(await position.innerText(),'1 / '+ids.length);
+      await orderedView.locator('#player-close').click();
+      const index=ids.findIndex((id,i)=>i>0 && id!==flat.items[i].id && i+1<ids.length);
+      assert.ok(index>0);
+      const group=grouped.groups.findIndex(g=>g.clip_ids.includes(ids[index]));
+      await orderedView.locator('[data-group="'+group+'"]').click();
+      await orderedView.locator('[data-play="'+ids[index]+'"]').click();
+      await until(async()=>await link.getAttribute('href')===grouped.items[index].playback_url);
+      assert.equal(await position.innerText(),(index+1)+' / '+ids.length);
+      if(await orderedView.locator('#player-shuffle').getAttribute('aria-pressed')==='true')
+        await orderedView.locator('#player-shuffle').click();
+      await orderedView.locator('#player-next').click();
+      await until(async()=>await link.getAttribute('href')===grouped.items[index+1].playback_url);
+      await orderedView.locator('#player-close').click();
+      // Selected versions follow their displayed order even when checked in reverse.
+      const pair=grouped.groups[group].clip_ids.slice(0,2);
+      assert.equal(pair.length,2);
+      for(const id of [...pair].reverse()) await orderedView.locator('[data-select="'+id+'"]').check();
+      await orderedView.locator('#play-selected').click();
+      await until(async()=>await position.innerText()==='1 / 2');
+      assert.equal(await link.getAttribute('href'),grouped.items.find(i=>i.id===pair[0]).playback_url);
+      await orderedView.locator('#player-next').click();
+      await until(async()=>await link.getAttribute('href')===grouped.items.find(i=>i.id===pair[1]).playback_url);
+      await orderedView.locator('#player-close').click();
+      await orderedView.locator('#playlist-new').click();
+      await orderedView.locator('#playlist-add-results').click();
+      await until(async()=>await orderedView.locator('#playlist-items [data-remove]').count()===ids.length);
+      await orderedView.locator('#playlist-name').fill('按显示顺序');
+      await orderedView.locator('#playlist-save-button').click();
+      await orderedView.locator('#playlist-dialog').waitFor({state:'hidden'});
+      const savedOrder=await api('/api/playlists/'+await orderedView.locator('#playlist-select').inputValue());
+      assert.deepEqual(savedOrder.items.map(item=>item.id),ids);
+    }finally{await orderedView.close();}
+    pass('Grouped Play All, playback from a chosen version, selected versions, and adding filtered results to a playlist follow the displayed order');
+
     await page.locator('#search').fill('同一首歌');await until(async()=>await page.locator('.song-group-row').count()===1);
     await page.locator('#source-filter').selectOption(String(fixture.source_ids[0]));
     await until(async()=>(await page.locator('[data-group="0"]').textContent()).includes('25 个版本'));

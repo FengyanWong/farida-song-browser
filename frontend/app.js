@@ -8,8 +8,8 @@ import { connectMediaControls } from './media-controls.js';
 
 hydrateIcons();
 const pet = new Pet(); pet.initialize();
-const appLifetime = new AppLifetime();
-const state = {view:'catalog',filter:'included',page:1,pageSize:40,overview:null,clips:null,token:null,preview:false,stopping:false,selected:new Map(),expandedGroups:new Set(),grouped:false,editSource:null,request:0};
+const appLifetime = new AppLifetime(finishQuit);
+const state = {view:'catalog',filter:'included',page:1,pageSize:40,overview:null,clips:null,token:null,preview:false,stopping:false,exited:false,selected:new Map(),expandedGroups:new Set(),grouped:false,editSource:null,request:0};
 const failedCovers = new Set();
 const clipFilters = {included:'已收录',bookmarked:'星标收藏',needs_review:'待确认',all:'全部候选',excluded:'已排除'};
 const labels = {queued:'等待采集',running:'采集中',paused:'访问受限',failed:'采集未完成',interrupted:'上次运行中断',cancelled:'已取消',completed:'已完成'};
@@ -31,6 +31,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 async function api(path, {asBlob=false, ...options}={}) {
+  if (state.exited) throw new Error('应用已退出。');
   const response=await fetch(path,{...options,headers:{'Content-Type':'application/json','X-Farida-Token':state.token || '',...options.headers}});
   if (asBlob && response.ok) return response.blob();
   let data;try {data=await response.json();}catch {throw new Error('本地服务返回异常，请重新启动应用。');}
@@ -46,6 +47,21 @@ const accountLogin = new AccountLogin(api, async()=>{
 const playlistPlayer = new PlaylistPlayer(api, requestParameters, selectedClips, ()=>accountLogin.canCollect() && !state.stopping);
 const miniPlayer = new MiniPlayer(playlistPlayer);
 connectMediaControls(playlistPlayer);
+function finishQuit() {
+  if (state.exited) return;
+  state.stopping=true;state.exited=true;++state.request;
+  clearTimeout(pollTimer);clearTimeout(sessionRetryTimer);clearTimeout(searchTimer);
+  appLifetime.stop();
+  pet.setPageActive(false);
+  playlistPlayer.persistenceSuspended=true;
+  playlistPlayer.stop();
+  accountLogin.stop();
+  $$('[data-quit-app]').forEach(button=>button.disabled=true);
+  $$('dialog[open]').forEach(dialog=>dialog.close());
+  $('#shutdown-dialog').showModal();
+  $('#connection-label').textContent='应用已退出';
+  $('.status-dot').style.background='var(--muted)';
+}
 async function quitApp() {
   if(state.stopping)return;
   state.stopping=true;playlistPlayer.updateResumeButton();clearTimeout(pollTimer);
@@ -53,16 +69,11 @@ async function quitApp() {
   try {
     await playlistPlayer.persistPreferences();
     await playlistPlayer.remember();
+    if (state.exited) return;
     await api('/api/shutdown',{method:'POST'});
-    appLifetime.stop();
-    pet.setPageActive(false);
-    playlistPlayer.stop();
-    accountLogin.stop();
-    $$('dialog[open]').forEach(dialog=>dialog.close());
-    $('#shutdown-dialog').showModal();
-    $('#connection-label').textContent='应用已退出';
-    $('.status-dot').style.background='var(--muted)';
+    finishQuit();
   } catch(error) {
+    if (state.exited) return;
     state.stopping=false;playlistPlayer.updateResumeButton();schedulePoll(10000);
     $$('[data-quit-app]').forEach(button=>button.disabled=false);
     toast(error.message);
@@ -112,6 +123,7 @@ function saveRoute(rememberView=false) {
   else history.replaceState(null,'',hash);
 }
 function readRoute() {
+  if (state.stopping) return;
   const [view,query]=location.hash.slice(1).split('?');
   const filter=({bookmarks:'bookmarked',review:'needs_review'})[view] || new URLSearchParams(query).get('filter');
   const nextFilter=Object.hasOwn(clipFilters,filter)?filter:'included';
@@ -499,7 +511,7 @@ async function startSync(mode='incremental',sourceIds=[]) {
   try {notice('');await api('/api/sync',{method:'POST',body:JSON.stringify({mode,source_ids:sourceIds})});await loadOverview();toast('采集任务已启动，内容会逐条保存。');}
   catch(error){notice(error.message,true);if(error.status===401)await accountLogin.requireLogin();}
 }
-async function refresh() {try {await loadOverview();if(state.view!=='sources')await loadClips();}catch(error){notice(error.message,true);$('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';}}
+async function refresh() {try {await loadOverview();if(!state.stopping && state.view!=='sources')await loadClips();}catch(error){if(state.stopping)return;notice(error.message,true);$('#connection-label').textContent='本地服务未连接';$('.status-dot').style.background='var(--danger)';}}
 function selectClip(clip, index, checked) {
   if (!checked) {
     state.selected.delete(clip.id);
@@ -906,12 +918,14 @@ async function initializeApp() {
   }
   $('#connection-retry').hidden=true;
   state.token=session.token;
+  if(session.version)$('#app-version').textContent=' 应用版本 v'+session.version;
   state.preview=!!session.preview_mode;
   if(session.close_with_page)appLifetime.start(state.token);
   $('#preview-notice').hidden=!state.preview;
   $$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);
   accountLogin.initialize(state.preview);
   const overview=loadOverview().catch(error=>{
+    if (state.stopping) return;
     startupOverviewError='暂时无法读取采集状态，将自动重试。'+error.message;
     notice(startupOverviewError,true);
     $('#connection-label').textContent='正在重试本地连接';
@@ -952,6 +966,7 @@ $('#backup-file').onchange=async event=>{
     playlistPlayer.updateResumeButton();
     await playlistPlayer.saveChain;
     await api('/api/restore',{method:'POST',body:file});
+    if (state.exited) return;
     playlistPlayer.preferencesReady=false;
     clearTimeout(playlistPlayer.preferencesTimer);
     playlistPlayer.stop();
@@ -959,6 +974,7 @@ $('#backup-file').onchange=async event=>{
     alert('恢复完成。你可以在右上角的账号菜单下载上次恢复前的备份。');
     location.reload();
   } catch(error){
+    if (state.exited) return;
     playlistPlayer.persistenceSuspended=false;
     playlistPlayer.updateResumeButton();
     playlistPlayer.persistPreferences();

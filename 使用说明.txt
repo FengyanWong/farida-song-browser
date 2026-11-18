@@ -97,14 +97,14 @@ v2：1536×2288，8 列 11 行。
 升级前请先退出旧版，再打开新 EXE；v0.0.1 可通过关闭启动窗口退出。
 启动或运行遇到错误时，可在数据目录查看 launcher.log。
 Windows 数据保存在：%LOCALAPPDATA%\FaridaSongBrowser
-需要备份时，先退出应用，再复制整个数据文件夹。
+如需复制整个数据文件夹，请先退出应用。
 
 【开源与版本】
-v0.0.5，Windows x64。此版本尚未进行代码签名。
+本应用为未签名的 Windows x64 程序。右上角账号菜单显示当前运行的版本。
 源码：https://github.com/FengyanWong/farida-song-browser
-发行版：https://github.com/FengyanWong/farida-song-browser/releases/tag/v0.0.5
+发行版：https://github.com/FengyanWong/farida-song-browser/releases
 软件采用 GNU GPL 第 3 版，不提供担保。完整许可见 LICENSE。
 原视频、歌曲、封面及角色素材权利属于各自权利人，详见 THIRD_PARTY_NOTICES.md。
 
-备份与恢复：右上角账号菜单 → 备份数据 / 恢复备份。恢复会替换本机目录、来源、歌单、收藏、备注和播放进度，不改变登录凭据。恢复前的数据会自动保存到 %LOCALAPPDATA%\FaridaSongBrowser\backups。
+备份与恢复：右上角账号菜单 → 备份数据 / 恢复备份。恢复会替换本机目录、来源、歌单、收藏、备注和播放进度，不改变登录凭据。恢复前的数据会自动保存到 %LOCALAPPDATA%\FaridaSongBrowser\backups，也可在账号菜单选择「下载上次恢复前的备份」。
 播放：可切换随机播放、列表循环或单曲循环；关闭播放器后或下次打开应用时，点击「继续播放」才会加载完整队列，并回到上次的歌曲与位置。

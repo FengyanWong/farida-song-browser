@@ -133,6 +133,7 @@ def check_executable(source_executable, workspace, expected, proxy_url, destinat
                 assert overview["included"] == expected["included_clips"]
                 assert overview["jobs"] == []
                 session = request("/api/session")
+                assert session["version"] == health["version"]
                 request.token = session["token"]
                 assert session["can_shutdown"] is True
                 auth = request("/api/auth")

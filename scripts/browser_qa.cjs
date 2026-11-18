@@ -104,8 +104,10 @@ async function checkCoverRecovery(browser, base) {
     checks.push('Song-list attribution and original-site link in clip details');
     await page.getByText('修改歌名、分组与备注',{exact:true}).click();
     await page.locator('[name=display_song_title]').fill('演示 · 中文修正');await page.locator('[name=notes]').fill('保存中文备注');
-    await page.locator('#annotation-form button').click();await page.waitForTimeout(300);
-    await page.locator('#search').fill('中文修正');await page.waitForTimeout(500);
+    await page.locator('#annotation-form').getByRole('button',{name:'保存修正'}).click();
+    await page.locator('#detail-dialog').waitFor({state:'hidden'});
+    await page.locator('#search').fill('中文修正');
+    await page.locator('.row-title').filter({hasText:'演示 · 中文修正'}).waitFor();
     assert.equal(await page.locator('.row-title').textContent(),'演示 · 中文修正');checks.push('Manual Chinese title/note correction');
     await page.reload();await page.locator('#clip-rows tr').first().waitFor();
     assert.equal(await page.locator('#clip-filter').inputValue(),'bookmarked');
@@ -116,6 +118,9 @@ async function checkCoverRecovery(browser, base) {
     await page.locator('#select-page').check();await page.locator('[data-bulk=included]').click();await page.waitForTimeout(300);
     assert.equal(await page.locator('#clip-rows tr').count(),0);checks.push('Review filter and explicit selected-row bulk review');
     await page.locator('[data-view=sources]').click();
+    const version=(await (await page.request.get(new URL('/api/session',page.url()).href)).json()).version;
+    assert.match(version,/^\d+\.\d+\.\d+$/);
+    assert.equal((await page.locator('#app-version').textContent()).trim(),'应用版本 v'+version);
     assert.equal(await page.locator('.source-card').count(),6);
     const curatedCard=page.locator('.source-card').filter({has:page.locator('h3',{hasText:'CLANNADOR 歌单'})});
     assert.match(await curatedCard.textContent(),/CLANNADOR 整理/);

@@ -16,13 +16,12 @@ class WindowLifetime:
         if self.startup_timeout is not None:
             self._schedule(self.startup_timeout)
 
-    def connect(self):
+    def connect(self, send_state):
         if self.stopped:
-            return None
+            return False
         self._cancel_timer()
-        window = object()
-        self.windows.add(window)
-        return window
+        self.windows.add(send_state)
+        return True
 
     def disconnect(self, window):
         if window not in self.windows:
@@ -49,12 +48,32 @@ class WindowLifetime:
         except asyncio.CancelledError:
             pass
 
+    @staticmethod
+    async def notify_stopping(windows):
+        async def notify(send_state):
+            # A tab can disappear while its frame is in flight.
+            with suppress(Exception):
+                await send_state('stopping')
+
+        sends = [asyncio.create_task(notify(send_state)) for send_state in windows]
+        if sends:
+            try:
+                # All windows share one deadline, even if a transport stalls.
+                await asyncio.wait(sends, timeout=0.5)
+            finally:
+                for send in sends:
+                    if not send.done():
+                        send.cancel()
+
     async def shutdown(self):
         if self.stopped:
             return
         self.stopped = True
         self._cancel_timer()
-        self.shutdown_callback()
+        try:
+            await self.notify_stopping(self.windows)
+        finally:
+            self.shutdown_callback()
 
     async def close(self):
         self.stopped = True

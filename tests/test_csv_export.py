@@ -64,7 +64,7 @@ def test_csv_bytes_match_the_full_export_for_filters_and_sorts(settings, video):
 
 
 
-def test_grouped_downloads_match_all_catalog_pages_in_display_order(settings, video):
+def test_grouped_downloads_and_queue_match_all_catalog_pages_in_display_order(settings, video):
     with TestClient(create_app(settings, scan_on_start=False)) as client:
         db = client.app.state.db
         ids = []
@@ -89,6 +89,11 @@ def test_grouped_downloads_match_all_catalog_pages_in_display_order(settings, vi
                     expected += client.get("/api/clips", params={**query, "page_size": 1, "page": number}).json()["items"]
                 if sort == "newest" and not scope:
                     assert [item["id"] for item in expected] == [ids[5], ids[4], ids[2], ids[3], ids[1]]
+                queue = client.get("/api/play-queue", params=query).json()["items"]
+                assert [item["id"] for item in queue] == [item["id"] for item in expected]
+                flat = client.get("/api/play-queue", params={**scope, "sort": sort}).json()["items"]
+                flat_catalog = client.get("/api/clips", params={**scope, "sort": sort}).json()["items"]
+                assert [item["id"] for item in flat] == [item["id"] for item in flat_catalog]
                 as_json = client.get("/api/export", params={**query, "format": "json"})
                 assert as_json.content == JSONResponse(expected).body
                 assert int(as_json.headers["content-length"]) == len(as_json.content)

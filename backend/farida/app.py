@@ -273,7 +273,7 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
 
     @app.get("/api/session")
     def session():
-        return {"token":token,"request_interval":settings.request_interval,"discovery_pages":settings.discovery_pages,"incremental_pages":settings.incremental_pages,"preview_mode":preview_mode,"can_shutdown":lifetime is not None,"close_with_page":lifetime is not None,"close_grace_seconds":window_grace_seconds}
+        return {"token":token,"version":__version__,"request_interval":settings.request_interval,"discovery_pages":settings.discovery_pages,"incremental_pages":settings.incremental_pages,"preview_mode":preview_mode,"can_shutdown":lifetime is not None,"close_with_page":lifetime is not None,"close_grace_seconds":window_grace_seconds}
 
     @app.websocket('/api/window')
     async def app_window(websocket: WebSocket):
@@ -292,11 +292,20 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             if not isinstance(supplied, str) or not secrets.compare_digest(supplied.encode(), token.encode()):
                 await websocket.close(code=1008)
                 return
-            window = lifetime.connect()
-            if window is None:
-                await websocket.close(code=1001)
+            # Serialize the initial handshake with an explicit quit in another tab.
+            send_lock = asyncio.Lock()
+
+            async def send_state(state):
+                async with send_lock:
+                    await websocket.send_json({'state': state})
+                    if state == 'stopping':
+                        await websocket.close(code=1001)
+
+            if not lifetime.connect(send_state):
+                await lifetime.notify_stopping((send_state,))
                 return
-            await websocket.send_json({'state': 'connected'})
+            window = send_state
+            await send_state('connected')
             while (await websocket.receive())['type'] != 'websocket.disconnect':
                 pass
         except WebSocketDisconnect:
@@ -370,9 +379,9 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     @app.get('/api/play-queue')
     def play_queue(q: str='', status: Literal['included','excluded','needs_review','all']='included', source_id: int | None=None,
                    uploader: str | None=None, after: CatalogDate | None=None, before: CatalogDate | None=None, bookmarked: bool=False,
-                   sort: CatalogSort='newest'):
+                   sort: CatalogSort='newest', grouped: bool=False):
         return {'items': db.playback_queue(q=q, status=status, source_id=source_id, uploader=uploader,
-                                          after=after, before=before, bookmarked=bookmarked, sort=sort)}
+                                          after=after, before=before, bookmarked=bookmarked, sort=sort, grouped=grouped)}
 
     @app.get('/api/listening-history')
     def listening_history():

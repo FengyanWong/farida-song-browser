@@ -231,6 +231,19 @@ def clip_order(sort):
     return columns[sort] + ", p.video_bvid, p.part_number"
 
 
+def ordered_catalog_sql(columns, where, sort, grouped):
+    order = clip_order(sort)
+    query = "SELECT " + columns + CLIP_FROM
+    if not grouped:
+        return query + where + " ORDER BY " + order
+    # Groups follow their first matching clip; each group's clips keep their individual order.
+    ranked = (f"SELECT p.id,{GROUP_KEY} AS group_key,ROW_NUMBER() OVER (ORDER BY {order}) AS ordinal"
+              + CLIP_FROM + where)
+    return ("WITH ranked AS (" + ranked + "), ordered AS ("
+            "SELECT id,ordinal,MIN(ordinal) OVER (PARTITION BY group_key) AS first_ordinal FROM ranked) "
+            + query + " JOIN ordered ON ordered.id=p.id ORDER BY ordered.first_ordinal,ordered.ordinal")
+
+
 class SourceConflict(Exception):
     """An editor's source or one of its changed settings has been replaced."""
 
@@ -601,21 +614,11 @@ class Database:
     @contextmanager
     def export_rows(self, format, *, sort="newest", grouped=False, **filters):
         where, args = self.filters(**filters)
-        order = clip_order(sort)
         columns = DETAIL_COLUMNS if format == "json" else (
             "a.display_song_title,v.raw_title,v.uploader_name,v.published_at,"
             "p.video_bvid,p.cid,p.part_number," + PLAYBACK_URL + ",a.inclusion_status," + CURATED_CREDIT
         )
-        query = "SELECT " + columns + CLIP_FROM
-        if grouped:
-            # Groups follow their first matching clip; each group's clips keep their individual order.
-            ranked = (f"SELECT p.id,{GROUP_KEY} AS group_key,ROW_NUMBER() OVER (ORDER BY {order}) AS ordinal"
-                      + CLIP_FROM + where)
-            query = ("WITH ranked AS (" + ranked + "), ordered AS ("
-                     "SELECT id,ordinal,MIN(ordinal) OVER (PARTITION BY group_key) AS first_ordinal FROM ranked) "
-                     + query + " JOIN ordered ON ordered.id=p.id ORDER BY ordered.first_ordinal,ordered.ordinal")
-        else:
-            query += where + " ORDER BY " + order
+        query = ordered_catalog_sql(columns, where, sort, grouped)
         with self.connect() as con:
             # The cursor holds one read snapshot until the export is completely spooled.
             rows = con.execute(query, args)
@@ -747,10 +750,9 @@ class Database:
         by_id = {row['id']: row if compact else self.clip_row(row) for row in rows}
         return [by_id[clip_id] for clip_id in clip_ids if clip_id in by_id]
 
-    def playback_queue(self, sort='newest', **filters):
+    def playback_queue(self, sort="newest", *, grouped=False, **filters):
         where, args = self.filters(**filters)
-        order = clip_order(sort)
-        return self.all(QUEUE_SELECT + where + f' ORDER BY {order}', args)
+        return self.all(ordered_catalog_sql(QUEUE_COLUMNS, where, sort, grouped), args)
 
     def playlist_copy_links(self, clip_ids):
         # A saved CID stays the same when a multipart video is reordered.
