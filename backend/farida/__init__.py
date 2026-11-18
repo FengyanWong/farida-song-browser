@@ -1,3 +1,3 @@
 """Farida Song Browser: local metadata, original Bilibili playback."""
 
-__version__ = "0.0.22"
+__version__ = "0.0.23"

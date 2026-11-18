@@ -2,13 +2,19 @@ import { $, $$, icon, toast } from './ui.js';
 
 const labels={checking:'正在验证登录',signed_out:'未登录',saved:'等待验证',connected:'已登录',expired:'登录已失效',unknown:'状态待检查',unavailable:'登录信息无法读取',preview:'演示模式'};
 const activeStates=new Set(['waiting','scanned']);
+const sessionChangeKey='farida-session-change';
+function differentSession(a,b) {return a?.state!==b?.state || a?.account?.uid!==b?.account?.uid;}
 
 export class AccountLogin {
   constructor(api, changed) {
     this.api=api;this.changed=changed;this.preview=true;this.busy=false;this.loggingOut=false;this.initialized=false;this.stopped=false;
     this.generation=0;this.revision=0;this.attempt=null;this.operations=Promise.resolve();
     this.qrObserver=globalThis.crypto?.randomUUID?.();
-    this.menuRevision=0;
+    this.menuRevision=0;this.peerEpoch=0;
+    window.addEventListener('storage',event=>{
+      if (event.key!==sessionChangeKey || this.preview || this.stopped) return;
+      ++this.peerEpoch;this.refresh(true);
+    });
     this.dialog=$('#login-dialog');
     $('#account-toggle').onclick=()=>this.toggleMenu();
     $('#login-button').onclick=()=>this.openQR();
@@ -57,18 +63,30 @@ export class AccountLogin {
     this.operations=this.operations.catch(()=>{}).then(operation);
     return this.operations;
   }
-  async refresh() {
-    if(this.stopped||!this.initialized||this.busy)return;
+  notifyPeers() {
+    try {localStorage.setItem(sessionChangeKey,crypto.randomUUID());}
+    catch { /* Periodic local status reads also work when browser storage is unavailable. */ }
+  }
+  async afterPeerChange(auth,epoch) {
+    // A checked or scanned response can arrive after another tab changed the shared session.
+    while (epoch!==this.peerEpoch && !this.stopped) {
+      epoch=this.peerEpoch;auth=await this.api('/api/auth');
+    }
+    return auth;
+  }
+  async refresh(fromPeer=false) {
+    if(this.stopped||!this.initialized||(this.busy&&!fromPeer))return;
     const revision=++this.revision;
     try {
       const auth=await this.api('/api/auth');if(revision!==this.revision)return;
       if (JSON.stringify(auth) === JSON.stringify(this.auth)) return;
-      const previous=this.auth?.state;this.render(auth);
-      if(!this.preview&&previous!==auth.state)await this.settle(auth);
+      const changed=differentSession(this.auth,auth);this.render(auth);
+      if(!this.preview&&changed)await this.settle(auth);
     }catch{ /* A local service outage is reported by the main connection status. */ }
   }
   render(auth) {
     if(this.stopped)return;
+    const switched=this.auth?.state==='connected' && auth.state==='connected' && this.auth.account?.uid!==auth.account?.uid;
     this.auth=auth;const preview=this.preview||auth.state==='preview',account=auth.account;
     const name=account?.name||(account?.uid?`UID ${account.uid}`:'哔哩哔哩账号');
     $('#account-name').textContent=name;$('#account-name').title=name;
@@ -84,7 +102,7 @@ export class AccountLogin {
     $('#check-login').disabled=this.busy;$('#logout-button').disabled=this.busy;$('#login-check').disabled=this.busy;
     $$('.login-dismiss').forEach(button=>button.hidden=!this.canCollect());
     document.body.classList.toggle('login-required',!preview&&!this.canCollect());
-    document.dispatchEvent(new Event('farida-auth-change'));
+    document.dispatchEvent(new CustomEvent('farida-auth-change',{detail:{switched}}));
   }
   showDialog() {
     if(this.stopped)return;
@@ -106,7 +124,7 @@ export class AccountLogin {
     }
     this.showDialog();
     if(['signed_out','expired'].includes(auth.state)) {
-      if(!this.attempt)this.generate();
+      if(!this.attempt && this.creatingGeneration!==this.generation)this.generate();
     }else{
       this.failure(auth.message||'暂时无法验证登录，请稍后重新检查。');
       const unreadable=auth.state==='unavailable';
@@ -118,13 +136,16 @@ export class AccountLogin {
   }
   async accountAction(action) {
     if(this.stopped||this.busy||this.preview)return;
+    const epoch=this.peerEpoch,previous=this.auth,wasInitialized=this.initialized;
     this.busy=true;this.loggingOut=action==='logout';++this.revision;this.render(this.auth);this.toggleMenu(false);
     // Startup verification stays in the header. Open the login dialog only
     // after checking the saved session, so a valid login never flashes a QR box.
     if(action==='check'&&this.dialog.open&&!this.canCollect())this.showChecking();
     try {
-      const auth=await this.api(`/api/auth/${action}`,{method:'POST'});
+      const result=await this.api(`/api/auth/${action}`,{method:'POST'});
+      const auth=await this.afterPeerChange(result,epoch);
       if(this.stopped)return;
+      if (action==='logout' || (wasInitialized && epoch===this.peerEpoch && differentSession(previous,auth))) this.notifyPeers();
       this.loggingOut=false;this.initialized=true;this.render(auth);
       if(action==='logout'){await this.changed();toast('已退出本机账号，采集任务已停止。');}
       await this.settle(auth);
@@ -152,7 +173,7 @@ export class AccountLogin {
   }
   generate() {
     if(this.stopped||this.preview)return;
-    const generation=++this.generation,old=this.attempt;this.attempt=null;clearTimeout(this.timer);
+    const generation=++this.generation,old=this.attempt;this.attempt=null;this.creatingGeneration=generation;clearTimeout(this.timer);
     this.hideImage();$('#login-qr-box').hidden=false;$('#login-qr-placeholder').hidden=false;
     $('#login-title').textContent=this.canCollect()?'更换哔哩哔哩账号':'登录后开始收藏';
     $('#login-instructions').textContent='打开哔哩哔哩手机 App，使用「扫一扫」，然后在手机上确认登录。';
@@ -169,6 +190,7 @@ export class AccountLogin {
         $('#login-qr').src=result.qr_image;$('#login-qr').hidden=false;$('#login-qr-placeholder').hidden=true;
         await this.update(result,generation);
       }catch(error){if(this.valid(generation))this.failure(error.message);}
+      finally{if(this.creatingGeneration===generation)this.creatingGeneration=null;}
     });
   }
   failure(message) {
@@ -176,12 +198,15 @@ export class AccountLogin {
     $('#login-message').textContent=message;$('#login-message').classList.add('error');
     $('#login-expiry').textContent='';$('#login-retry').hidden=false;
   }
-  async update(result,generation) {
+  async update(result,generation,epoch=this.peerEpoch) {
     if(!this.valid(generation))return;
     if(result.state==='authenticated'||result.state==='saved') {
+      const auth=await this.afterPeerChange(result.auth,epoch);
+      if (!this.valid(generation)) return;
       this.attempt=null;this.hideImage();$('#login-qr-box').hidden=true;$('#login-expiry').textContent='';
-      ++this.revision;this.render(result.auth);await this.settle(result.auth);
-      if(result.auth.state==='connected')toast('登录成功。');return;
+      if (epoch===this.peerEpoch && differentSession(this.auth,auth)) this.notifyPeers();
+      ++this.revision;this.render(auth);await this.settle(auth);
+      if(auth.state==='connected')toast('登录成功。');return;
     }
     if(!activeStates.has(result.state)){this.failure(result.message||(result.state==='expired'?'二维码已过期，请刷新后重新扫码。':'登录已结束，请重新获取二维码。'));return;}
     $('#login-message').textContent=result.state==='scanned'?'已扫码，请在手机上确认登录。':'等待扫码';
@@ -192,8 +217,8 @@ export class AccountLogin {
   }
   async poll(generation) {
     if(document.hidden||!this.valid(generation)||!this.attempt||this.pollGeneration!==generation||this.polling===generation)return;
-    this.polling=generation;
-    try {await this.update(await this.api(`/api/auth/qr/${encodeURIComponent(this.attempt)}/poll`,{method:'POST'}),generation);}
+    this.polling=generation;const epoch=this.peerEpoch;
+    try {await this.update(await this.api(`/api/auth/qr/${encodeURIComponent(this.attempt)}/poll`,{method:'POST'}),generation,epoch);}
     catch(error){if(this.valid(generation))this.failure(error.message);}
     finally{if(this.polling===generation)this.polling=null;}
   }

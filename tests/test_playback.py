@@ -66,6 +66,47 @@ def test_logged_playback_seeking_and_logout(settings, video):
         assert client.post(endpoint).status_code == 401
 
 
+def test_history_respects_clear_and_restore_at_actual_playback_start(settings, video, monkeypatch):
+    from types import SimpleNamespace
+
+    # The browser and server run on the same computer. Control the boundary to
+    # distinguish an old delayed event from a newly started, pre-buffered clip.
+    monkeypatch.setattr("farida.app.time", SimpleNamespace(time_ns=lambda: 1000_000_000))
+    login(settings)
+    transport = httpx.MockTransport(handler)
+    app = create_app(settings, scan_on_start=False, auth_transport=transport, playback_transport=transport)
+    with TestClient(app) as client:
+        db = app.state.db
+        db.save_video(db.source(1), video, [])
+        clip = video['bvid'] + ':200'
+        client.headers['X-Farida-Token'] = client.get('/api/session').json()['token']
+        assert client.post('/api/auth/check').json()['state'] == 'connected'
+        empty = client.get('/api/backup').json()
+        play = '/api/clips/' + clip + '/play'
+        history = '/api/listening-history'
+        prepared = client.post(play).json()['history_generation']
+        assert client.get(history).json()['items'] == []
+
+        def write(generation, played_at):
+            return client.post(history, json={'clip_id': clip, 'history_generation': generation,
+                                              'played_at_ms': played_at}).json()['saved']
+
+        assert write(prepared, 999)
+        assert client.delete(history).json()['cleared']
+        assert not write(prepared, 999) and not write(prepared, 1000)
+        assert client.get(history).json()['items'] == []
+        assert write(prepared, 1001)  # Prepared earlier, but actually started after Clear.
+        newer = client.post(play).json()['history_generation']
+        assert newer != prepared and write(newer, 1001)
+        assert client.post('/api/restore', json={}).status_code == 400 and write(newer, 1001)
+        assert client.post('/api/restore', json=empty).json()['restored']
+        assert not write(prepared, 2000) and not write(newer, 2000)
+        assert client.get(history).json()['items'] == []
+        fresh = client.post(play).json()['history_generation']
+        assert write(fresh, 2000)
+        assert [item['id'] for item in client.get(history).json()['items']] == [clip]
+
+
 @pytest.mark.parametrize('url', [
     'http://upos-sz.bilivideo.com/video.mp4', 'https://evil.example/video.mp4',
     'https://evilbilivideo.com/video.mp4', 'https://upos.bilivideo.com.evil.example/video.mp4',

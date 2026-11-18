@@ -215,12 +215,16 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     pass('Changed playlist name/order guards close and reload; search and undo-to-original stay clean, and explicit discard preserves the stored playlist');
 
     await page.locator('#playlist-edit').click();await editor.waitFor({state:'visible'});
-    const target = '**/api/playlists/'+savedId;
+    const target = url => url.pathname==='/api/playlists/'+savedId;
     let releaseSave, announceSave;
     const hold = new Promise(resolve=>{releaseSave=resolve;});
     const submitted = new Promise(resolve=>{announceSave=resolve;});
     await page.route(target, async route=>{
-      if(route.request().method()==='PATCH'){announceSave();await hold;}
+      if(route.request().method()==='PATCH'){
+        assert.equal(new URL(route.request().url()).searchParams.get('summary'),'true');
+        assert.deepEqual(route.request().postDataJSON(),{name:'第一版'});
+        announceSave();await hold;
+      }
       await route.continue();
     });
     try {

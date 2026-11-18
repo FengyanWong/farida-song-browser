@@ -101,6 +101,48 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     });
     await page.goto(base+'/#catalog');await page.locator('#clip-rows tr').first().waitFor();
     assert.equal(await page.locator('nav [data-view]').count(),2);
+    const historyPath='/api/listening-history', recent=await context.newPage();
+    const localQueue=(await api('/api/play-queue')).items.slice(0,2);
+    let preparedGeneration=0;
+    try {
+      await recent.route(url=>url.pathname==='/api/play-queue',r=>r.fulfill({json:{items:[localQueue[0]]}}));
+      await recent.route(url=>/^\/api\/clips\/[^/]+\/play$/.test(url.pathname),r=>r.fulfill({
+        json:{history_generation:preparedGeneration,quality:64,segments:[{url:'/api/playback/media/history-clear-qa'}]}
+      }));
+      await api(historyPath,'POST',{clip_id:localQueue[1].id});
+      await recent.goto(base);
+      for (const view of [page,recent]) {
+        await view.locator('#listening-history-open').click();await view.locator('.history-play').first().waitFor();
+      }
+      await page.locator('#listening-history-clear').click();await page.locator('#listening-history-empty').waitFor();preparedGeneration++;
+      await until(async()=>await recent.locator('.history-play').count()===0);
+      await recent.locator('#listening-history-dialog .close-dialog').first().click();
+      await api(historyPath,'POST',{clip_id:localQueue[1].id});
+      await page.locator('#listening-history-refresh').click();await page.locator('.history-play').first().waitFor();
+      let releaseHistory, captured;
+      const gate=new Promise(resolve=>{releaseHistory=resolve;});
+      const held=new Promise(resolve=>{captured=resolve;});
+      await recent.route(url=>url.pathname===historyPath,async route=>{
+        if(route.request().method()!=='POST')return route.fallback();
+        captured(route.request().postDataJSON());await gate;await route.continue();
+      },{times:1});
+      await recent.locator('#play-all').click();
+      const oldEvent=await held;assert.equal(oldEvent.history_generation,1);assert.ok(Number.isFinite(oldEvent.played_at_ms));
+      await recent.locator('#song-video').evaluate(video=>video.pause());
+      await page.locator('#listening-history-clear').click();await page.locator('#listening-history-empty').waitFor();preparedGeneration++;
+      const isPlayWrite=reply=>new URL(reply.url()).pathname===historyPath && reply.request().method()==='POST';
+      const delayed=recent.waitForResponse(isPlayWrite);
+      releaseHistory();assert.equal((await(await delayed).json()).saved,false);
+      assert.equal((await api(historyPath)).items.length,0);
+      const replay=recent.waitForResponse(isPlayWrite);
+      await recent.locator('#player-queue [data-queue-index="0"]').click();
+      assert.equal((await(await replay).json()).saved,true);
+      assert.deepEqual((await api(historyPath)).items.map(item=>item.id),[localQueue[0].id]);
+      await recent.locator('#player-close').click();
+      await page.locator('#listening-history-dialog .close-dialog').first().click();
+      await api(historyPath,'DELETE');
+    } finally {await recent.close();}
+    pass('Clearing history invalidates the other tab, suppresses delayed pre-clear playing events, and records a genuine new replay');
     // Hold replies after the server has processed them to control their arrival order.
     async function holdDetailReply(id, action='') {
       let release, started;

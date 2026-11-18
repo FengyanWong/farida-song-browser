@@ -6,6 +6,7 @@ import json
 import secrets
 import sqlite3
 import tempfile
+import time
 import webbrowser
 from contextlib import ExitStack, asynccontextmanager
 from datetime import date
@@ -24,7 +25,7 @@ from .config import Settings
 from . import __version__
 from .resources import resource_root
 from .auth import BilibiliLogin
-from .db import Database, PLAYER_STATE_SQL, PlaylistConflict
+from .db import Database, PLAYER_STATE_SQL, PlaylistConflict, SourceConflict
 from .sync import Collector
 from .lifetime import WindowLifetime
 from .playback import Playback
@@ -74,7 +75,15 @@ class SourceCreate(Model):
     singing_collection: bool = False
 
 
+class SourceExpected(Model):
+    canonical_url: str = Field(min_length=1, max_length=1000)
+    display_name: str | None = Field(default=None, max_length=120)
+    enabled: bool | None = None
+    singing_collection: bool | None = None
+
+
 class SourceUpdate(Model):
+    expected: SourceExpected | None = None
     display_name: str | None = Field(default=None,min_length=1,max_length=120)
     url: str | None = Field(default=None,min_length=1,max_length=1000)
     enabled: bool | None = None
@@ -131,6 +140,8 @@ class PlayerPreferences(Model):
 
 class ListeningEvent(Model):
     clip_id: str = Field(min_length=1, max_length=100)
+    history_generation: int | None = Field(default=None, ge=0, le=2**53-1)
+    played_at_ms: int | None = Field(default=None, ge=0, le=2**53-1)
 
 
 class SyncRequest(Model):
@@ -151,7 +162,12 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     # Active page IDs bound reordered unload writes and are revoked on restore.
     preference_writers = OrderedDict()
     preference_lock = Lock()
+    history_lock = Lock()
+    history_generation = restored_history_generation = 0
+    history_cleared_ms = -1
     startup_pending = scan_on_start
+    restore_tasks = set()
+    shutting_down = False
     lifetime = WindowLifetime(shutdown_callback, grace_seconds=window_grace_seconds,
                               startup_timeout=browser_start_timeout) if shutdown_callback and not preview_mode else None
 
@@ -181,6 +197,8 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
 
     @asynccontextmanager
     async def lifespan(app):
+        nonlocal shutting_down
+        shutting_down = False
         db.initialize()
         # Keep the UI available while validating a saved session. No source
         # request is made until login has been verified.
@@ -190,7 +208,7 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         try:
             yield
         finally:
-            await playback.clear()
+            shutting_down = True
             if lifetime:
                 await lifetime.close()
             startup.cancel()
@@ -198,6 +216,9 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
                 await startup
             except asyncio.CancelledError:
                 pass
+            if restore_tasks:
+                await asyncio.gather(*restore_tasks, return_exceptions=True)
+            await playback.clear()
             await collector.close()
             await login.close()
 
@@ -355,11 +376,24 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
 
     @app.post('/api/listening-history')
     def record_listening(body: ListeningEvent):
-        return db.record_listening(body.clip_id)
+        with history_lock:
+            prepared = body.history_generation
+            if prepared is not None:
+                if not restored_history_generation <= prepared <= history_generation:
+                    return {'saved': False}
+                if prepared != history_generation and (body.played_at_ms is None or body.played_at_ms <= history_cleared_ms):
+                    return {'saved': False}
+            elif body.played_at_ms is not None and body.played_at_ms <= history_cleared_ms:
+                return {'saved': False}
+            return db.record_listening(body.clip_id)
 
     @app.delete('/api/listening-history')
     def clear_listening_history():
-        db.execute('DELETE FROM listening_history')
+        nonlocal history_generation, history_cleared_ms
+        with history_lock:
+            db.execute('DELETE FROM listening_history')
+            history_cleared_ms = time.time_ns() // 1_000_000
+            history_generation += 1
         return {'cleared': True}
 
     @app.get('/api/playlists')
@@ -367,8 +401,8 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         return {'items': db.playlists()}
 
     @app.post('/api/playlists', status_code=201)
-    def create_playlist(body: PlaylistCreate):
-        return db.save_playlist(body.name, body.clip_ids)
+    def create_playlist(body: PlaylistCreate, summary: bool=False):
+        return db.save_playlist(body.name, body.clip_ids, summary=summary)
 
     @app.post('/api/playlists/resolve-links')
     def resolve_playlist_links(body: PlaylistLinks):
@@ -379,8 +413,8 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         return db.playlist(playlist_id)
 
     @app.patch('/api/playlists/{playlist_id}')
-    def edit_playlist(playlist_id: int, body: PlaylistUpdate, request: Request):
-        return db.save_playlist(body.name, body.clip_ids, playlist_id,
+    def edit_playlist(playlist_id: int, body: PlaylistUpdate, request: Request, summary: bool=False):
+        return db.save_playlist(body.name, body.clip_ids, playlist_id, summary=summary,
                                 expected_revision=request.headers.get('X-Farida-Playlist-Revision'))
 
     @app.delete('/api/playlists/{playlist_id}')
@@ -400,7 +434,8 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             clip = db.clip(clip_id)
             if not clip:
                 raise KeyError(clip_id)
-            return await playback.prepare(clip)
+            result = await playback.prepare(clip)
+            return {**result, 'history_generation': history_generation}
 
     @app.get('/api/playback/status/{key}')
     def playback_failure_status(key: str):
@@ -474,7 +509,11 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
     def update_source(source_id: int,body: SourceUpdate):
         if any(job["state"] in {"queued","running"} and source_id in job["source_ids"] for job in db.jobs()):
             raise HTTPException(409,"请先取消此来源的采集任务，再修改设置")
-        return db.update_source(source_id,body.model_dump(exclude_none=True))
+        try:
+            return db.update_source(source_id, body.model_dump(exclude_none=True))
+        except SourceConflict as error:
+            raise HTTPException(409, "此来源已在其他页面更改，请重新打开并核对最新设置。",
+                                headers={"X-Farida-Error": "source_conflict"}) from error
 
     @app.post("/api/sync",status_code=202)
     async def sync(body: SyncRequest):
@@ -643,9 +682,13 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             return response
 
     def replace_and_revoke_writers(data):
-        with preference_lock:
+        nonlocal history_generation, restored_history_generation, history_cleared_ms
+        with preference_lock, history_lock:
             safety = restore_validated_backup(db, data)
             preference_writers.clear()
+            history_generation += 1
+            restored_history_generation = history_generation
+            history_cleared_ms = time.time_ns() // 1_000_000
             return safety
 
     async def install_backup(data):
@@ -656,6 +699,12 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             startup_pending = False
             await playback.clear()
             return safety
+
+    def restore_finished(task):
+        restore_tasks.discard(task)
+        if not task.cancelled():
+            # A disconnected requester may no longer be waiting to retrieve the exception.
+            task.exception()
 
     @app.post("/api/restore")
     async def restore(request: Request):
@@ -668,13 +717,14 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             data = await asyncio.to_thread(json.loads, raw)
             del raw
             data = await asyncio.to_thread(validate_backup, data)
-            # Once installation begins, finish the transaction even if the requesting tab closes.
+            if shutting_down:
+                raise HTTPException(503, "本机服务正在退出，未开始恢复。")
+            # Installation belongs to the app. Cancelling the HTTP request can stop
+            # waiting for its response, but lifespan must drain the disk work and cleanup.
             install = asyncio.create_task(install_backup(data))
-            try:
-                safety = await asyncio.shield(install)
-            except asyncio.CancelledError:
-                await install
-                raise
+            restore_tasks.add(install)
+            install.add_done_callback(restore_finished)
+            safety = await asyncio.shield(install)
             return {"restored": True, "safety_backup": safety}
         except OSError as error:
             raise HTTPException(507, "无法写入本机备份或数据库，请检查磁盘空间和写入权限。") from error

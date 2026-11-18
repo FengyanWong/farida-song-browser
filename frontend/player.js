@@ -107,6 +107,7 @@ export class PlaylistPlayer {
     });
     this.video.addEventListener('playing',()=>{
       if(!this.segments.length||this.loading||this.handlingFailure===this.generation)return;
+      if (this.logicalPlay) this.logicalPlay.playedAt ??= Date.now();
       this.status('正在播放');$('#player-resume').hidden=true;$('#player-toggle').textContent='暂停';this.recordHistory();
     });
     this.video.addEventListener('pause',()=>{if(this.segments.length&&!this.video.ended&&!this.loading&&this.handlingFailure!==this.generation&&!this.failed)this.status('已暂停');$('#player-toggle').textContent='播放';});
@@ -238,11 +239,13 @@ export class PlaylistPlayer {
   }
   async recordHistory() {
     const logical=this.logicalPlay;
-    if(this.persistenceSuspended||!logical||logical.recorded||logical.pending)return;
+    if(this.persistenceSuspended||!logical?.playedAt||logical.recorded||logical.pending)return;
     logical.pending=true;logical.recorded=true;
     try {
-      await this.api('/api/listening-history',{method:'POST',body:JSON.stringify({clip_id:logical.id})});
-      document.dispatchEvent(new Event('farida-history-change'));
+      // Capture playback time at the first playing event, even if restore defers this write.
+      const event={clip_id:logical.id,history_generation:logical.historyGeneration,played_at_ms:logical.playedAt};
+      const result=await this.api('/api/listening-history',{method:'POST',body:JSON.stringify(event)});
+      if (result.saved) document.dispatchEvent(new Event('farida-history-change'));
     } catch { /* A history write must not interrupt playback. */ }
     finally {logical.pending=false;}
   }
@@ -449,6 +452,7 @@ export class PlaylistPlayer {
       const result=await this.api(`/api/clips/${encodeURIComponent(clip.id)}/play`,{method:'POST',signal:this.abort.signal});
       if(generation!==this.generation)return;
       if(!result.segments?.length||result.segments.some(part=>!/^\/api\/playback\/media\/[A-Za-z0-9_-]+$/.test(part.url)))throw Object.assign(new Error('播放地址异常，请打开原视频。'),{category:'upstream'});
+      if (!this.logicalPlay.playedAt) this.logicalPlay.historyGeneration=result.history_generation;
       this.segments=result.segments;this.segment=Math.min(resume?.segment||0,this.segments.length-1);
       this.seekPosition=resume?.position||0;
       this.loadSegment(generation);
@@ -752,8 +756,10 @@ export class PlaylistPlayer {
     const ids=edit.items.map(item=>item.id), updating=!!edit.id && !asCopy;
     edit.saving=true;this.updateEditorActions();
     try {
-      const result=await this.api('/api/playlists'+(updating?'/'+edit.id:''),{
-        method:updating?'PATCH':'POST',headers:updating?this.revisionHeaders(edit):{},body:JSON.stringify({name,clip_ids:ids})});
+      const data={name};
+      if (!updating || ids.length!==edit.savedIds.length || ids.some((id,index)=>id!==edit.savedIds[index])) data.clip_ids=ids;
+      const result=await this.api('/api/playlists'+(updating?'/'+edit.id:'')+'?summary=true',{
+        method:updating?'PATCH':'POST',headers:updating?this.revisionHeaders(edit):{},body:JSON.stringify(data)});
       if (!this.currentEditor(edit)) {await this.refreshAfterPlaylistChange(edit);return;}
       edit.id=result.id;edit.revision=result.revision;edit.savedName=name;edit.savedIds=ids;edit.conflict=false;
       $('#playlist-error').textContent='';$('#playlist-dialog-title').textContent='编辑歌单';

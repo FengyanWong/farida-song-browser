@@ -63,7 +63,7 @@ py -3.12 -m venv .build-venv
 .\.build-venv\Scripts\python.exe -m pip install -r requirements-build.txt
 .\.build-venv\Scripts\python.exe -X utf8 scripts\build_windows.py
 .\.build-venv\Scripts\python.exe -X utf8 scripts\download_dependency_sources.py
-.\.build-venv\Scripts\python.exe -X utf8 scripts\smoke_exe.py release\FaridaSongBrowser-0.0.22-windows-x64.exe
+.\.build-venv\Scripts\python.exe -X utf8 scripts\smoke_exe.py release\FaridaSongBrowser-0.0.23-windows-x64.exe
 ```
 
 产物在 `release/`：单文件 EXE、ZIP、公开目录与链接清单、依赖源码包及 SHA-256 校验值。

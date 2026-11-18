@@ -70,7 +70,13 @@ async function quitApp() {
 }
 $$('[data-quit-app]').forEach(button=>button.onclick=quitApp);
 $('#shutdown-dialog').addEventListener('cancel',event=>event.preventDefault());
-document.addEventListener('farida-auth-change',()=>{renderJob();if(!accountLogin.canCollect())playlistPlayer.stop(accountLogin.loggingOut);else playlistPlayer.updateResumeButton();if(state.view==='sources')renderSources();});
+document.addEventListener('farida-auth-change',event=>{
+  renderJob();
+  if (event.detail?.switched) playlistPlayer.stop();
+  else if (!accountLogin.canCollect()) playlistPlayer.stop(accountLogin.loggingOut);
+  else playlistPlayer.updateResumeButton();
+  if(state.view==='sources')renderSources();
+});
 const searchLimitMessage = '搜索内容最多 2,048 个字符。请缩短分享文字或删除链接中的跟踪参数，并保留分 P 参数。';
 function parameters() {
   const query = $('#search').value;
@@ -702,7 +708,13 @@ document.addEventListener('click',async event=>{
     if(button.dataset.scanSource)await startSync('incremental',[Number(button.dataset.scanSource)]);
     if(button.dataset.fullSource)await startSync('full',[Number(button.dataset.fullSource)]);
     if(button.dataset.editSource)showSource(state.overview.sources.find(s=>s.id===Number(button.dataset.editSource)));
-    if(button.dataset.toggleSource){const source=state.overview.sources.find(s=>s.id===Number(button.dataset.toggleSource));await api('/api/sources/'+source.id,{method:'PATCH',body:JSON.stringify({enabled:!source.enabled})});await loadOverview();}
+    if(button.dataset.toggleSource){
+      const source=state.overview.sources.find(s=>s.id===Number(button.dataset.toggleSource));
+      const data={enabled:!source.enabled,expected:{canonical_url:source.canonical_url,enabled:!!source.enabled}};
+      try{await api('/api/sources/'+source.id,{method:'PATCH',body:JSON.stringify(data)});}
+      catch(error){if(error.category==='source_conflict')await loadOverview().catch(()=>{});throw error;}
+      await loadOverview();
+    }
   }catch(error){notice(error.message,true);toast(error.message);if(error.status===401)await accountLogin.requireLogin();}
 });
 document.addEventListener('submit',async event=>{
@@ -804,7 +816,16 @@ $('#source-form').onsubmit=async event=>{
   const {source}=draft;
   const data={display_name:$('#source-name').value.trim(),url:$('#source-url').value.trim(),singing_collection:$('#singing-collection').checked};
   if(!data.display_name && source)data.display_name=source.display_name;
-  if(source && data.url===source.canonical_url)delete data.url;
+  if(source){
+    const expected={canonical_url:source.canonical_url};
+    if(data.url===source.canonical_url)delete data.url;
+    if(data.display_name===source.display_name)delete data.display_name;
+    else expected.display_name=source.display_name;
+    if(data.singing_collection===!!source.singing_collection)delete data.singing_collection;
+    else expected.singing_collection=!!source.singing_collection;
+    if(!Object.keys(data).length){dialog.close();return;}
+    data.expected=expected;
+  }
   draft.saving=true;
   setSourceSaving(true);
   $('#source-form-error').textContent='';
@@ -812,8 +833,9 @@ $('#source-form').onsubmit=async event=>{
     await api('/api/sources'+(source?'/'+source.id:''),{method:source?'PATCH':'POST',body:JSON.stringify(data)});
     if(state.editSource===draft && dialog.open)dialog.close();
   }catch(error){
-    if(state.editSource===draft && dialog.open)$('#source-form-error').textContent=error.message;
+    if(state.editSource===draft && dialog.open)$('#source-form-error').textContent=error.message+(error.category==='source_conflict'?' 当前输入已保留。':'');
     else toast(error.message);
+    if(error.category==='source_conflict')await loadOverview().catch(()=>{});
     return;
   }finally{
     draft.saving=false;
@@ -830,9 +852,9 @@ async function poll() {
   polling = true;
   const previousOverview = state.overview;
   try {
-    await loadOverview();
-    if (document.hidden || state.stopping) return;
-    await accountLogin.refresh();
+    // Session state and catalogue statistics come from independent local endpoints.
+    const [overview]=await Promise.allSettled([loadOverview(),accountLogin.refresh()]);
+    if (overview.status==='rejected') throw overview.reason;
     if (document.hidden || state.stopping) return;
     if (!composingSearch) {
       if ((previousOverview !== state.overview || refreshOnReturn) && state.view === 'catalog') await loadClips();
@@ -916,6 +938,7 @@ $('#backup-file').onchange=async event=>{
     playlistPlayer.preferencesReady=false;
     clearTimeout(playlistPlayer.preferencesTimer);
     playlistPlayer.stop();
+    historyChannel?.postMessage('reset');
     alert('恢复完成。你可以在右上角的账号菜单下载上次恢复前的备份。');
     location.reload();
   } catch(error){
@@ -929,8 +952,20 @@ $('#backup-file').onchange=async event=>{
 };
 
 
-let listeningHistory=[],historyRequest=0;
+const historyDialog=$('#listening-history-dialog');
+let listeningHistory=[],historyRequest=0,historyClearing=false,historyChannel;
+try { historyChannel=new BroadcastChannel('farida-listening-history'); } catch {}
+function invalidateHistory() {
+  ++historyRequest;
+  listeningHistory=[];
+  $('#listening-history-list').replaceChildren();
+  $('#listening-history-empty').hidden=true;
+  $('#listening-history-clear').disabled=true;
+  $('#listening-history-count').textContent='正在读取最近播放…';
+  $('#listening-history-error').textContent='';
+}
 async function loadListeningHistory() {
+  if (!historyDialog.open || document.hidden || historyClearing) return;
   const request=++historyRequest;$('#listening-history-error').textContent='';
   try {
     const result=await api('/api/listening-history');if(request!==historyRequest)return;
@@ -941,7 +976,14 @@ async function loadListeningHistory() {
     $('#listening-history-count').textContent=`最近 ${listeningHistory.length} 首 · 仅保存在此电脑`;
   }catch(error){if(request===historyRequest)$('#listening-history-error').textContent=error.message;}
 }
-$('#listening-history-open').onclick=()=>{$('#listening-history-dialog').showModal();loadListeningHistory();};
+function reloadVisibleHistory() {
+  invalidateHistory();
+  loadListeningHistory();
+}
+$('#listening-history-open').onclick=()=>{historyDialog.showModal();reloadVisibleHistory();};
+historyDialog.addEventListener('close',()=>{if(!historyDialog.open)invalidateHistory();});
+document.addEventListener('visibilitychange',()=>{if(historyDialog.open)reloadVisibleHistory();});
+historyChannel?.addEventListener('message',event=>{if(event.data==='reset' && historyDialog.open)reloadVisibleHistory();});
 $('#listening-history-refresh').onclick=loadListeningHistory;
 $('#listening-history-list').onclick=event=>{
   const button=event.target.closest('[data-history-play]');if(!button||button.disabled)return;
@@ -950,8 +992,14 @@ $('#listening-history-list').onclick=event=>{
 };
 $('#listening-history-clear').onclick=async()=>{
   if(!confirm('清空最近播放记录？歌曲、歌单和收藏会保留。'))return;
-  $('#listening-history-clear').disabled=true;
-  try{await api('/api/listening-history',{method:'DELETE'});await loadListeningHistory();toast('最近播放记录已清空。');}
-  catch(error){$('#listening-history-error').textContent=error.message;$('#listening-history-clear').disabled=false;}
+  historyClearing=true;invalidateHistory();
+  let failure;
+  try {
+    await api('/api/listening-history',{method:'DELETE'});
+    historyChannel?.postMessage('reset');toast('最近播放记录已清空。');
+  } catch(error) { failure=error.message; }
+  finally { historyClearing=false; }
+  await loadListeningHistory();
+  if (failure && historyDialog.open) $('#listening-history-error').textContent=failure;
 };
 document.addEventListener('farida-history-change',()=>{if($('#listening-history-dialog').open)loadListeningHistory();});

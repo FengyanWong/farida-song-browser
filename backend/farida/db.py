@@ -230,6 +230,10 @@ def clip_order(sort):
     return columns[sort] + ", p.video_bvid, p.part_number"
 
 
+class SourceConflict(Exception):
+    """An editor's source or one of its changed settings has been replaced."""
+
+
 class PlaylistConflict(Exception):
     """The saved playlist changed or was deleted after an editor opened it."""
 
@@ -377,11 +381,15 @@ class Database:
     def update_source(self, source_id, patch):
         changes = dict(patch)
         url = changes.pop("url", None)
+        expected = changes.pop("expected", {})
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            current = con.execute("SELECT canonical_url,source_type,singing_collection FROM sources WHERE id=?", (source_id,)).fetchone()
+            current = con.execute("SELECT canonical_url,source_type,display_name,enabled,singing_collection FROM sources WHERE id=?",
+                                  (source_id,)).fetchone()
             if current is None:
                 raise KeyError(source_id)
+            if any(current[key] != value for key, value in expected.items()):
+                raise SourceConflict()
             if url is not None and url.strip() != current["canonical_url"]:
                 identity = parse_source(url)
                 if identity["canonical_url"] != current["canonical_url"]:
@@ -780,18 +788,22 @@ class Database:
             return self._read_playlist(con, playlist_id)
 
     @staticmethod
+    def _stored_playlist_revision(con, row):
+        ids = [item[0] for item in con.execute(
+            'SELECT clip_id FROM playlist_items WHERE playlist_id=? ORDER BY position,clip_id', (row['id'],))]
+        return playlist_revision(row, ids)
+
+    @staticmethod
     def _check_playlist_revision(con, playlist_id, expected_revision):
         if expected_revision is None:
             return
         row = con.execute('SELECT * FROM playlists WHERE id=?', (playlist_id,)).fetchone()
         if row is None:
             raise PlaylistConflict()
-        ids = [item[0] for item in con.execute(
-            'SELECT clip_id FROM playlist_items WHERE playlist_id=? ORDER BY position,clip_id', (playlist_id,))]
-        if playlist_revision(row, ids) != expected_revision:
+        if Database._stored_playlist_revision(con, row) != expected_revision:
             raise PlaylistConflict()
 
-    def save_playlist(self, name=None, clip_ids=None, playlist_id=None, *, expected_revision=None):
+    def save_playlist(self, name=None, clip_ids=None, playlist_id=None, *, expected_revision=None, summary=False):
         with self.connect() as con:
             con.execute('BEGIN IMMEDIATE')
             if playlist_id is not None:
@@ -830,7 +842,11 @@ class Database:
                     raise ValueError('歌单包含不存在的片段，请刷新列表。')
                 con.execute('DELETE FROM playlist_items WHERE playlist_id=?', (playlist_id,))
                 con.executemany('INSERT INTO playlist_items(playlist_id,clip_id,position) VALUES(?,?,?)',
-                                [(playlist_id, clip_id, position) for position, clip_id in enumerate(ids)])
+                                ((playlist_id, clip_id, position) for position, clip_id in enumerate(ids)))
+            if summary:
+                row = con.execute('SELECT * FROM playlists WHERE id=?', (playlist_id,)).fetchone()
+                revision = playlist_revision(row, ids) if clip_ids is not None else self._stored_playlist_revision(con, row)
+                return {'id': playlist_id, 'revision': revision}
             return self._read_playlist(con, playlist_id)
 
     def delete_playlist(self, playlist_id, *, expected_revision=None):

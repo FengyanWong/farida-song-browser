@@ -264,3 +264,31 @@ def test_pasted_part_uses_active_replacement_and_skips_unavailable(db, source, v
     db.execute('UPDATE videos SET availability_status=? WHERE bvid=?', ('unavailable', bvid))
     assert db.resolve_playlist_links([bvid, url]) == {
         'items': [], 'invalid': 0, 'duplicates': 0, 'missing': 0, 'unavailable': 2}
+
+
+def test_summary_playlist_saves_return_matching_revisions_without_reading_clip_details(settings, video, monkeypatch):
+    with TestClient(create_app(settings, scan_on_start=False)) as client:
+        db = client.app.state.db
+        db.save_video(db.source(1), video, [])
+        ids = [item["id"] for item in db.clips()["items"]]
+        client.headers["X-Farida-Token"] = client.get("/api/session").json()["token"]
+        # Summary writes must not construct the full playlist response inside the transaction.
+        with monkeypatch.context() as patch:
+            def unexpected(*args):
+                pytest.fail("summary save fetched full song metadata")
+            patch.setattr(Database, "_read_playlist", unexpected)
+            created = client.post("/api/playlists?summary=true", json={"name": "排序", "clip_ids": [*ids, ids[0]]})
+            assert created.status_code == 201
+            receipt = created.json()
+            assert set(receipt) == {"id", "revision"}
+            target = "/api/playlists/" + str(receipt["id"])
+            headers = {"X-Farida-Playlist-Revision": receipt["revision"]}
+            renamed = client.patch(target+"?summary=true", headers=headers, json={"name": "改名"}).json()
+            assert set(renamed) == {"id", "revision"} and renamed["revision"] != receipt["revision"]
+            assert client.patch(target+"?summary=true", headers=headers, json={"clip_ids": []}).status_code == 409
+        full = client.get(target).json()
+        assert full["name"] == "改名" and full["revision"] == renamed["revision"]
+        assert [item["id"] for item in full["items"]] == ids
+        reordered = client.patch(target+"?summary=true", json={"clip_ids": ids[::-1]}).json()
+        assert reordered["revision"] == client.get(target).json()["revision"]
+        assert [item["id"] for item in client.get(target).json()["items"]] == ids[::-1]

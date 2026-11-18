@@ -111,3 +111,38 @@ def test_retargeted_default_source_and_restored_source_list_survive_restart(sett
 
     with TestClient(create_app(settings, scan_on_start=False)) as restored:
         assert restored.get("/api/sources").json() == []
+
+
+def test_old_source_editor_cannot_undo_a_new_uid_or_clear_its_memberships(settings, video):
+    with TestClient(create_app(settings, scan_on_start=False)) as client:
+        db = client.app.state.db
+        client.headers["X-Farida-Token"] = client.get("/api/session").json()["token"]
+        old = db.source(1)
+        target = "/api/sources/1"
+        new = client.patch(target, json={"url": "UID: 123456789",
+                                          "expected": {"canonical_url": old["canonical_url"]}}).json()
+        video["owner"]["mid"] = int(new["uid"])
+        mark_verified(db, new, video)
+        current = db.source(1)
+        for changes in ({"display_name": "上一位 UP 主"}, {"url": "987654321"}, {"enabled": False}):
+            rejected = client.patch(target, json={**changes, "expected": {"canonical_url": old["canonical_url"]}})
+            assert rejected.status_code == 409 and rejected.headers["X-Farida-Error"] == "source_conflict"
+            assert db.source(1) == current
+        assert current["submissions"] == 1 and current["verified_uid"] == "123456789"
+
+
+def test_independent_source_edits_merge_while_competing_names_keep_the_first_save(settings):
+    with TestClient(create_app(settings, scan_on_start=False)) as client:
+        db = client.app.state.db
+        client.headers["X-Farida-Token"] = client.get("/api/session").json()["token"]
+        source = db.add_source("原名", "https://space.bilibili.com/123/lists/456?type=season")
+        target = "/api/sources/" + str(source["id"])
+        identity = {"canonical_url": source["canonical_url"]}
+        original_name = {**identity, "display_name": "原名"}
+        assert client.patch(target, json={"display_name": "新名", "expected": original_name}).status_code == 200
+        merged = client.patch(target, json={"singing_collection": True, "expected": {**identity, "singing_collection": False}})
+        assert merged.json()["display_name"] == "新名" and merged.json()["singing_collection"] == 1
+        assert client.patch(target, json={"display_name": "过时", "expected": original_name}).status_code == 409
+        assert db.source(source["id"])["display_name"] == "新名"
+        # Older clients do not send an editing baseline.
+        assert client.patch(target, json={"display_name": "传统客户端"}).json()["display_name"] == "传统客户端"

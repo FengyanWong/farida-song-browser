@@ -165,6 +165,34 @@ async function checkCoverRecovery(browser, base) {
     assert.equal(await saveSource.isEnabled(),true);assert.equal(await sourceUrl.inputValue(),'UID: 111333');
     await form.getByRole('button',{name:'取消'}).click();
     checks.push('A labelled full-width UID saves once; a delayed save leaves a second source draft intact and a failed save keeps it editable');
+    const secondTab=await page.context().newPage();
+    try{
+      const sourceCard=(tab,name)=>tab.locator('.source-card').filter({has:tab.getByRole('heading',{name,exact:true})});
+      const editor=tab=>tab.locator('#source-form'),save=tab=>editor(tab).locator('[type=submit]').click();
+      const oldName='延迟保存的来源',newName='另一页修改的名称';
+      await sourceCard(page,oldName).locator('[data-edit-source]').click();
+      await sourceUrl.fill('https://space.bilibili.com/123/lists/98765?type=season');
+      await save(page);await page.locator('#source-dialog').waitFor({state:'hidden'});
+      await secondTab.goto(new URL('/#sources',page.url()).href);
+      await sourceCard(page,oldName).locator('[data-edit-source]').click();
+      await sourceCard(secondTab,oldName).locator('[data-edit-source]').click();
+      await secondTab.locator('#source-name').fill(newName);await save(secondTab);
+      await secondTab.locator('#source-dialog').waitFor({state:'hidden'});
+      await singing.check();await save(page);await page.locator('#source-dialog').waitFor({state:'hidden'});
+      await sourceCard(page,newName).locator('[data-edit-source]').click();
+      assert.equal(await singing.isChecked(),true);
+      await sourceUrl.fill('UID: 987650001');
+      await sourceCard(secondTab,newName).locator('[data-edit-source]').click();
+      await secondTab.locator('#source-url').fill('UID: 987650002');await save(secondTab);
+      await secondTab.locator('#source-dialog').waitFor({state:'hidden'});
+      await save(page);await page.locator('#source-form-error').filter({hasText:/其他页面更改/}).waitFor();
+      assert.equal(await sourceUrl.inputValue(),'UID: 987650001');
+      await editor(page).getByRole('button',{name:'取消'}).click();
+      await sourceCard(page,newName).locator('[data-edit-source]').click();
+      assert.match(await sourceUrl.inputValue(),/987650002$/);
+      await editor(page).getByRole('button',{name:'取消'}).click();
+      checks.push('Two source editors merge name and singing-collection changes; a stale retarget keeps its draft and leaves the saved UID intact');
+    }finally{await secondTab.close();}
     await page.locator('#sync-button').click();await page.waitForTimeout(150);
     await page.locator('#job-banner').waitFor({state:'visible'});await page.locator('[data-cancel]').first().click();
     await page.waitForFunction(()=>/已取消|已完成/.test(document.querySelector('#job-history').textContent),{timeout:8000});
