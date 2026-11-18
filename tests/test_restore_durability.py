@@ -1,8 +1,6 @@
 import asyncio
 import json
 import sqlite3
-import threading
-from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -18,39 +16,28 @@ def test_edits_during_restore_remain_in_the_live_catalog(db, source, video, monk
     db.annotate([clip], {"notes": "in the supplied backup"})
     supplied = backup.export_backup(db)
     db.annotate([clip], {"notes": "before restore"})
-    snapshot_ready = threading.Event()
-    write_attempted = threading.Event()
+    save_recovery = backup._save_recovery
+    statements = []
 
-    def edit_from_another_connection():
-        assert snapshot_ready.wait(5)
-        with db.connect() as con:
-            # Force the first attempt to report immediately whether the writer lock is held.
-            con.execute("PRAGMA busy_timeout=0")
-            sql = "UPDATE user_state SET notes=? WHERE clip_id=?"
-            values = ("edited during restore", clip)
-            try:
-                con.execute(sql, values)
-            except sqlite3.OperationalError as error:
-                if "locked" not in str(error):
-                    raise
-                write_attempted.set()
-                con.execute("PRAGMA busy_timeout=5000")
-                con.execute(sql, values)
-            else:
-                write_attempted.set()
+    with db.connect() as editor:
+        editor.execute("PRAGMA busy_timeout=0")
 
-    dump = json.dump
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        edit = pool.submit(edit_from_another_connection)
+        def attempt_edit_after_copy(restore_connection, folder):
+            name = save_recovery(restore_connection, folder)
+            # A second SQLite connection must wait even though the copy is already complete.
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                editor.execute("BEGIN IMMEDIATE")
+            restore_connection.set_trace_callback(statements.append)
+            return name
 
-        def dump_and_edit(*args, **kwargs):
-            dump(*args, **kwargs)
-            snapshot_ready.set()
-            assert write_attempted.wait(3)
-
-        monkeypatch.setattr(backup.json, "dump", dump_and_edit)
+        monkeypatch.setattr(backup, "_save_recovery", attempt_edit_after_copy)
         recovery_name = backup.restore_backup(db, supplied)
-        edit.result(timeout=5)
+        assert db.clip(clip)["notes"] == "in the supplied backup"
+        # The traced connection performs the live replacement before its first commit.
+        assert "DELETE FROM user_state" in statements[:statements.index("COMMIT")]
+        assert statements[-1] == "COMMIT"
+        editor.execute("BEGIN IMMEDIATE")
+        editor.execute("UPDATE user_state SET notes=? WHERE clip_id=?", ("edited during restore", clip))
 
     recovery_file = db.path.parent / "backups" / recovery_name
     recovered = json.loads(recovery_file.read_text(encoding="utf-8"))

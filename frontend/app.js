@@ -35,7 +35,11 @@ async function api(path, {asBlob=false, ...options}={}) {
   return data;
 }
 function notice(message, error=false) { const el=$('#notice');el.textContent=message;el.hidden=!message;el.classList.toggle('error',error); }
-const accountLogin = new AccountLogin(api, async()=>{notice('');await refresh();});
+let initialViewReady = false;
+const accountLogin = new AccountLogin(api, async()=>{
+  notice('');
+  if(initialViewReady)await refresh();
+});
 const playlistPlayer = new PlaylistPlayer(api, parameters, selectedClips);
 const miniPlayer = new MiniPlayer(playlistPlayer);
 connectMediaControls(playlistPlayer);
@@ -78,12 +82,15 @@ function saveRoute() {
 function readRoute() {
   const [view,query]=location.hash.slice(1).split('?');
   const filter=({bookmarks:'bookmarked',review:'needs_review'})[view] || new URLSearchParams(query).get('filter');
-  state.filter=Object.hasOwn(clipFilters,filter)?filter:'included';
+  const nextFilter=Object.hasOwn(clipFilters,filter)?filter:'included';
+  if(nextFilter!==state.filter) {
+    state.filter=nextFilter;state.page=1;state.expandedGroups.clear();clearSelection();
+  }
   setView(view);
 }
 function setView(view) {
   if(!['catalog','sources'].includes(view))view='catalog';
-  state.view=view;state.page=1;clearSelection();
+  state.view=view;closePageJump();
   $$('.nav-item').forEach(el=>{el.classList.toggle('active',el.dataset.view===view);if(el.dataset.view===view)el.setAttribute('aria-current','page');else el.removeAttribute('aria-current');});
   const names={catalog:'片段收藏',sources:'采集来源'};
   $('#page-title').innerHTML=e(names[view])+'<span class="title-dot">.</span>';
@@ -114,16 +121,33 @@ async function loadOverview() {
   optionList('#uploader-filter',o.uploaders,s=>s.uid,s=>s.name,'全部 UP 主');
   renderJob();if(state.view==='sources')renderSources();
 }
+let displayedCatalogScope, catalogLoadError;
+function catalogScope(params) {
+  const scope=new URLSearchParams(params);
+  scope.delete('page');
+  return scope.toString();
+}
+function guardCatalogResults(scope) {
+  const stale=displayedCatalogScope!==undefined && displayedCatalogScope!==scope;
+  $('.table-scroll').inert=stale;
+  $('.table-footer').inert=stale;
+  $('#bulk-bar').inert=stale;
+  if (stale && state.selected.size) clearSelection();
+}
 async function loadClips() {
-  const request=++state.request;
+  const request=++state.request, params=parameters(), scope=catalogScope(params);
+  guardCatalogResults(scope);
   try {
-    const result=await api('/api/clips?'+parameters());
-    if(request!==state.request)return;
+    params.set('compact','true');
+    const result=await api('/api/clips?'+params);
+    if (request!==state.request || scope!==catalogScope(parameters())) return;
     const lastPage = Math.max(1, Math.ceil(result.total/state.pageSize));
     if (state.page > lastPage) {
       state.page = lastPage;
       if (result.total) return loadClips();
+      result.page=lastPage;
     }
+    displayedCatalogScope=scope;
     state.clips=result;
     if (state.selected.size) {
       result.items.forEach((clip, index) => {
@@ -131,7 +155,16 @@ async function loadClips() {
       });
     }
     renderClips();
-  } catch(error) {if(request===state.request)notice(error.message,true);}
+    guardCatalogResults(scope);
+    if (catalogLoadError && $('#notice').textContent===catalogLoadError) notice('');
+    catalogLoadError=null;
+  } catch(error) {
+    if (request!==state.request || scope!==catalogScope(parameters())) return;
+    // Relative navigation starts from the page that is still on screen after a failed request.
+    state.page=displayedCatalogScope===scope && state.clips ? state.clips.page : 1;
+    catalogLoadError=error.message;
+    notice(error.message,true);
+  }
 }
 function coverImage(raw) {
   let src='';
@@ -144,15 +177,45 @@ function coverImage(raw) {
       if((bili || demo) && !url.username && !url.password)src=url.href;
     } catch { /* Missing or malformed covers use the same quiet placeholder. */ }
   }
-  const available=src && !failedCovers.has(src);
-  const label=available?'视频封面':'暂无封面';
-  return `<span class="clip-cover" role="img" aria-label="${label}" title="${label}">${icon('music')}${available?`<img src="${e(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" width="104" height="59">`:''}</span>`;
+  if (src && failedCovers.has(src)) {
+    return `<button type="button" class="clip-cover" data-retry-cover="${e(src)}" aria-label="重新加载封面" title="封面暂时无法加载，点击重试">${icon('refresh')}</button>`;
+  }
+  const label=src?'视频封面':'暂无封面';
+  return `<span class="clip-cover" role="img" aria-label="${label}" title="${label}">${icon('music')}${src?`<img src="${e(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" width="104" height="59">`:''}</span>`;
 }
 document.addEventListener('error',event=>{
   if(!event.target.matches?.('.clip-cover img'))return;
-  const img=event.target,cover=img.parentElement;
-  failedCovers.add(img.src);cover.title='封面暂时无法加载';cover.setAttribute('aria-label','封面暂时无法加载');img.remove();
+  const img=event.target;
+  failedCovers.add(img.src);
+  img.parentElement.outerHTML=coverImage(img.src);
 },true);
+
+function retryCovers(src) {
+  if (src) failedCovers.delete(src);
+  else failedCovers.clear();
+  for (const cover of $$('#clip-rows [data-retry-cover]')) {
+    if (!src || cover.dataset.retryCover === src) {
+      // Other parts may share this artwork. Native lazy loading still applies.
+      if (cover === document.activeElement) {
+        cover.closest('tr')?.querySelector('a.row-title, [data-detail]')?.focus({preventScroll:true});
+      }
+      cover.outerHTML = coverImage(cover.dataset.retryCover);
+    }
+  }
+}
+$('#clip-rows').addEventListener('click', event => {
+  const cover = event.target.closest('[data-retry-cover]');
+  if (cover) retryCovers(cover.dataset.retryCover);
+});
+function retryCoversOnReconnect() {
+  if (!failedCovers.size || state.stopping || !navigator.onLine) return;
+  if (document.hidden) {
+    document.addEventListener('visibilitychange', retryCoversOnReconnect, {once:true});
+    return;
+  }
+  retryCovers();
+}
+window.addEventListener('online', retryCoversOnReconnect);
 function clipRow(clip) {
     const dates=dateTime(clip.published_at).split(' ');
     const target=clip.playback_url;
@@ -177,7 +240,12 @@ function renderClips() {
     $('#first-scan').hidden=!!(filtered||o.entries||state.filter!=='included');
   }
   $('#result-count').textContent=`${state.grouped?`${result.total.toLocaleString()} 首歌 · ${(result.total_clips??result.items.length).toLocaleString()} 个版本`:`${result.total.toLocaleString()} 个片段`}${result.total?` · 显示 ${(state.page-1)*state.pageSize+1}–${Math.min(state.page*state.pageSize,result.total)}`:''}`;
-  $('#page-number').textContent=`${state.page} / ${Math.max(1,Math.ceil(result.total/state.pageSize))}`;
+  const pages=Math.max(1,Math.ceil(result.total/state.pageSize));
+  $('#page-number').textContent=`${state.page} / ${pages}`;
+  $('#page-number').setAttribute('aria-label',`第 ${state.page} 页，共 ${pages} 页，跳到指定页`);
+  $('#page-number').disabled=pages===1;
+  $('#page-target').max=String(pages);
+  if(pages===1)closePageJump();
   $('#prev-page').disabled=state.page===1;$('#next-page').disabled=state.page*state.pageSize>=result.total;
   updateSelection();
 }
@@ -278,7 +346,7 @@ function updateSelection() {
   });
   $$('[data-select]').forEach(el=>el.checked=state.selected.has(el.dataset.select));
 }
-function filtersChanged() {clearTimeout(searchTimer);state.page=1;state.expandedGroups.clear();clearSelection();loadClips();}
+function filtersChanged() {clearTimeout(searchTimer);closePageJump();state.page=1;state.expandedGroups.clear();clearSelection();loadClips();}
 function showSource(source) {
   state.editSource=source || null;$('#source-name').value=source?.display_name || '';$('#source-url').value=source?.canonical_url || '';
   $('#singing-collection').checked=!!source?.singing_collection;$('#source-form-error').textContent='';$('#source-dialog-title').textContent=source?'编辑来源':'添加来源';$('#source-dialog').showModal();
@@ -316,7 +384,12 @@ document.addEventListener('click',async event=>{
       event.preventDefault();const result=await api(`/api/clips/${encodeURIComponent(button.dataset.open)}/open`,{method:'POST'});
       if(!result.opened)toast('无法启动默认浏览器，请使用原视频链接。',result.url);
     }
-    if(button.dataset.bookmark){const clip=state.clips.items.find(c=>c.id===button.dataset.bookmark);await api(`/api/clips/${encodeURIComponent(clip.id)}/bookmark`,{method:'PATCH',body:JSON.stringify({bookmarked:!clip.bookmarked})});await refresh();}
+    if(button.dataset.bookmark) {
+      const clip=state.clips.items.find(c=>c.id===button.dataset.bookmark);
+      await api(`/api/clips/${encodeURIComponent(clip.id)}/bookmark`,{method:'PATCH',body:JSON.stringify({bookmarked:!clip.bookmarked})});
+      if(clip.bookmarked && state.filter==='bookmarked')state.selected.delete(clip.id);
+      await refresh();
+    }
     if(button.dataset.detail)await showDetail(button.dataset.detail);
     if(button.dataset.classify){await api(`/api/clips/${encodeURIComponent(button.dataset.id)}/annotation`,{method:'PATCH',body:JSON.stringify({inclusion_status:button.dataset.classify})});$('#detail-dialog').close();clearSelection();await refresh();toast('已保存你的决定，后续采集会保留。');}
     if(button.dataset.bulk){
@@ -377,10 +450,47 @@ searchInput.addEventListener('compositionend', () => {
   scheduleSearch();
 });
 searchInput.addEventListener('input', event => {
+  guardCatalogResults(catalogScope(parameters()));
   if (!composingSearch && !event.isComposing) scheduleSearch();
 });
 ['#source-filter','#uploader-filter','#after','#before','#sort'].forEach(s=>$(s).onchange=filtersChanged);
-$('#prev-page').onclick=()=>{state.page--;loadClips();};$('#next-page').onclick=()=>{state.page++;loadClips();};
+function closePageJump(focus=false) {
+  $('#page-jump').hidden=true;
+  $('#page-controls').hidden=false;
+  if(focus)$('#page-number').focus({preventScroll:true});
+}
+async function goToPage(page) {
+  if(!Number.isInteger(page) || page===state.page || page<1 || page>Number($('#page-target').max))return;
+  const control=document.activeElement;
+  state.page=page;
+  await loadClips();
+  if(state.view==='catalog' && state.page===page && state.clips?.page===page && document.activeElement===control) {
+    const first=$('#clip-rows input[type=checkbox]');
+    if(first) {
+      first.focus({preventScroll:true});
+      $('.table-scroll').scrollIntoView({block:'start',behavior:'instant'});
+    }
+  }
+}
+$('#prev-page').onclick=()=>goToPage(state.page-1);
+$('#next-page').onclick=()=>goToPage(state.page+1);
+$('#page-number').onclick=()=>{
+  $('#page-controls').hidden=true;
+  $('#page-jump').hidden=false;
+  const target=$('#page-target');
+  target.value=String(state.page);target.focus();target.select();
+};
+$('#page-jump').onsubmit=event=>{
+  event.preventDefault();
+  const target=$('#page-target').valueAsNumber;
+  closePageJump(true);goToPage(target);
+};
+$('#page-jump').onkeydown=event=>{
+  if(event.key==='Escape'){event.preventDefault();closePageJump(true);}
+};
+$('#page-jump').onfocusout=event=>{
+  if(!$('#page-jump').contains(event.relatedTarget))closePageJump();
+};
 $('#sync-button').onclick=()=>startSync();$('#first-scan').onclick=()=>startSync();$('#full-scan').onclick=()=>startSync('full');
 $('#export-button').onclick=()=>{const params=parameters();params.delete('page');params.delete('page_size');location.href='/api/export?'+params;};
 $('#add-source').onclick=()=>showSource();
@@ -415,7 +525,20 @@ async function poll() {
     schedulePoll(active ? 1500 : 10000);
   }
 }
-try {const session=await api('/api/session');state.token=session.token;state.preview=!!session.preview_mode;if(session.close_with_page)appLifetime.start(state.token);$('#preview-notice').hidden=!state.preview;$$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);accountLogin.initialize(state.preview);await loadOverview();await playlistPlayer.initialize();readRoute();}catch(error){notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);}
+try {
+  const session=await api('/api/session');
+  state.token=session.token;
+  state.preview=!!session.preview_mode;
+  if(session.close_with_page)appLifetime.start(state.token);
+  $('#preview-notice').hidden=!state.preview;
+  $$('[data-quit-app]').forEach(button=>button.hidden=!session.can_shutdown);
+  accountLogin.initialize(state.preview);
+  await Promise.all([loadOverview(), playlistPlayer.initialize()]);
+  readRoute();
+  initialViewReady=true;
+} catch(error) {
+  notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);
+}
 
 $('#backup-download').onclick=async()=>{
   try {

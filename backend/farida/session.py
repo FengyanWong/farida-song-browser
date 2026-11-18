@@ -73,7 +73,7 @@ class SessionStore:
                 return {'cookie': cookie, 'account': None}
             return {'cookie': '', 'account': None}
         except (OSError, ValueError, KeyError, TypeError):
-            raise SessionError('本地登录信息无法读取，请在采集来源中重新扫码登录。') from None
+            raise SessionError('未能读取本机保存的登录信息。') from None
 
     def cookie_header(self):
         return self.load()['cookie']

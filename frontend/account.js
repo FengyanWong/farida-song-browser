@@ -1,6 +1,6 @@
 import { $, $$, icon, toast } from './ui.js';
 
-const labels={checking:'正在验证登录',signed_out:'未登录',saved:'等待验证',connected:'已登录',expired:'登录已失效',unknown:'状态待检查',unavailable:'需要重新登录',preview:'演示模式'};
+const labels={checking:'正在验证登录',signed_out:'未登录',saved:'等待验证',connected:'已登录',expired:'登录已失效',unknown:'状态待检查',unavailable:'登录信息无法读取',preview:'演示模式'};
 const activeStates=new Set(['waiting','scanned']);
 
 export class AccountLogin {
@@ -86,12 +86,15 @@ export class AccountLogin {
       await this.changed();return;
     }
     this.showDialog();
-    if(['signed_out','expired','unavailable'].includes(auth.state)) {
+    if(['signed_out','expired'].includes(auth.state)) {
       if(!this.attempt)this.generate();
     }else{
       this.failure(auth.message||'暂时无法验证登录，请稍后重新检查。');
-      $('#login-title').textContent='需要验证登录';$('#login-check').hidden=!auth.stored;
-      $('#login-retry').textContent='重新扫码';
+      const unreadable=auth.state==='unavailable';
+      $('#login-title').textContent=unreadable?'读取已保存的登录':'需要验证登录';
+      $('#login-instructions').textContent=unreadable?'可以重试读取本机登录信息，也可以重新扫码。':'检查已保存的登录状态，验证成功后即可继续。';
+      $('#login-check').textContent=unreadable?'重试读取登录信息':'检查登录';
+      $('#login-check').hidden=!auth.stored;$('#login-retry').textContent='重新扫码';
     }
   }
   async accountAction(action) {
@@ -124,7 +127,7 @@ export class AccountLogin {
     if(this.stopped)return;
     ++this.generation;clearTimeout(this.timer);this.hideImage();
     const id=this.attempt;this.attempt=null;this.queue(()=>this.cancel(id));
-    if(!this.canCollect()){this.showDialog();this.generate();}
+    if(!this.canCollect())this.settle(this.auth);
   }
   generate() {
     if(this.stopped||this.preview)return;

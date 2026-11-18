@@ -142,13 +142,17 @@ PLAYER_STATE_SQL = """SELECT s.id, CASE WHEN p.id IS NULL THEN s.value
  ELSE json_patch(s.value,p.value) END AS value FROM playback_state s
  LEFT JOIN playback_progress p ON s.id=p.id WHERE s.id=1"""
 
-CLIP_SELECT = """SELECT p.*,(SELECT COUNT(*) FROM parts siblings WHERE siblings.video_bvid=p.video_bvid AND siblings.active=1) AS part_count,
- v.uploader_uid,v.uploader_name,v.raw_title,v.description,v.tags,
- v.thumbnail_url,v.published_at,v.availability_status,v.verification_status,v.statistics,
+# Both catalog views display the original upload, membership credit, and bookmark.
+CATALOG_COLUMNS = """(SELECT COUNT(*) FROM parts siblings
+ WHERE siblings.video_bvid=p.video_bvid AND siblings.active=1) AS part_count,
+ v.uploader_uid,v.uploader_name,v.raw_title,v.thumbnail_url,v.published_at,
+ a.display_song_title,a.song_group,a.inclusion_status,COALESCE(u.bookmarked,0) AS bookmarked,
+ EXISTS(SELECT 1 FROM curated_songs cs WHERE cs.bvid=v.bvid) AS has_curated_credit,""" + PLAYBACK_URL
+BROWSE_COLUMNS = "p.id,p.part_number,p.raw_part_title," + CATALOG_COLUMNS
+DETAIL_COLUMNS = """p.*,v.description,v.tags,v.availability_status,v.verification_status,v.statistics,
  v.stats_fetched_at,v.stats_scope,v.fetched_at,v.provenance,
- a.display_song_title,a.song_group,a.inclusion_status,a.classification_reason,a.classification_version,a.manual_fields,
- COALESCE(u.bookmarked,0) AS bookmarked,COALESCE(u.notes,'') AS notes,
- EXISTS(SELECT 1 FROM curated_songs cs WHERE cs.bvid=v.bvid) AS has_curated_credit,""" + PLAYBACK_URL + CLIP_FROM
+ a.classification_reason,a.classification_version,a.manual_fields,COALESCE(u.notes,'') AS notes,""" + CATALOG_COLUMNS
+CLIP_SELECT = "SELECT " + DETAIL_COLUMNS + CLIP_FROM
 
 
 def clip_order(sort):
@@ -414,15 +418,23 @@ class Database:
         row['songlist_url'] = SONGLIST_URL if row['has_curated_credit'] else ''
         return row
 
-    def clips(self, page=1, page_size=40, sort="newest", **filters):
-        where,args = self.filters(**filters)
+    def clips(self, page=1, page_size=40, sort="newest", *, compact=False, **filters):
+        where, args = self.filters(**filters)
         order = clip_order(sort)
+        columns = BROWSE_COLUMNS if compact else DETAIL_COLUMNS
         with self.connect() as con:
-            total = con.execute("SELECT COUNT(*) FROM (" + CLIP_SELECT + where + ")", args).fetchone()[0]
-            rows = con.execute(CLIP_SELECT + where + f" ORDER BY {order} LIMIT ? OFFSET ?", [*args,page_size,(page-1)*page_size]).fetchall()
-        return {"items": [self.clip_row(dict(row)) for row in rows], "total": total, "page": page, "page_size": page_size}
+            con.execute("BEGIN")
+            total = con.execute("SELECT COUNT(*)" + CLIP_FROM + where, args).fetchone()[0]
+            items = [dict(row) for row in con.execute(
+                "SELECT " + columns + CLIP_FROM + where + f" ORDER BY {order} LIMIT ? OFFSET ?",
+                [*args, page_size, (page - 1) * page_size],
+            )]
+        if not compact:
+            for item in items:
+                self.clip_row(item)
+        return {"items": items, "total": total, "page": page, "page_size": page_size}
 
-    def grouped_clips(self, page=1, page_size=40, sort="newest", **filters):
+    def grouped_clips(self, page=1, page_size=40, sort="newest", *, compact=False, **filters):
         """Page complete song groups, retaining every matching recording."""
         where, args = self.filters(**filters)
         order = clip_order(sort)
@@ -432,10 +444,11 @@ class Database:
         rank = (f"SELECT p.id, {group_key} AS group_key, "
                 f"ROW_NUMBER() OVER (ORDER BY {order}) AS ordinal"
                 + CLIP_FROM + where)
+        columns = BROWSE_COLUMNS if compact else DETAIL_COLUMNS
         page_query = ("WITH ranked AS (" + rank + "), selected AS ("
                       "SELECT group_key, MIN(ordinal) AS first_ordinal FROM ranked GROUP BY group_key "
                       "ORDER BY first_ordinal LIMIT ? OFFSET ?) "
-                      + CLIP_SELECT.replace("SELECT p.*", "SELECT ranked.group_key,p.*", 1)
+                      + "SELECT ranked.group_key," + columns + CLIP_FROM
                       + " JOIN ranked ON ranked.id=p.id JOIN selected ON selected.group_key=ranked.group_key"
                       + " ORDER BY selected.first_ordinal, ranked.ordinal")
         with self.connect() as con:
@@ -451,7 +464,7 @@ class Database:
                                             'count': 0, 'clip_ids': []})
             group['count'] += 1
             group['clip_ids'].append(item['id'])
-            items.append(self.clip_row(item))
+            items.append(item if compact else self.clip_row(item))
         return {'groups': list(groups.values()), 'items': items, 'total': counts['groups'],
                 'total_clips': counts['clips'], 'page': page, 'page_size': page_size}
 

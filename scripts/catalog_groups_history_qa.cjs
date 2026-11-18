@@ -122,6 +122,82 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await page.locator('#search').fill('');
     await until(async()=>await page.locator('#clip-rows [data-play]').count()===40);
     pass('Pasting a shared Bilibili link selects the saved clip and Copy Link returns its clean original URL');
+    await page.locator('#page-number').click();
+    const pageTarget=page.locator('#page-target');
+    assert.equal(await pageTarget.inputValue(),'1');
+    await pageTarget.fill('4');
+    await pageTarget.press('Enter');
+    assert.equal(await pageTarget.evaluate(el=>el.validity.rangeOverflow),true);
+    await pageTarget.press('Escape');
+    assert.equal(await page.locator('#page-number').evaluate(el=>el===document.activeElement),true);
+    await page.locator('#page-number').click();
+    await pageTarget.fill('3');
+    await pageTarget.press('Enter');
+    await until(async()=>await page.locator('#page-number').textContent()==='3 / 3');
+    assert.equal(await page.locator('#clip-rows [data-select]').first().evaluate(el=>el===document.activeElement),true);
+    await page.locator('#clip-rows [data-select]').first().check();
+    await page.locator('[data-view=sources]').click();
+    await page.locator('[data-view=catalog]').click();
+    await until(async()=>await page.locator('#page-number').textContent()==='3 / 3');
+    assert.equal(await page.locator('#clip-rows [data-select]').first().isChecked(),true);
+    await page.locator('#clear-selection').click();
+    await page.locator('#page-number').click();await pageTarget.fill('1');
+    await page.locator('#page-jump [type=submit]').click();
+    await until(async()=>await page.locator('#page-number').textContent()==='1 / 3');
+    pass('Direct page jump validates the number, supports keyboard or touch, and keeps the current page and selection across Sources');
+    const catalogPattern='**/api/clips?**';
+    const onPage=number=>until(async()=>await page.locator('#page-number').textContent()===number+' / 3');
+    // Hold exactly one request while allowing subsequent navigation to finish.
+    async function holdCatalogResponse(matches) {
+      let signal, release;
+      const started=new Promise(resolve=>{signal=resolve;});
+      const held=new Promise(resolve=>{release=resolve;});
+      let captured=false;
+      const handler=async route=>{
+        const params=new URL(route.request().url()).searchParams;
+        if (!captured && matches(params)) {captured=true;signal();await held;}
+        await route.continue();
+      };
+      await page.route(catalogPattern,handler);
+      return {started, async finish(){
+        const response=page.waitForResponse(res=>{
+          const url=new URL(res.url());
+          return url.pathname==='/api/clips' && matches(url.searchParams);
+        });
+        release();await (await response).finished();await page.unroute(catalogPattern,handler);
+      }};
+    }
+    await page.route(catalogPattern,route=>route.fulfill({status:503,json:{detail:'分页读取失败测试'}}),{times:1});
+    await page.locator('#next-page').click();await until(async()=>await page.locator('#notice').textContent()==='分页读取失败测试');
+    await onPage(1);await page.locator('#next-page').click();await onPage(2);
+    assert.ok(await page.locator('#notice').isHidden());
+    await page.locator('#prev-page').click();await onPage(1);
+    const delayedPage=await holdCatalogResponse(params=>params.get('page')==='2');
+    await page.locator('#next-page').click();await delayedPage.started;
+    await page.locator('#next-page').click();await onPage(3);
+    const page3First=await page.locator('[data-select]').first().getAttribute('data-select');
+    await delayedPage.finish();await onPage(3);
+    assert.equal(await page.locator('[data-select]').first().getAttribute('data-select'),page3First);
+    pass('Retrying a failed Next loads the missing page; two rapid clicks still reach page three when page two arrives last');
+
+    const delayedFilter=await holdCatalogResponse(params=>params.get('bookmarked')==='true');
+    await page.locator('#clip-filter').selectOption('bookmarked');await delayedFilter.started;
+    const oldBox=page.locator('[data-select]').first();
+    await oldBox.scrollIntoViewIfNeeded();
+    const rect=await oldBox.boundingBox();
+    await page.mouse.click(rect.x+rect.width/2,rect.y+rect.height/2);
+    assert.equal(await oldBox.isChecked(),false);
+    await delayedFilter.finish();await until(async()=>await page.locator('#clip-rows tr').count()===0);
+    assert.equal(await page.locator('#bulk-bar').isVisible(),false);
+    await page.locator('#clip-filter').selectOption('included');await onPage(1);
+    await page.locator('[data-view=sources]').click();
+    const sameFilter=await holdCatalogResponse(params=>params.get('page')==='1');
+    await page.locator('[data-view=catalog]').click();await sameFilter.started;
+    await page.locator('[data-select]').first().check();await sameFilter.finish();
+    assert.equal(await page.locator('[data-select]').first().isChecked(),true);
+    await page.locator('#clear-selection').click();
+    pass('Pending filters reject clicks on obsolete rows; refreshing the same filter preserves the ability to select songs');
+
     // Pick in reverse page order. Playback and the saved playlist follow catalog order.
     await page.locator('#next-page').click();
     await until(async()=>await page.locator('#page-number').textContent()==='2 / 3');

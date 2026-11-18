@@ -29,11 +29,12 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.ok(Object.hasOwn(all[0],'raw_part_title'),'Queue must include original part title');
     const fixtures=all.slice(0,6).map((clip,index)=>({...clip,display_song_title:['第一首','月亮 Café','第三首','第四首','月亮之上','<夜色> ＭＯＯＮ'][index],uploader_name:index===4?'阿见':'CLANNADOR',raw_title:index===3?'隐藏标题 古典 2026':'原始标题 '+index,raw_part_title:index===2?'独特分P名称':'分P '+index}));
     const fixtureById=new Map(fixtures.map(item=>[item.id,item]));
+    let useFullQueue=false;
     await context.route('**/*',async route=>{
       const url=new URL(route.request().url());
       if(url.origin!==base)return route.abort();
       if(url.pathname.startsWith('/api/auth'))return route.fulfill({json:{state:'connected',stored:true,account:{uid:'123',name:'歌单搜索测试'},message:''}});
-      if(url.pathname==='/api/play-queue')return route.fulfill({json:{items:fixtures}});
+      if(url.pathname==='/api/play-queue')return route.fulfill({json:{items:useFullQueue?all:fixtures}});
       if(/^\/api\/playlists\/\d+$/.test(url.pathname)&&route.request().method()==='GET'){
         const response=await route.fetch(),result=await response.json();
         result.items=result.items.map(item=>({...item,...fixtureById.get(item.id),playback_url:item.id===fixtures[2].id?null:item.playback_url}));return route.fulfill({response,json:result});
@@ -57,6 +58,17 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.equal(await page.locator('#player-queue button').count(),2);
     assert.equal(await page.locator('#player-queue-count').textContent(),'2 / 6 首');
     assert.deepEqual(await page.locator('#player-queue button').evaluateAll(rows=>rows.map(row=>row.dataset.queueIndex)),['1','4']);
+    const focusedQueueIndex=()=>page.evaluate(()=>document.activeElement.dataset.queueIndex);
+    await page.locator('#player-queue-clear').focus();await page.keyboard.press('Tab');
+    assert.equal(await focusedQueueIndex(),'1');
+    await page.keyboard.press('ArrowDown');assert.equal(await focusedQueueIndex(),'4');
+    await page.keyboard.press('Home');assert.equal(await focusedQueueIndex(),'1');
+    await page.keyboard.press('End');assert.equal(await focusedQueueIndex(),'4');
+    await page.keyboard.press('ArrowUp');assert.equal(await focusedQueueIndex(),'1');
+    assert.equal(plays.length,1);
+    await page.keyboard.press('Enter');await until(()=>plays.at(-1)===fixtures[1].id);
+    assert.equal(await page.locator('#player-queue [aria-current]').getAttribute('data-queue-index'),'1');
+    pass('Arrow keys, Home and End browse filtered songs by original index; Enter alone starts the focused song');
     await page.locator('#player-queue-search').fill('clannador ＣＡＦＥ́');
     assert.equal(await page.locator('#player-queue button').count(),1);
     assert.equal(await page.locator('#player-queue button').getAttribute('data-queue-index'),'1');
@@ -93,7 +105,9 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.equal(await page.locator('#playlist-dialog').isVisible(),true);
     await page.locator('#playlist-items [data-item="4"][data-move="-1"]').click();
     assert.equal(await page.locator('#playlist-items [data-item="3"][data-move="-1"]').count(),1);
+    assert.equal(await page.evaluate(()=>document.activeElement.matches('[data-item="3"][data-move="-1"]')),true);
     await page.locator('#playlist-items [data-remove="1"]').click();
+    assert.equal(await page.evaluate(()=>document.activeElement.matches('[data-remove="2"]')),true);
     assert.match(await page.locator('#playlist-item-count').textContent(),/^1 \/ 5 首/);
     const links=[fixtures[0],fixtures[4],fixtures[3],fixtures[5]].map(item=>item.playback_url).join('\n');
     await page.locator('#playlist-copy-links').click();
@@ -194,6 +208,21 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.equal((await(await fetch(base+'/api/playlists/'+savedId)).json()).name,'第二版');
     assert.equal(await unloadGuarded(),false);
     pass('Edits made while saving remain open for a second save; both submissions retain the same playlist ID');
+    useFullQueue=true;
+    await page.locator('#play-all').click();await until(async()=>await page.locator('#player-queue button').count()===all.length);
+    assert.ok(all.length>=1000);
+    assert.equal(await page.locator('#player-queue button[tabindex="0"]').count(),1);
+    await page.locator('#player-queue-search').focus();await page.keyboard.press('Tab');
+    assert.equal(await focusedQueueIndex(),'0');
+    await page.keyboard.press('End');assert.equal(await focusedQueueIndex(),String(all.length-1));
+    await page.keyboard.press('Tab');
+    assert.equal(await page.evaluate(()=>document.activeElement.closest('.player-controls')!==null),true);
+    await page.keyboard.press('Shift+Tab');assert.equal(await focusedQueueIndex(),String(all.length-1));
+    await page.keyboard.press('Space');await until(()=>plays.at(-1)===all[all.length-1].id);
+    assert.equal(await page.locator('#player-position').textContent(),all.length+' / '+all.length);
+    await page.locator('#player-queue-search').fill('no-match-for-keyboard-test-1234');
+    assert.equal(await page.locator('#player-queue button').count(),0);
+    pass('The full '+all.length+'-song queue uses one tab stop, Shift+Tab returns to the browsed song, and Space plays it');
     await page.close();await until(()=>service.exitCode!==null);assert.equal(service.exitCode,0);
     fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({checks,errors,output},null,2));
   }finally{await browser.close();if(service.exitCode===null)spawnSync('taskkill',['/PID',String(service.pid),'/T','/F'],{stdio:'ignore'});}

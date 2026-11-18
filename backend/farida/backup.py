@@ -5,6 +5,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from .db import Database, PLAYER_STATE_SQL, now
+from .player_state import PlayerState
 
 LEGACY_TABLES = ("sources", "videos", "parts", "memberships", "annotations", "curated_songs", "user_state", "playlists", "playlist_items", "playback_state")
 TABLES = LEGACY_TABLES + ("listening_history",)
@@ -58,12 +59,38 @@ def validate_backup(data):
         candidate = Database(Path(folder) / "validate.sqlite3")
         candidate.initialize()
         replace_tables(candidate, data)
-        # Exercise the JSON fields consumed by the UI before accepting a file.
-        candidate.overview()
-        candidate.clips(status="all", page_size=2147483647)
-        for row in candidate.playlists():
-            candidate.playlist(row["id"])
+        with candidate.connect() as con:
+            _validate_catalog_fields(con)
     return data
+
+
+def _validate_catalog_fields(con):
+    # Scan the stored fields directly, including videos with no active parts.
+    columns = {
+        "sources": {"required_tags": "array"},
+        "videos": {"tags": "array", "statistics": "object", "provenance": "object", "raw_metadata": "object"},
+        "annotations": {"manual_fields": "array"},
+    }
+
+    def json_type(field):
+        # json_valid rejects JSON5 syntax that Python and browsers cannot decode.
+        return f"CASE WHEN json_valid({field}) THEN json_type({field}) ELSE 'invalid' END"
+
+    for table, fields in columns.items():
+        conditions = [f"{json_type(field)} != '{kind}'" for field, kind in fields.items()]
+        if table == "sources":
+            # Preserve all legacy representations of an absent source error.
+            conditions.append(f"(COALESCE(last_error, '') != '' AND {json_type('last_error')} NOT IN ('object','null'))")
+        if con.execute(f"SELECT 1 FROM {table} WHERE " + " OR ".join(conditions) + " LIMIT 1").fetchone():
+            raise ValueError("备份中的来源、视频或片段元数据无效。")
+    # A playlist item can reference an existing part whose title annotation is missing.
+    # That item disappears from the playlist's display join despite passing the foreign keys.
+    if con.execute("SELECT 1 FROM playlist_items i LEFT JOIN annotations a ON a.clip_id=i.clip_id "
+                   "WHERE a.clip_id IS NULL LIMIT 1").fetchone():
+        raise ValueError("备份中的歌单包含缺少标题记录的片段。")
+    saved = con.execute("SELECT value FROM playback_state WHERE id=1").fetchone()
+    if saved is not None:
+        PlayerState.model_validate_json(saved["value"])
 
 
 def replace_tables(db, data):

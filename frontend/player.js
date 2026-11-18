@@ -58,7 +58,24 @@ export class PlaylistPlayer {
     $('#player-resume').onclick=()=>this.resume(this.generation);
     $('#player-toggle').onclick=()=>{if(this.failed){this.retry();return;}if(this.video.getAttribute('src'))this.video.paused?this.resume(this.generation):this.video.pause();};
     $('#player-compact').onclick=()=>this.setCompact(!this.compact);
-    $('#player-queue').onclick=event=>{
+    const queueList = $('#player-queue');
+    queueList.setAttribute('aria-keyshortcuts', 'ArrowUp ArrowDown Home End');
+    queueList.addEventListener('focusin', event => this.setQueueTabStop(event.target.closest('[data-queue-index]')));
+    queueList.onkeydown = event => {
+      const row = event.target.closest('[data-queue-index]')?.parentElement;
+      if (!row || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      let next;
+      switch (event.key) {
+        case 'ArrowUp': next = row.previousElementSibling; break;
+        case 'ArrowDown': next = row.nextElementSibling; break;
+        case 'Home': next = queueList.firstElementChild; break;
+        case 'End': next = queueList.lastElementChild; break;
+        default: return;
+      }
+      event.preventDefault();
+      next?.querySelector('button')?.focus();
+    };
+    queueList.onclick=event=>{
       const button=event.target.closest('[data-queue-index]');
       if(button)this.play(Number(button.dataset.queueIndex));
     };
@@ -144,10 +161,19 @@ export class PlaylistPlayer {
       return terms.every(term=>text.includes(term));
     });
   }
+  setQueueTabStop(button) {
+    if (this.queueTabStop === button) return;
+    if (this.queueTabStop) this.queueTabStop.tabIndex = -1;
+    if (button) button.tabIndex = 0;
+    this.queueTabStop = button;
+  }
   renderQueue() {
     const query=$('#player-queue-search').value,rows=this.matchingItems(this.queue,query);
     $('#player-queue-count').textContent=query.trim()?`${rows.length} / ${this.queue.length} 首`:`共 ${this.queue.length} 首`;
-    $('#player-queue').innerHTML=rows.length?rows.map(({item,index})=>`<li><button data-queue-index="${index}" ${index===this.index?'aria-current="true"':''} title="${e(item.raw_title||item.display_song_title)}"><span>${index+1}</span><b>${e(item.display_song_title)}</b><small>${e(item.uploader_name)}</small></button></li>`).join(''):'<li class="playlist-search-empty">没有匹配的歌曲</li>';
+    const list = $('#player-queue'), hadFocus = list.contains(document.activeElement);
+    list.innerHTML=rows.length?rows.map(({item,index})=>`<li><button tabindex="-1" data-queue-index="${index}" ${index===this.index?'aria-current="true"':''} title="${e(item.raw_title||item.display_song_title)}"><span>${index+1}</span><b>${e(item.display_song_title)}</b><small>${e(item.uploader_name)}</small></button></li>`).join(''):'<li class="playlist-search-empty">没有匹配的歌曲</li>';
+    this.setQueueTabStop(list.querySelector('[aria-current]') || list.querySelector('button'));
+    if (hadFocus) (this.queueTabStop || $('#player-queue-search')).focus();
   }
   status(message) {$('#player-status').textContent=message;}
   failure(message) {
@@ -202,7 +228,7 @@ export class PlaylistPlayer {
     finally {logical.pending=false;}
   }
   async initialize() {
-    await this.loadPlaylists();
+    const lists=this.loadPlaylists().catch(()=>toast('暂时无法读取本地歌单。刷新页面可重试。'));
     try {
       this.saved=await this.api('/api/player-state?compact=true');
       this.preferenceWriter=this.saved.preference_writer;this.preferenceSequence=0;
@@ -213,6 +239,7 @@ export class PlaylistPlayer {
       const clip=this.saved.items.find(item=>item.id===this.saved.current_id);
       if(clip){$('#player-remembered').textContent='继续播放：'+clip.display_song_title;$('#player-remembered').hidden=false;}
     } catch { /* Playback memory must not prevent opening the library. */ }
+    await lists;
   }
   modeButtons() {
     $('#player-shuffle').textContent=this.shuffle?'随机：开':'随机：关';
@@ -325,9 +352,13 @@ export class PlaylistPlayer {
     this.modeButtons();
     $('#player-retry').hidden=true;$('#player-resume').hidden=true;
     $$('#player-queue [aria-current]').forEach(button=>button.removeAttribute('aria-current'));
-    const selected=$(`[data-queue-index="${index}"]`,$('#player-queue'));
+    const list=$('#player-queue'), selected=$(`[data-queue-index="${index}"]`,list);
     selected?.setAttribute('aria-current','true');
-    if(selected){const list=$('#player-queue');list.scrollTop=selected.offsetTop-list.offsetTop-45;}
+    // When browsing with the keyboard, automatic playback keeps the focused row in view.
+    if (selected && !list.contains(document.activeElement)) {
+      this.setQueueTabStop(selected);
+      list.scrollTop=selected.offsetTop-list.offsetTop-45;
+    }
     this.status('正在读取视频…');
     try {
       const result=await this.api(`/api/clips/${encodeURIComponent(clip.id)}/play`,{method:'POST',signal:this.abort.signal});
@@ -469,13 +500,31 @@ export class PlaylistPlayer {
     $('#playlist-items').innerHTML=rows.length?rows.map(({item,index})=>`<li><button type="button" class="playlist-drag-handle" data-drag-index="${index}" aria-label="拖动调整 ${e(item.display_song_title)} 的顺序" title="拖动调整顺序">⠿</button><span>${index+1}</span><b title="${e(item.raw_title||item.display_song_title)}">${e(item.display_song_title)}${item.playback_url?'':' · 当前不可用'}<small>${e(item.uploader_name)}</small></b><button type="button" class="icon-button" data-move="-1" data-item="${index}" aria-label="上移 ${e(item.display_song_title)}" ${index===0?'disabled':''}>↑</button><button type="button" class="icon-button" data-move="1" data-item="${index}" aria-label="下移 ${e(item.display_song_title)}" ${index===items.length-1?'disabled':''}>↓</button><button type="button" class="icon-button" data-remove="${index}" aria-label="移除 ${e(item.display_song_title)}">${icon('x')}</button></li>`).join(''):`<li class="playlist-search-empty">${items.length?'没有匹配的歌曲':'在列表中勾选歌曲后加入歌单，或添加当前筛选结果。'}</li>`;
   }
   editItem(event) {
-    const button=event.target.closest('button');if(!button||button.disabled)return;
-    if(button.dataset.remove!==undefined)this.editing.items.splice(Number(button.dataset.remove),1);
-    if(button.dataset.move){
-      const from=Number(button.dataset.item),to=from+Number(button.dataset.move),items=this.editing.items;
-      if(to>=0&&to<items.length)[items[from],items[to]]=[items[to],items[from]];
+    const button=event.target.closest('button[data-move], button[data-remove]');
+    if (!button || button.disabled) return;
+    const list=$('#playlist-items'), items=this.editing.items;
+    const keepFocus=document.activeElement===button, scroll=list.scrollTop;
+    let targetSelector;
+    if (button.dataset.remove!==undefined) {
+      const index=Number(button.dataset.remove), row=button.closest('li');
+      const neighbor=row.nextElementSibling || row.previousElementSibling;
+      if (neighbor) {
+        const previousIndex=Number(neighbor.querySelector('[data-remove]').dataset.remove);
+        targetSelector=`[data-remove="${previousIndex > index ? previousIndex-1 : previousIndex}"]`;
+      }
+      items.splice(index,1);
+    } else {
+      const from=Number(button.dataset.item), to=from+Number(button.dataset.move);
+      [items[from],items[to]]=[items[to],items[from]];
+      const direction=(to===0 || to===items.length-1) ? -Number(button.dataset.move) : Number(button.dataset.move);
+      targetSelector=`[data-item="${to}"][data-move="${direction}"]`;
     }
-    const scroll=$('#playlist-items').scrollTop;this.renderEditing();$('#playlist-items').scrollTop=scroll;
+    this.renderEditing();
+    list.scrollTop=scroll;
+    if (keepFocus) {
+      const next=targetSelector && list.querySelector(targetSelector);
+      (next || $('#playlist-search')).focus({preventScroll:true});
+    }
   }
   async save() {
     const edit=this.editing,name=$('#playlist-name').value.trim();

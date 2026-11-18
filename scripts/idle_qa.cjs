@@ -29,12 +29,20 @@ async function until(test) {
     const page = await browser.newPage();
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     let overviews=0, clips=0, active=false;
+    let readLists=false,readPlayer=false,releaseLists;
+    const delayedLists=new Promise(resolve=>{releaseLists=resolve;});
     const overview = await (await fetch(base+'/api/overview?compact=true')).json();
     await page.route('**/*', async route => {
       const url=new URL(route.request().url());
       if (url.origin!==base) return route.abort();
       if (url.pathname.startsWith('/api/auth')) return route.fulfill({json:{state:'connected',stored:true,account:{uid:'1',name:'测试'}}});
       if (url.pathname==='/api/clips') clips++;
+      if (url.pathname==='/api/playlists' && !readLists) {
+        readLists=true;
+        await delayedLists;
+        return route.fulfill({status:503,json:{detail:'测试歌单暂时不可用'}});
+      }
+      if (url.pathname==='/api/player-state') readPlayer=true;
       if (url.pathname==='/api/overview') {
         assert.equal(url.searchParams.get('compact'),'true');overviews++;
         const jobs=active ? [{id:'local',state:'running',mode:'recent',processed:0,checkpoints:{},errors:[]}] : [];
@@ -42,7 +50,13 @@ async function until(test) {
       }
       return route.continue();
     });
-    await page.goto(base);
+    await page.goto(base+'/#sources',{waitUntil:'commit'});
+    try { await until(()=>readLists&&readPlayer&&overviews>0); }
+    finally { releaseLists(); }
+    await page.locator('#source-list .source-card').first().waitFor();
+    assert.equal(overviews,1);
+    assert.equal(clips,0);
+    await page.locator('[data-view=catalog]').click();
     await page.locator('#clip-rows tr').first().waitFor();
     await until(async()=>await page.locator('#pet-sprite').evaluate(el=>el.style.backgroundImage.includes('frida.webp')));
     await page.clock.install();

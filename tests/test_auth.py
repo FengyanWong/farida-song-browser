@@ -273,6 +273,33 @@ async def test_check_throttled_and_logout_disables_legacy_without_deleting_it(se
     await login.close()
 
 
+async def test_saved_session_read_can_be_retried_immediately_without_extra_requests(settings, monkeypatch):
+    store = SessionStore(settings)
+    store.save(COOKIE, ACCOUNT)
+    original = store.path.read_bytes()
+    read_bytes = type(store.path).read_bytes
+    def temporarily_locked(path):
+        if path == store.path:
+            raise PermissionError("synthetic sharing violation")
+        return read_bytes(path)
+
+    server = LoginServer()
+    with monkeypatch.context() as patch:
+        patch.setattr(type(store.path), "read_bytes", temporarily_locked)
+        login = server.login(settings)
+        assert login.status()["state"] == "unavailable"
+        for _ in range(2):
+            status = await login.check()
+            assert status["state"] == "unavailable" and status["stored"]
+        assert not server.calls
+    # The test clock hasn't advanced. Reading succeeds as soon as the file unlocks.
+    assert (await login.check())["state"] == "connected"
+    assert (await login.check())["state"] == "connected"
+    assert [request.url.path for request in server.calls] == ["/x/web-interface/nav"]
+    assert store.path.read_bytes() == original
+    await login.close()
+
+
 def test_corrupt_session_is_reported_without_contents(settings):
     store = SessionStore(settings)
     store.path.write_bytes(SECRET.encode())

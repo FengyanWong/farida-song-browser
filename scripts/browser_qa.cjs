@@ -4,6 +4,67 @@ const path=require('node:path');
 const assert=require('node:assert/strict');
 const { chromium }=require(process.argv[2] || process.env.FARIDA_PLAYWRIGHT_PATH || 'playwright');
 
+async function checkCoverRecovery(browser, base) {
+  const context = await browser.newContext({viewport:{width:1440,height:1000}});
+  const page = await context.newPage();
+  const automatic = 'https://i0.hdslb.com/qa/reconnect.jpg';
+  const manual = 'https://i0.hdslb.com/qa/manual.jpg';
+  const blocked = 'https://covers.invalid/never.jpg';
+  const permitted = new Set(), requests = new Map();
+  const art = fs.readFileSync(path.resolve('frontend/assets/demo-cover.svg'));
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  try {
+    await page.route('https://**/*', route => {
+      const url = route.request().url();
+      requests.set(url, (requests.get(url) || 0) + 1);
+      return permitted.has(url) ? route.fulfill({contentType:'image/svg+xml',body:art}) : route.abort('internetdisconnected');
+    });
+    await page.route(url => url.pathname === '/api/clips', async route => {
+      const response = await route.fetch(), result = await response.json();
+      const fixtures = {'BV0000000009:9':automatic,'BV0000000007:7':manual,'BV0000000006:6':blocked};
+      for (const item of result.items) if (fixtures[item.id]) item.thumbnail_url = fixtures[item.id];
+      await route.fulfill({response,json:result});
+    });
+    await page.goto(base);
+    const retry = page.getByRole('button',{name:'重新加载封面',exact:true});
+    await page.waitForFunction(() => document.querySelectorAll('[data-retry-cover]').length === 2);
+    assert.equal(requests.get(automatic),1);assert.equal(requests.get(manual),1);
+    // Two ordinary list redraws leave failures dormant.
+    await page.locator('#filter-button').click();
+    for (const value of ['oldest','newest']) {
+      const results = page.waitForResponse(r => new URL(r.url()).pathname === '/api/clips' && new URL(r.url()).searchParams.get('sort') === value);
+      await page.locator('#sort').selectOption(value);await results;
+      await page.waitForFunction(expected => {
+        const first = document.querySelector('#clip-rows input[data-select]');
+        return first?.dataset.select === expected && document.querySelectorAll('[data-retry-cover]').length === 2;
+      }, value === 'oldest' ? 'BV0000000001:1' : 'BV0000000009:9');
+    }
+    assert.equal(requests.get(automatic),1);assert.equal(requests.get(manual),1);
+    const selected = page.locator('[data-select="BV0000000009:9"]');
+    await selected.check();
+    await selected.evaluate(el => window.selectedBeforeCoverRetry = el);
+    permitted.add(automatic);
+    await context.setOffline(true);await page.waitForFunction(()=>!navigator.onLine);
+    await context.setOffline(false);
+    await page.waitForFunction(url => {
+      const image = Array.from(document.querySelectorAll('.clip-cover img')).find(img => img.src === url);
+      return image?.complete && image.naturalWidth > 0;
+    },automatic);
+    await page.waitForFunction(() => document.querySelectorAll('[data-retry-cover]').length === 1);
+    assert.equal(requests.get(automatic),2);assert.equal(requests.get(manual),2);
+    permitted.add(manual);
+    await retry.focus();await page.keyboard.press('Enter');
+    await page.waitForFunction(url => Array.from(document.querySelectorAll('.clip-cover img')).some(img => img.src === url && img.naturalWidth > 0),manual);
+    assert.equal(requests.get(manual),3);assert.equal(requests.get(automatic),2);
+    assert.equal(await selected.evaluate(el=>el.checked && el === window.selectedBeforeCoverRetry),true);
+    assert.equal(await page.locator('.clip-cover[aria-label="暂无封面"]').count(),2);
+    assert.equal(requests.has(blocked),false);assert.deepEqual(errors,[]);
+  } finally {
+    await context.close();
+  }
+}
+
 (async()=>{
   const output=path.resolve('.local/browser-qa');fs.mkdirSync(output,{recursive:true});
   const browser=await chromium.launch({channel:'msedge',headless:true});
@@ -23,6 +84,8 @@ const { chromium }=require(process.argv[2] || process.env.FARIDA_PLAYWRIGHT_PATH
     await page.waitForFunction(()=>[...document.querySelectorAll('.clip-cover img')].every(img=>img.complete&&img.naturalWidth>0));
     assert.equal(await page.locator('.clip-cover img').count(),8);
     assert.equal(await page.locator('.clip-cover[aria-label="暂无封面"]').count(),1);checks.push('Labeled preview, lazy cover thumbnails, missing-cover placeholder');
+    await checkCoverRecovery(browser, page.url());
+    checks.push('Failed covers stay dormant on redraw, recover on reconnect or keyboard retry, and preserve the selected row and missing-cover placeholders');
     const startupJobs=await page.evaluate(async()=>await(await fetch('/api/sync')).json());
     assert.equal(startupJobs.length,1);assert.equal(startupJobs[0].mode,'incremental');assert.equal(startupJobs[0].source_ids.length,6);
     await page.waitForFunction(async()=>{const jobs=await(await fetch('/api/sync')).json();return jobs[0].state==='completed';});
@@ -30,13 +93,13 @@ const { chromium }=require(process.argv[2] || process.env.FARIDA_PLAYWRIGHT_PATH
     await page.screenshot({path:path.join(output,'catalog-desktop.png'),fullPage:true});
     await page.locator('#search').fill('月亮');await page.waitForTimeout(500);
     assert.equal(await page.locator('#clip-rows tr').count(),1);checks.push('Chinese debounced search');
-    const openResponse=page.waitForResponse(r=>r.url().includes('/open')&&r.request().method()==='POST');
-    await page.locator('.row-title').click();const opened=await (await openResponse).json();
-    assert.equal(opened.url,'https://www.bilibili.com/video/BV0000000001/?p=1');checks.push('Title dispatches verified part URL to system-browser endpoint');
     await page.locator('[data-bookmark]').click();await page.waitForTimeout(300);
     await page.locator('#clip-filter').selectOption('bookmarked');await page.waitForTimeout(300);
     assert.equal(await page.locator('#clip-rows tr').count(),1);checks.push('Bookmark filter within clips tab');
     await page.locator('[data-detail]').click();await page.locator('#detail-dialog').waitFor({state:'visible'});
+    const openResponse=page.waitForResponse(r=>r.url().includes('/open')&&r.request().method()==='POST');
+    await page.locator('#detail-content [data-open]').click();const opened=await (await openResponse).json();
+    assert.equal(opened.url,'https://www.bilibili.com/video/BV0000000001/?p=1');checks.push('Open original dispatches the verified part URL to the system-browser endpoint');
     assert.equal(await page.locator('#detail-content a[href="https://fareeda.songlist.cc/"]').textContent(),'CLANNADOR · 小法的歌单 ↗');
     checks.push('Song-list attribution and original-site link in clip details');
     await page.getByText('修改歌名、分组与备注',{exact:true}).click();

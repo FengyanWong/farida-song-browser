@@ -27,6 +27,7 @@ from .db import Database, PLAYER_STATE_SQL
 from .sync import Collector
 from .lifetime import WindowLifetime
 from .playback import Playback
+from .player_state import PlayerState
 from .backup import export_backup, restore_validated_backup, validate_backup, LIMIT
 
 
@@ -74,20 +75,6 @@ class PlaylistCreate(Model):
 class PlaylistUpdate(Model):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     clip_ids: list[str] | None = Field(default=None, max_length=20000)
-
-
-class PlayerState(Model):
-    clip_ids: list[str] = Field(default_factory=list, max_length=20000)
-    current_id: str | None = Field(default=None, max_length=100)
-    name: str = Field(default="播放队列", max_length=200)
-    position: float = Field(default=0, ge=0, le=86400, allow_inf_nan=False)
-    segment: int = Field(default=0, ge=0, le=99)
-    shuffle: bool = False
-    skip_unavailable: bool = False
-    repeat: Literal["off", "all", "one"] = "off"
-    volume: float = Field(default=1, ge=0, le=1, allow_inf_nan=False)
-    muted: bool = False
-    compact: bool = False
 
 
 class PlayerProgress(Model):
@@ -309,11 +296,11 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         return await login.logout()
 
     @app.get("/api/clips")
-    def clips(q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: date | None=None,before: date | None=None,bookmarked: bool=False,sort: CatalogSort="newest",page: int=1,page_size: int=40,grouped: bool=False):
+    def clips(q: str="",status: Literal["included","excluded","needs_review","all"]="included",source_id: int | None=None,uploader: str | None=None,after: date | None=None,before: date | None=None,bookmarked: bool=False,sort: CatalogSort="newest",page: int=1,page_size: int=40,grouped: bool=False,compact: bool=False):
         if page < 1 or not 1 <= page_size <= 100 or len(q)>500 or (after and before and after>before):
             raise ValueError("分页、日期范围或搜索参数无效")
         query = db.grouped_clips if grouped else db.clips
-        return query(q=q,status=status,source_id=source_id,uploader=uploader,after=after,before=before,bookmarked=bookmarked,sort=sort,page=page,page_size=page_size)
+        return query(q=q,status=status,source_id=source_id,uploader=uploader,after=after,before=before,bookmarked=bookmarked,sort=sort,page=page,page_size=page_size,compact=compact)
 
     @app.get('/api/play-queue')
     def play_queue(q: str='', status: Literal['included','excluded','needs_review','all']='included', source_id: int | None=None,
@@ -575,8 +562,6 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         try:
             data = json.loads(raw)
             del raw
-            for row in data.get("tables", {}).get("playback_state", []):
-                PlayerState.model_validate_json(row["value"])
             # Keep the current collection and playback active during the offline import check.
             data = await asyncio.to_thread(validate_backup, data)
             async with login.lock:

@@ -255,12 +255,13 @@ class BilibiliLogin:
         """Check while the caller holds lock, so starting a job cannot race logout."""
         if self.clock() - self.last_check < 30:
             return self.status()
-        self.last_check = self.clock()
         try:
             record = self.store.load()
         except SessionError as exc:
             self.account = {'state': 'unavailable', 'stored': True, 'account': None, 'message': str(exc)}
             return self.status()
+        # A failed local read makes no upstream request and can be retried immediately.
+        self.last_check = self.clock()
         if not record['cookie']:
             self.account = {'state': 'signed_out', 'stored': False, 'account': None, 'message': ''}
         else:
