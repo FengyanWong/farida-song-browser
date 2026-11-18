@@ -582,29 +582,49 @@ async function showDetail(id) {
   if (request!==detailRequest || state.stopping || document.querySelector('dialog[open]')) return;
   const el=$('#detail-content');
   const credit=clip.songlist_credits?.length?`<dt>歌单整理</dt><dd><a href="https://fareeda.songlist.cc/" target="_blank" rel="noopener noreferrer">CLANNADOR · 小法的歌单 ↗</a><br>${clip.songlist_credits.map(song=>`${e(song.song_title)}${song.original_artist?` · 原唱 ${e(song.original_artist)}`:''}`).join('<br>')}</dd>`:'';
-  el.innerHTML=`<div class="dialog-heading"><h2>片段详情</h2><button class="icon-button close-dialog" aria-label="关闭">${icon('x')}</button></div><h3 class="detail-title">${e(clip.display_song_title)}</h3><div class="detail-original">${e(clip.raw_title)}</div><dl class="detail-grid"><dt>UP 主</dt><dd>${e(clip.uploader_name)} · UID ${e(clip.uploader_uid)}</dd><dt>上传时间</dt><dd>${dateTime(clip.published_at)}（当前时区）</dd><dt>分 P 信息</dt><dd>P${clip.part_number} · ${e(clip.raw_part_title)} · CID ${e(clip.cid)}</dd><dt>判断依据</dt><dd data-detail-reason>${e(clip.classification_reason)}${clip.manual_fields.length?' · 含手动修正':''}</dd><dt>来源</dt><dd>${clip.sources.map(s=>e(s.display_name)).join('、')}</dd>${credit}</dl><div class="tag-list">${clip.tags.map(tag=>`<span class="badge">${e(tag)}</span>`).join('')}</div><div class="review-actions"><button class="button primary small" data-classify="included" data-id="${e(id)}">确认收录</button><button class="button secondary small" data-classify="excluded" data-id="${e(id)}">排除此片段</button><button class="button secondary small" data-classify="needs_review" data-id="${e(id)}">保留待确认</button>${clip.playback_url?`<a class="button secondary small" href="${e(clip.playback_url)}" data-open="${e(id)}" target="_blank" rel="noopener noreferrer">${icon('external')}打开原视频</a><button type="button" class="button secondary small" data-copy-url="${e(clip.playback_url)}">复制链接</button>`:''}</div><p id="detail-feedback" class="field-help" role="status" hidden></p><details><summary>修改歌名、分组与备注</summary><form id="annotation-form" data-id="${e(id)}"><label class="field">显示歌名<input name="display_song_title" required maxlength="500" value="${e(clip.display_song_title)}"></label><label class="field">歌曲分组<input name="song_group" maxlength="200" value="${e(clip.song_group)}" placeholder="用于归拢不同演唱版本"></label><label class="field">个人备注<input name="notes" maxlength="5000" value="${e(clip.notes)}"></label><button class="button primary small">保存修正</button></form></details><details><summary>原始描述与数据来源</summary><div class="detail-description">${e(clip.description || '暂无描述')}</div><p class="detail-stats">${Object.entries(clip.statistics).map(([key,v])=>`${({view:'播放',like:'点赞',coin:'投币',favorite:'收藏',share:'分享',reply:'评论',danmaku:'弹幕'})[key]}：${v==null?'未知':v.toLocaleString()}`).join(' · ')}<br>以上为整个原视频的统计，不是此分 P 的单独统计。<br>获取于 ${dateTime(clip.stats_fetched_at)} · ${e(clip.provenance.details)}</p></details>`;
+  el.innerHTML=`<div class="dialog-heading"><h2>片段详情</h2><button class="icon-button close-dialog" aria-label="关闭">${icon('x')}</button></div><h3 class="detail-title">${e(clip.display_song_title)}</h3><div class="detail-original">${e(clip.raw_title)}</div><dl class="detail-grid"><dt>UP 主</dt><dd>${e(clip.uploader_name)} · UID ${e(clip.uploader_uid)}</dd><dt>上传时间</dt><dd>${dateTime(clip.published_at)}（当前时区）</dd><dt>分 P 信息</dt><dd>P${clip.part_number} · ${e(clip.raw_part_title)} · CID ${e(clip.cid)}</dd><dt>判断依据</dt><dd data-detail-reason>${e(clip.classification_reason)}${clip.manual_fields.length?' · 含手动修正':''}</dd><dt>来源</dt><dd>${clip.sources.map(s=>e(s.display_name)).join('、')}</dd>${credit}</dl><div class="tag-list">${clip.tags.map(tag=>`<span class="badge">${e(tag)}</span>`).join('')}</div><div class="review-actions"><button class="button primary small" data-classify="included" data-id="${e(id)}">确认收录</button><button class="button secondary small" data-classify="excluded" data-id="${e(id)}">排除此片段</button><button class="button secondary small" data-classify="needs_review" data-id="${e(id)}">保留待确认</button>${clip.playback_url?`<a class="button secondary small" href="${e(clip.playback_url)}" data-open="${e(id)}" target="_blank" rel="noopener noreferrer">${icon('external')}打开原视频</a><button type="button" class="button secondary small" data-copy-url="${e(clip.playback_url)}">复制链接</button>`:''}</div><p id="detail-feedback" class="field-help" role="status" hidden></p><details><summary>修改歌名、分组与备注</summary><button type="button" class="text-button" id="detail-auto-title" ${clip.manual_fields.includes('display_song_title')?'':'hidden'}>使用自动歌名</button><form id="annotation-form" data-id="${e(id)}"><label class="field">显示歌名<input name="display_song_title" required maxlength="500" value="${e(clip.display_song_title)}"></label><label class="field">歌曲分组<input name="song_group" maxlength="200" value="${e(clip.song_group)}" placeholder="用于归拢不同演唱版本"></label><label class="field">个人备注<input name="notes" maxlength="5000" value="${e(clip.notes)}"></label><button class="button primary small">保存修正</button></form></details><details><summary>原始描述与数据来源</summary><div class="detail-description">${e(clip.description || '暂无描述')}</div><p class="detail-stats">${Object.entries(clip.statistics).map(([key,v])=>`${({view:'播放',like:'点赞',coin:'投币',favorite:'收藏',share:'分享',reply:'评论',danmaku:'弹幕'})[key]}：${v==null?'未知':v.toLocaleString()}`).join(' · ')}<br>以上为整个原视频的统计，不是此分 P 的单独统计。<br>获取于 ${dateTime(clip.stats_fetched_at)} · ${e(clip.provenance.details)}</p></details>`;
   const form=el.querySelector('#annotation-form');
   detailEditor={id,form,original:Object.fromEntries(new FormData(form)),saving:false};
   detailDialog.showModal();
 }
-async function saveAnnotation(editor, patch, message) {
+async function saveAnnotation(editor, patch, message, {automaticTitle=false}={}) {
   if (!editor || editor!==detailEditor || !detailDialog.open || editor.saving) return;
-  if (!Object.keys(patch).length) { detailDialog.close(); return; }
+  const titleInput=editor.form.elements.namedItem('display_song_title'), submittedTitle=titleInput.value;
+  if (automaticTitle) {
+    const prompt=submittedTitle===editor.original.display_song_title
+      ? '使用自动歌名？当前手动歌名将被替换，后续会随采集更新。'
+      : '显示歌名还有未保存的修改。放弃这些歌名修改并使用自动歌名？';
+    if (!confirm(prompt)) return;
+  } else if (!Object.keys(patch).length) { detailDialog.close(); return; }
   editor.saving=true;
-  const buttons=detailDialog.querySelectorAll('[data-classify], #annotation-form button');
+  const autoButton=$('#detail-auto-title');
+  const buttons=detailDialog.querySelectorAll('[data-classify], #annotation-form button, #detail-auto-title');
   buttons.forEach(button=>button.disabled=true);
   const feedback=$('#detail-feedback');
   feedback.hidden=true;
   try {
-    const clip=await api(`/api/clips/${encodeURIComponent(editor.id)}/annotation`,{method:'PATCH',body:JSON.stringify(patch)});
+    const path='/api/clips/'+encodeURIComponent(editor.id);
+    const clip=automaticTitle
+      ? await api(path+'/automatic-title',{method:'POST'})
+      : await api(path+'/annotation',{method:'PATCH',body:JSON.stringify(patch)});
     if (detailDialog.open && editor===detailEditor) {
       Object.assign(editor.original,patch);
+      if (automaticTitle) {
+        // Text inputs strip line breaks; an imported title containing one is still unedited.
+        const automaticValue=clip.display_song_title.replace(/[\r\n]/g,'');
+        editor.original.display_song_title=automaticValue;
+        if (titleInput.value===submittedTitle) titleInput.value=automaticValue;
+      }
       if (patch.inclusion_status) clearSelection();
-      if (Object.keys(annotationChanges(editor)).length) {
+      const hasDraft=Object.keys(annotationChanges(editor)).length>0;
+      if (automaticTitle || hasDraft) {
         // The user can keep typing during a save. Preserve edits newer than the submitted values.
         detailDialog.querySelector('.detail-title').textContent=clip.display_song_title;
         detailDialog.querySelector('[data-detail-reason]').textContent=clip.classification_reason+(clip.manual_fields.length?' · 含手动修正':'');
-        feedback.textContent='本次修改已保存。其他改动仍待保存。';feedback.hidden=false;
+        autoButton.hidden=!clip.manual_fields.includes('display_song_title');
+        if (automaticTitle && (document.activeElement===document.body || document.activeElement===autoButton)) titleInput.focus({preventScroll:true});
+        feedback.textContent=(automaticTitle?message:'本次修改已保存。')+(hasDraft?'其他改动仍待保存。':'');
+        feedback.hidden=false;
       } else {
         detailDialog.close();toast(message);
       }
@@ -648,6 +668,7 @@ document.addEventListener('click',async event=>{
     if(button.dataset.bookmark)await toggleBookmark(button);
     if(button.dataset.detail)await showDetail(button.dataset.detail);
     if(button.dataset.classify)await saveAnnotation(detailEditor,{inclusion_status:button.dataset.classify},'已保存你的决定，后续采集会保留。');
+    if(button.id==='detail-auto-title')await saveAnnotation(detailEditor,{},'已使用自动歌名。',{automaticTitle:true});
     if(button.dataset.bulk){
       const ids=[...state.selected.keys()];$$('[data-bulk]').forEach(el=>el.disabled=true);let saved=0;
       try {

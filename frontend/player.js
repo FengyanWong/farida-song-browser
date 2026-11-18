@@ -545,6 +545,8 @@ export class PlaylistPlayer {
     const edit=this.editing, busy=!!(edit.saving || edit.resolving);
     $('#playlist-import-text').readOnly=busy;
     $('#playlist-import-add').disabled=busy;
+    $('#playlist-add-results').disabled=busy;
+    $('#playlist-add-results').textContent=edit.resolving==='results'?'正在加入…':'加入当前筛选结果';
     $('#playlist-save-button').disabled=busy;
     $('#playlist-save-button').hidden=!!edit.conflict;
     $('#playlist-delete').hidden=!edit.id || !!edit.conflict;
@@ -576,7 +578,6 @@ export class PlaylistPlayer {
     $('#playlist-import').open=false;
     $('#playlist-import-text').value='';
     $('#playlist-import-status').textContent='';
-    $('#playlist-add-results').disabled=false;
     this.updateEditorActions();
     $('#playlist-search').value='';$('#playlist-search-clear').hidden=true;
     $('#playlist-name').value=this.editing.savedName;
@@ -604,7 +605,7 @@ export class PlaylistPlayer {
     if (links.length>maxPlaylistItems || links.some(line=>line.length>2048 && [...line].length>2048)) {
       status.textContent='每次最多添加 20,000 行，每行最多 2,048 个字符。';return;
     }
-    edit.resolving=true;
+    edit.resolving='links';
     this.updateEditorActions();
     status.textContent='正在查找本机片段…';
     try {
@@ -631,13 +632,18 @@ export class PlaylistPlayer {
   }
   async addResults() {
     const edit=this.editing;
+    if (!edit || edit.resolving || edit.saving) return;
+    edit.resolving='results';this.updateEditorActions();
+    if (!edit.conflict) $('#playlist-error').textContent='';
     try {
-      $('#playlist-add-results').disabled=true;
       const items=await this.results();
-      if(edit!==this.editing||!$('#playlist-dialog').open)return;
+      if (!this.currentEditor(edit)) return;
       this.addItems(items);this.renderEditing();
     } catch(error) {if(this.currentEditor(edit))$('#playlist-error').textContent=error.message;}
-    finally {if(this.currentEditor(edit))$('#playlist-add-results').disabled=false;}
+    finally {
+      edit.resolving=false;
+      if (this.currentEditor(edit)) this.updateEditorActions();
+    }
   }
   async copyPlaylistLinks() {
     const edit = this.editing;

@@ -93,3 +93,54 @@ async def test_invalid_upload_preserves_current_collection_and_playback(settings
             release.set()
             await asyncio.wait_for(app.state.collector.task, timeout=3)
             assert app.state.db.job(job["id"])["state"] == "completed"
+
+
+async def test_recovery_write_keeps_second_window_responsive(settings, monkeypatch):
+    from threading import Event
+
+    app = create_app(settings, scan_on_start=False, preview_mode=True)
+    writing, resume = Event(), Event()
+    original = backup._save_recovery
+
+    def wait_for_disk(con, folder):
+        writing.set()
+        if not resume.wait(3):
+            raise TimeoutError("The other page could not use the app during a restore")
+        return original(con, folder)
+
+    monkeypatch.setattr(backup, "_save_recovery", wait_for_disk)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://testserver") as client:
+            client.headers["X-Farida-Token"] = (await client.get("/api/session")).json()["token"]
+            saved = (await client.get("/api/backup")).content
+            restoring = asyncio.create_task(client.post("/api/restore", content=saved))
+            try:
+                assert await asyncio.to_thread(writing.wait, 3)
+                health = await asyncio.wait_for(client.get("/api/health"), timeout=2)
+                assert health.json()["status"] == "ok"
+                assert not restoring.done()
+            finally:
+                resume.set()
+                response = await restoring
+            assert response.status_code == 200
+
+
+async def test_failed_recovery_write_preserves_playback_and_reports_storage_failure(settings, monkeypatch):
+    def disk_full(_con, _folder):
+        raise OSError("simulated full disk")
+
+    monkeypatch.setattr(backup, "_save_recovery", disk_full)
+    app = create_app(settings, scan_on_start=False, preview_mode=True)
+    transport = httpx.ASGITransport(app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            client.headers["X-Farida-Token"] = (await client.get("/api/session")).json()["token"]
+            saved = (await client.get("/api/backup")).json()
+            playback = app.state.playback
+            generation = playback.generation
+            playback.leases["current"] = {"generation": generation}
+            response = await client.post("/api/restore", json=saved)
+            assert response.status_code == 507
+            assert "磁盘" in response.json()["detail"]
+            assert playback.generation == generation and "current" in playback.leases
+            assert (await client.get("/api/backup")).json()["tables"] == saved["tables"]

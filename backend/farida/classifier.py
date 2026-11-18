@@ -3,6 +3,7 @@ import unicodedata
 
 VERSION = "rules-4"
 SINGING_COLLECTION_TYPES = frozenset({"season", "series", "favorites"})
+QUOTED_SONG = re.compile(r"《([^》]{1,120})》")
 
 
 def normalize(value: str) -> str:
@@ -18,19 +19,33 @@ def is_singing_collection(source):
             and bool(source.get("singing_collection")) and source.get("verification_status") == "verified")
 
 
+def matching_curated_song(part_title, multipart, titles):
+    if multipart and titles:
+        target = normalize(part_title.strip("《》"))
+        titles = {title for title in titles if normalize(title) == target}
+    return next(iter(titles)) if len(titles) == 1 else None
+
+
+def song_title_and_quote(video_title, part_title, multipart, curated_song=None):
+    text = part_title.strip() if multipart else video_title
+    quote = QUOTED_SONG.search(text)
+    title = quote.group(1).strip() if quote else text
+    return curated_song or title, bool(quote)
+
+
 def classify(video, part, tags, source, *, curated_song=None):
     title = video["title"]
     part_title = part.get("part", "")
     context = normalize_performer(" ".join([title, video.get("desc", ""), *tags]))
-    local = normalize(part_title if len(video["pages"]) > 1 else title)
+    multipart = len(video["pages"]) > 1
+    local = normalize(part_title if multipart else title)
     performer = "法里达" in context
     collection = is_singing_collection(source)
     music_pattern = r"歌切|翻唱|直播翻唱|清唱|弹唱|演唱|合唱|歌回|唱歌|纯享|cover|acoustic|歌曲|音乐合集|歌单"
     music = bool(re.search(music_pattern, normalize(title + " " + part_title + " " + " ".join(tags)))) or bool(collection)
-    song = re.search(r"《([^》]{1,120})》", part_title if len(video["pages"]) > 1 else title)
-    parent_song = re.search(r"《([^》]{1,120})》", title)
+    title_out, song = song_title_and_quote(title, part_title, multipart, curated_song)
+    parent_song = QUOTED_SONG.search(title)
     negative = bool(re.search(r"杂谈|聊天|打游戏|游戏实况|整活|鬼畜|反应|reaction|meme|闲聊", local))
-    title_out = curated_song or (song.group(1).strip() if song else part_title.strip() if len(video["pages"]) > 1 else title)
     if source["source_type"] == "search":
         required = {normalize(t) for t in source.get("required_tags", [])}
         if not required.issubset({normalize(t) for t in tags}):

@@ -424,6 +424,10 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         db.annotate([clip_id],body.model_dump(exclude_none=True))
         return db.clip(clip_id)
 
+    @app.post("/api/clips/{clip_id}/automatic-title")
+    def automatic_title(clip_id: str):
+        return db.reset_song_title(clip_id)
+
     @app.patch("/api/review/bulk")
     def bulk_annotation(body: BulkAnnotation):
         db.annotate(body.ids,{"inclusion_status":body.inclusion_status})
@@ -632,27 +636,42 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             cleanup.pop_all()
             return response
 
+    def replace_and_revoke_writers(data):
+        with preference_lock:
+            safety = restore_validated_backup(db, data)
+            preference_writers.clear()
+            return safety
+
+    async def install_backup(data):
+        nonlocal startup_pending
+        async with login.lock:
+            await collector.stop()
+            safety = await asyncio.to_thread(replace_and_revoke_writers, data)
+            startup_pending = False
+            await playback.clear()
+            return safety
+
     @app.post("/api/restore")
     async def restore(request: Request):
-        nonlocal startup_pending
         raw = bytearray()
         async for chunk in request.stream():
             if len(raw) + len(chunk) > LIMIT:
                 raise HTTPException(413, "可恢复的 JSON 备份上限为 64 MiB。")
             raw.extend(chunk)
         try:
-            data = json.loads(raw)
+            data = await asyncio.to_thread(json.loads, raw)
             del raw
-            # Keep the current collection and playback active during the offline import check.
             data = await asyncio.to_thread(validate_backup, data)
-            async with login.lock:
-                startup_pending = False
-                await collector.stop()
-                await playback.clear()
-                with preference_lock:
-                    safety = restore_validated_backup(db, data)
-                    preference_writers.clear()
+            # Once installation begins, finish the transaction even if the requesting tab closes.
+            install = asyncio.create_task(install_backup(data))
+            try:
+                safety = await asyncio.shield(install)
+            except asyncio.CancelledError:
+                await install
+                raise
             return {"restored": True, "safety_backup": safety}
+        except OSError as error:
+            raise HTTPException(507, "无法写入本机备份或数据库，请检查磁盘空间和写入权限。") from error
         except BackupTooLarge as error:
             raise HTTPException(409, "本机数据超过 64 MiB，无法保存恢复前备份，未替换本机数据。") from error
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError, sqlite3.DatabaseError) as error:

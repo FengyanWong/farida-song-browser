@@ -9,7 +9,8 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from .adapter import BVID, parse_source, validated_video, video_has_uploader
-from .classifier import SINGING_COLLECTION_TYPES, classify, is_singing_collection, normalize, normalize_performer
+from .classifier import (SINGING_COLLECTION_TYPES, classify, is_singing_collection, matching_curated_song,
+                         normalize, normalize_performer, song_title_and_quote)
 from .player_state import PlayerState
 from .songlist import CURATOR, URL as SONGLIST_URL
 
@@ -454,7 +455,8 @@ class Database:
         with self.connect() as con:
             added_clips = added_included = 0
             existing_ids = {row[0] for row in con.execute("SELECT id FROM parts WHERE video_bvid=?", (bvid,))}
-            curated = con.execute('SELECT song_title FROM curated_songs WHERE bvid=?', (bvid,)).fetchall()
+            curated_titles = {row[0] for row in con.execute('SELECT song_title FROM curated_songs WHERE bvid=?', (bvid,))}
+            multipart = len(data["pages"]) > 1
             con.execute("INSERT INTO videos(" + ",".join(fields) + ") VALUES(" + ",".join("?" for _ in fields) + ") ON CONFLICT(bvid) DO UPDATE SET " + ",".join(f"{k}=excluded.{k}" for k in fields if k != "bvid"), list(fields.values()))
             con.execute("INSERT INTO memberships VALUES(?,?,?,?) ON CONFLICT(source_id,video_bvid) DO UPDATE SET last_seen_at=excluded.last_seen_at", (source["id"],bvid,stamp,stamp))
             # Prefer verified singing evidence from any source that still lists this BV.
@@ -473,8 +475,8 @@ class Database:
             for part in data["pages"]:
                 clip_id = f"{bvid}:{part['cid']}"
                 con.execute("INSERT INTO parts(id,video_bvid,cid,part_number,raw_part_title,duration_seconds,active) VALUES(?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET part_number=excluded.part_number,raw_part_title=excluded.raw_part_title,duration_seconds=excluded.duration_seconds,active=1", (clip_id,bvid,str(part["cid"]),part["page"],part.get("part", ""),part.get("duration")))
-                song_names = {row['song_title'] for row in curated if len(data['pages']) == 1 or normalize(part.get('part', '').strip('《》')) == normalize(row['song_title'])}
-                title,status,reason,version = classify(data,part,tags,classification_source,curated_song=next(iter(song_names)) if len(song_names) == 1 else None)
+                curated = matching_curated_song(part.get("part", ""), multipart, curated_titles)
+                title,status,reason,version = classify(data,part,tags,classification_source,curated_song=curated)
                 if clip_id not in existing_ids:
                     added_clips += 1
                     added_included += int(status == "included")
@@ -646,20 +648,23 @@ class Database:
                         '(SELECT clip_id FROM listening_history ORDER BY last_played_at DESC,clip_id LIMIT 100)')
         return {'saved': True}
 
+    def _read_clip(self, con, clip_id):
+        record = con.execute(CLIP_SELECT + " WHERE p.id=?", (clip_id,)).fetchone()
+        if record is None:
+            return None
+        row = dict(record)
+        row["sources"] = [dict(source) for source in con.execute(
+            "SELECT s.id,s.display_name,s.source_type,s.canonical_url FROM sources s "
+            "JOIN memberships m ON m.source_id=s.id WHERE m.video_bvid=?", (row["video_bvid"],))]
+        row["songlist_credits"] = [dict(credit) for credit in con.execute(
+            "SELECT cs.song_title,cs.original_artist,cs.language,cs.style,cs.fetched_at,s.canonical_url "
+            "FROM curated_songs cs JOIN sources s ON s.id=cs.source_id WHERE cs.bvid=?", (row["video_bvid"],))]
+        return self.clip_row(row)
+
     def clip(self, clip_id):
         with self.connect() as con:
             con.execute("BEGIN")
-            record = con.execute(CLIP_SELECT + " WHERE p.id=?", (clip_id,)).fetchone()
-            if record is None:
-                return None
-            row = dict(record)
-            row["sources"] = [dict(source) for source in con.execute(
-                "SELECT s.id,s.display_name,s.source_type,s.canonical_url FROM sources s "
-                "JOIN memberships m ON m.source_id=s.id WHERE m.video_bvid=?", (row["video_bvid"],))]
-            row["songlist_credits"] = [dict(credit) for credit in con.execute(
-                "SELECT cs.song_title,cs.original_artist,cs.language,cs.style,cs.fetched_at,s.canonical_url "
-                "FROM curated_songs cs JOIN sources s ON s.id=cs.source_id WHERE cs.bvid=?", (row["video_bvid"],))]
-        return self.clip_row(row)
+            return self._read_clip(con, clip_id)
 
     def resume_state(self, *, summary):
         # Removing clip_ids before applying the small checkpoint avoids sending the whole
@@ -830,8 +835,33 @@ class Database:
             if not con.execute('DELETE FROM playlists WHERE id=?', (playlist_id,)).rowcount:
                 raise KeyError(playlist_id)
 
+    def reset_song_title(self, clip_id):
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            clip = self._read_clip(con, clip_id)
+            if clip is None:
+                raise KeyError(clip_id)
+            if "display_song_title" not in clip["manual_fields"]:
+                return clip
+            # A removed CID may share its BV with a replacement single-part video.
+            # Its own last-known caption is the only part-specific evidence still stored.
+            multipart = not clip["active"] or clip["part_count"] > 1
+            part_title = clip["raw_part_title"] or ""
+            titles = {entry["song_title"] for entry in clip["songlist_credits"]}
+            curated = matching_curated_song(part_title, multipart, titles)
+            title, _ = song_title_and_quote(clip["raw_title"], part_title, multipart, curated)
+            if not title.strip():
+                raise ValueError("本机没有可用的原始歌名，已保留手动歌名。")
+            fields = [field for field in clip["manual_fields"] if field != "display_song_title"]
+            con.execute("UPDATE annotations SET display_song_title=?,manual_fields=? WHERE clip_id=?",
+                        (title, encode(fields), clip_id))
+            clip.update(display_song_title=title, manual_fields=fields)
+            return clip
+
     def annotate(self, ids, patch):
         with self.connect() as con:
+            # Reset and edit must read the same manual fields they are about to update.
+            con.execute("BEGIN IMMEDIATE")
             for clip_id in ids:
                 previous = con.execute("SELECT manual_fields FROM annotations WHERE clip_id=?", (clip_id,)).fetchone()
                 if not previous:

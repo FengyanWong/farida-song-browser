@@ -30,6 +30,10 @@ for index in range(94):
     db.annotate([clip],{'display_song_title':title,'inclusion_status':'included'})
     if index>=92:db.annotate([clip],{'song_group':'手工分组'})
     ids.append(clip)
+# The newest clip tests an imported automatic title containing an actual line break.
+curated = next(source for source in db.sources() if source['source_type']=='songlist')
+db.execute("INSERT INTO curated_songs(source_id,id,song_title,original_artist,language,style,bvid,fetched_at) VALUES(?,?,?,'','','',?,?)",
+           (curated['id'],1,'自动'+chr(10)+'歌名',ids[49].split(':')[0],'2026-11-18'))
 print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},ensure_ascii=False))
 `;
 (async()=>{
@@ -98,11 +102,11 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await page.goto(base+'/#catalog');await page.locator('#clip-rows tr').first().waitFor();
     assert.equal(await page.locator('nav [data-view]').count(),2);
     // Hold replies after the server has processed them to control their arrival order.
-    async function holdDetailReply(id, saving=false) {
+    async function holdDetailReply(id, action='') {
       let release, started;
       const delivered=new Promise(resolve=>{release=resolve;});
       const received=new Promise(resolve=>{started=resolve;});
-      const target='/api/clips/'+encodeURIComponent(id)+(saving?'/annotation':'');
+      const target='/api/clips/'+encodeURIComponent(id)+(action?'/'+action:'');
       await page.route(url=>url.pathname===target,async route=>{
         const response=await route.fetch();started();
         await delivered;await route.fulfill({response});
@@ -125,12 +129,12 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await expand();const originalGroup=await group.inputValue();await note.fill('本地备注');
     await firstReply.release();await page.evaluate(()=>new Promise(requestAnimationFrame));
     assert.equal(await form.getAttribute('data-id'),clipB);assert.equal(await note.inputValue(),'本地备注');
-    const noteReply=await holdDetailReply(clipB,true);
+    const noteReply=await holdDetailReply(clipB,'annotation');
     await save.click();await noteReply.received;await group.fill('正在编辑的分组');
     await noteReply.release();await until(async()=>await save.isEnabled());
     assert.equal(await group.inputValue(),'正在编辑的分组');
     assert.deepEqual(mutations,[{notes:'本地备注'}]);
-    const groupReply=await holdDetailReply(clipB,true);await save.click();await groupReply.received;
+    const groupReply=await holdDetailReply(clipB,'annotation');await save.click();await groupReply.received;
     await dialog.locator('.close-dialog').click();await openDetail(clipA);await expand();
     await note.fill('另一个片段的草稿');await groupReply.release();
     await page.evaluate(()=>new Promise(requestAnimationFrame));
@@ -148,6 +152,53 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     // Preserve the catalog fixture's grouping for the following independent checks.
     await api('/api/clips/'+encodeURIComponent(clipB)+'/annotation','PATCH',{song_group:originalGroup});
     pass('Only edited fields are saved; late detail and save replies preserve newer drafts, and reverting an edit sends no mutation');
+    const autoTitle=dialog.getByRole('button',{name:'使用自动歌名',exact:true});
+    const titleInput=form.locator('[name=display_song_title]');
+    const detailPath=id=>'/api/clips/'+encodeURIComponent(id);
+    const manualA=await api(detailPath(clipA)),manualB=await api(detailPath(clipB));
+    let automaticWrites=0;
+    page.on('request',req=>{if(req.method()==='POST' && req.url().endsWith('/automatic-title'))automaticWrites++;});
+    await openDetail(clipA);await expand();assert.equal(await autoTitle.isVisible(),true);
+    await titleInput.fill('修改中的歌名');await group.fill('未保存的分组');await note.fill('自动歌名测试备注');
+    dismissNextDialog=true;await autoTitle.click();
+    assert.equal(automaticWrites,0);assert.equal(await titleInput.inputValue(),'修改中的歌名');
+    await page.route(url=>url.pathname===detailPath(clipA)+'/automatic-title',
+      route=>route.fulfill({status:503,json:{detail:'测试请求暂时失败'}}),{times:1});
+    await autoTitle.click();await until(async()=>await dialog.locator('#detail-feedback').textContent()==='测试请求暂时失败');
+    assert.equal(await autoTitle.isEnabled(),true);assert.equal(await group.inputValue(),'未保存的分组');
+
+    const restored=await holdDetailReply(clipA,'automatic-title');
+    await autoTitle.click();await restored.received;assert.equal(await autoTitle.isEnabled(),false);
+    await titleInput.fill('请求发出后继续编辑');await restored.release();await until(async()=>await autoTitle.isHidden());
+    const automaticA=await api(detailPath(clipA));
+    assert.ok(!automaticA.manual_fields.includes('display_song_title'));
+    assert.equal(automaticA.display_song_title,'自动\n歌名');
+    assert.equal(await dialog.locator('.detail-title').textContent(),automaticA.display_song_title);
+    assert.equal(await titleInput.inputValue(),'请求发出后继续编辑');
+    assert.equal(await note.inputValue(),'自动歌名测试备注');assert.equal(await group.inputValue(),'未保存的分组');
+    assert.equal(automaticA.notes,manualA.notes);assert.equal(automaticA.song_group,manualA.song_group);
+    await titleInput.fill('自动歌名');await group.fill(manualA.song_group);await save.click();
+    await dialog.waitFor({state:'hidden'});assert.deepEqual(mutations.at(-1),{notes:'自动歌名测试备注'});
+    await openDetail(clipA);await expand();assert.equal(await autoTitle.isHidden(),true);
+    await dialog.locator('.close-dialog').click();
+
+    await openDetail(clipB);await expand();await titleInput.fill('确认放弃这个歌名草稿');
+    await autoTitle.click();await until(async()=>await autoTitle.isHidden());
+    assert.equal(await titleInput.inputValue(),(await api(detailPath(clipB))).display_song_title);
+    await dialog.locator('.close-dialog').click();
+    await api(detailPath(clipB)+'/annotation','PATCH',{display_song_title:manualB.display_song_title});
+    await openDetail(clipB);await expand();const lateAuto=await holdDetailReply(clipB,'automatic-title');
+    await autoTitle.click();await lateAuto.received;await dialog.locator('.close-dialog').click();
+    await openDetail(clipA);await expand();await note.fill('保留新的草稿');await lateAuto.release();
+    await page.evaluate(()=>new Promise(requestAnimationFrame));
+    assert.equal(await form.getAttribute('data-id'),clipA);assert.equal(await note.inputValue(),'保留新的草稿');
+    assert.equal(await autoTitle.isHidden(),true);await dialog.locator('.close-dialog').click();
+    assert.equal(automaticWrites,4);
+    for (const clip of [manualA,manualB]) {
+      await api(detailPath(clip.id)+'/annotation','PATCH',{display_song_title:clip.display_song_title,notes:clip.notes});
+    }
+    pass('Automatic titles are available only with a saved override and preserve drafts on cancellation, failed requests, retry and late replies');
+
     const queries=[];
     page.on('request',req=>{
       const target=new URL(req.url());

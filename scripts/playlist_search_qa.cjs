@@ -226,6 +226,7 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     try {
       await nameInput.fill('第一版');
       await page.locator('#playlist-save-button').click();await submitted;
+      assert.equal(await page.locator('#playlist-add-results').isDisabled(),true);
       await nameInput.fill('第二版');
     } finally {releaseSave();}
     await page.waitForFunction(()=>!document.querySelector('#playlist-save-button').disabled);
@@ -312,6 +313,50 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     let lookups=0;
     page.on('request',request=>{if(new URL(request.url()).pathname==='/api/playlists/resolve-links')lookups++;});
     const savedLists=async()=>(await(await fetch(base+'/api/playlists')).json()).items;
+    const addFiltered=page.locator('#playlist-add-results'), saveButton=page.locator('#playlist-save-button');
+    const queueURL='**/api/play-queue?*';
+    async function holdResultLookup(){
+      let release,announce;
+      const hold=new Promise(r=>{release=r;}),started=new Promise(r=>{announce=r;});
+      await page.route(queueURL,async route=>{announce();await hold;await route.fulfill({json:{items:fixtures}});},{times:1});
+      await addFiltered.click();await started;
+      return release;
+    }
+    const beforeFiltered=(await savedLists()).length;
+    await page.locator('#playlist-new').click();await nameInput.fill('完整筛选歌单');
+    const finish=await holdResultLookup();
+    assert.equal(await saveButton.isDisabled(),true);assert.equal(await addFiltered.isDisabled(),true);
+    assert.equal(await page.locator('#playlist-import-add').isDisabled(),true);
+    await page.locator('#playlist-save').evaluate(form=>form.requestSubmit());
+    assert.equal(await editor.isVisible(),true);assert.equal((await savedLists()).length,beforeFiltered);
+    finish();await until(async()=>await saveButton.isEnabled());
+    assert.equal(await editor.locator('[data-remove]').count(),fixtures.length);
+    await saveButton.click();await editor.waitFor({state:'hidden'});
+    const filteredId=await page.locator('#playlist-select').inputValue();
+    const savedIds=async()=>(await(await fetch(base+'/api/playlists/'+filteredId)).json()).items.map(i=>i.id);
+    assert.deepEqual(await savedIds(),fixtures.map(i=>i.id));
+
+    await page.locator('#playlist-edit').click();await editor.locator('[data-remove="0"]').click();
+    await page.route(queueURL,r=>r.fulfill({status:503,json:{detail:'筛选结果暂时无法读取'}}),{times:1});
+    await addFiltered.click();await until(async()=>(await page.locator('#playlist-error').textContent()).includes('暂时无法读取'));
+    assert.equal(await editor.locator('[data-remove]').count(),fixtures.length-1);
+    assert.equal(await saveButton.isEnabled(),true);assert.equal(await addFiltered.isEnabled(),true);
+    await addFiltered.click();await until(async()=>await editor.locator('[data-remove]').count()===fixtures.length);
+    assert.equal(await page.locator('#playlist-error').textContent(),'');
+    await saveButton.click();await editor.waitFor({state:'hidden'});
+    assert.deepEqual(await savedIds(),[...fixtures.slice(1),fixtures[0]].map(i=>i.id));
+    pass('Saving waits for filtered songs to arrive; a failed lookup preserves the draft and retry adds missing songs in order without duplicates');
+
+    await page.locator('#playlist-new').click();await nameInput.fill('放弃等待中的结果');
+    const stale=await holdResultLookup();
+    await Promise.all([respond('confirm',true),close.last().click()]);
+    await page.locator('#playlist-new').click();await nameInput.fill('保留新草稿');
+    const delivered=page.waitForResponse(queueURL);stale();await (await delivered).finished();
+    await page.evaluate(()=>new Promise(requestAnimationFrame));
+    assert.equal(await nameInput.inputValue(),'保留新草稿');assert.equal(await editor.locator('[data-remove]').count(),0);
+    assert.equal(await saveButton.isEnabled(),true);assert.equal(await addFiltered.isEnabled(),true);
+    await Promise.all([respond('confirm',true),close.last().click()]);
+    pass('Cancelling a filtered lookup leaves the next editor untouched when its delayed response arrives');
     const oldCount=(await savedLists()).length;
     const pasted=page.locator('#playlist-import-text'), importButton=page.locator('#playlist-import-add');
     const importStatus=page.locator('#playlist-import-status');
