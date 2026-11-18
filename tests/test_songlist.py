@@ -65,6 +65,7 @@ async def test_public_index_never_receives_bilibili_credentials(settings, video)
 async def test_each_update_rereads_index_reuses_metadata_and_keeps_manual_edits(db, settings, source, video):
     video['pages'] = video['pages'][:1]
     db.save_video(source, video, ['法里达'])
+    clip_id = video['bvid'] + ':100'
     db.execute("UPDATE videos SET fetched_at='2020-01-01T00:00:00+00:00'")
     curated = next(s for s in db.sources() if s['source_type'] == 'songlist')
     response, calls = payload(video), []
@@ -76,19 +77,26 @@ async def test_each_update_rereads_index_reuses_metadata_and_keeps_manual_edits(
     job = worker.start([curated['id']], 'incremental')
     await worker.task
     assert db.job(job['id'])['state'] == 'completed'
-    clip_id = video['bvid'] + ':100'
     row = db.clip(clip_id)
     assert row['display_song_title'] == '整理后的歌名'
     assert row['uploader_uid'] == source['uid'] and row['fetched_at'].startswith('2020-')
     assert row['has_curated_credit'] and row['songlist_credits'][0]['canonical_url'] == URL
     assert row['songlist_attribution'] == 'CLANNADOR' and row['songlist_url'] == URL
     assert len(row['sources']) == 2 and db.overview()['submissions'] == 1
+    db.annotate([clip_id], {'notes': '只改备注，歌名仍由整理歌单更新'})
+    response['data']['songs'][0]['name'] = '整理歌单修正的曲名'
+    job = worker.start([curated['id']], 'incremental')
+    await worker.task
+    row = db.clip(clip_id)
+    assert db.job(job['id'])['state'] == 'completed'
+    assert row['notes'] == '只改备注，歌名仍由整理歌单更新' and row['manual_fields'] == []
+    assert row['display_song_title'] == '整理歌单修正的曲名'
     db.annotate([clip_id], {'display_song_title': '我的名称'})
     db.bookmark(clip_id, True)
     response['data']['songs'][0]['name'] = '网站的新名称'
     job = worker.start([curated['id']], 'incremental')
     await worker.task
-    assert db.job(job['id'])['state'] == 'completed' and len(calls) == 2
+    assert db.job(job['id'])['state'] == 'completed' and len(calls) == 3
     row = db.clip(clip_id)
     assert row['display_song_title'] == '我的名称' and row['bookmarked']
     assert row['songlist_credits'][0]['song_title'] == '网站的新名称'

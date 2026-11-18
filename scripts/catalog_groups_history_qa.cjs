@@ -47,7 +47,12 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
   const page=await context.newPage(),checks=[],errors=[],plays=[],dialogs=[],blocked=[];
   const pass=message=>{checks.push(message);console.log('Passed: '+message);};
   page.on('pageerror',error=>errors.push(error.message));
-  page.on('dialog',async dialog=>{dialogs.push(dialog.message());await dialog.accept();});
+  let dismissNextDialog=false;
+  page.on('dialog',async dialog=>{
+    dialogs.push(dialog.message());
+    if (dismissNextDialog) {dismissNextDialog=false;await dialog.dismiss();}
+    else await dialog.accept();
+  });
   try{
     await page.goto('about:blank');
     const encoded=await page.evaluate(async()=>{
@@ -92,6 +97,57 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     });
     await page.goto(base+'/#catalog');await page.locator('#clip-rows tr').first().waitFor();
     assert.equal(await page.locator('nav [data-view]').count(),2);
+    // Hold replies after the server has processed them to control their arrival order.
+    async function holdDetailReply(id, saving=false) {
+      let release, started;
+      const delivered=new Promise(resolve=>{release=resolve;});
+      const received=new Promise(resolve=>{started=resolve;});
+      const target='/api/clips/'+encodeURIComponent(id)+(saving?'/annotation':'');
+      await page.route(url=>url.pathname===target,async route=>{
+        const response=await route.fetch();started();
+        await delivered;await route.fulfill({response});
+      },{times:1});
+      return {received, release:async()=>{
+        const result=page.waitForResponse(reply=>new URL(reply.url()).pathname===target);
+        release();await(await result).finished();
+      }};
+    }
+    const firstDetails=page.locator('#clip-rows button[data-detail]');
+    const [clipA,clipB]=await firstDetails.evaluateAll(buttons=>buttons.slice(0,2).map(b=>b.dataset.detail));
+    const openDetail=async id=>{await page.locator(`[data-detail="${id}"]`).click();};
+    const dialog=page.locator('#detail-dialog'),form=dialog.locator('#annotation-form');
+    const expand=async()=>{await dialog.getByText('修改歌名、分组与备注',{exact:true}).click();};
+    const note=form.locator('[name=notes]'),group=form.locator('[name=song_group]'),save=form.getByRole('button');
+    const mutations=[];
+    page.on('request',req=>{if(req.method()==='PATCH' && req.url().endsWith('/annotation'))mutations.push(req.postDataJSON());});
+    const firstReply=await holdDetailReply(clipA);
+    await openDetail(clipA);await firstReply.received;await openDetail(clipB);
+    await expand();const originalGroup=await group.inputValue();await note.fill('本地备注');
+    await firstReply.release();await page.evaluate(()=>new Promise(requestAnimationFrame));
+    assert.equal(await form.getAttribute('data-id'),clipB);assert.equal(await note.inputValue(),'本地备注');
+    const noteReply=await holdDetailReply(clipB,true);
+    await save.click();await noteReply.received;await group.fill('正在编辑的分组');
+    await noteReply.release();await until(async()=>await save.isEnabled());
+    assert.equal(await group.inputValue(),'正在编辑的分组');
+    assert.deepEqual(mutations,[{notes:'本地备注'}]);
+    const groupReply=await holdDetailReply(clipB,true);await save.click();await groupReply.received;
+    await dialog.locator('.close-dialog').click();await openDetail(clipA);await expand();
+    await note.fill('另一个片段的草稿');await groupReply.release();
+    await page.evaluate(()=>new Promise(requestAnimationFrame));
+    assert.equal(await form.getAttribute('data-id'),clipA);assert.equal(await note.inputValue(),'另一个片段的草稿');
+    assert.deepEqual(mutations[1],{song_group:'正在编辑的分组'});
+    await dialog.locator('[data-classify=included]').click();await until(async()=>await save.isEnabled());
+    assert.equal(await note.inputValue(),'另一个片段的草稿');assert.deepEqual(mutations[2],{inclusion_status:'included'});
+    dismissNextDialog=true;
+    await page.keyboard.press('Escape');
+    assert.equal(dismissNextDialog,false);assert.equal(await note.inputValue(),'另一个片段的草稿');
+    await dialog.locator('.close-dialog').click();await openDetail(clipA);await expand();
+    const previous=await note.inputValue();assert.notEqual(previous,'另一个片段的草稿');
+    await note.fill('撤销的编辑');await note.fill(previous);await save.click();
+    assert.equal(await dialog.isVisible(),false);assert.equal(mutations.length,3);
+    // Preserve the catalog fixture's grouping for the following independent checks.
+    await api('/api/clips/'+encodeURIComponent(clipB)+'/annotation','PATCH',{song_group:originalGroup});
+    pass('Only edited fields are saved; late detail and save replies preserve newer drafts, and reverting an edit sends no mutation');
     const queries=[];
     page.on('request',req=>{
       const target=new URL(req.url());

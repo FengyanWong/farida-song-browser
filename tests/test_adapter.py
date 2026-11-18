@@ -9,7 +9,12 @@ def test_source_routes(url,kind):
     assert parse_source(url)["source_type"]==kind
 
 
-@pytest.mark.parametrize("url",["http://127.0.0.1:8000/","https://evil.com/123","https://space.bilibili.com.evil.com/123","https://user@space.bilibili.com/123","https://space.bilibili.com/123?fid=nan","file:///etc/passwd","0","-1"])
+@pytest.mark.parametrize("uid", ["UID: 394803911", "uid　394803911", "ＵＩＤ：３９４８０３９１１", "３９４８０３９１１"])
+def test_labelled_uid_has_the_same_canonical_source(uid):
+    assert parse_source(uid) == parse_source("394803911")
+
+
+@pytest.mark.parametrize("url",["UID: 01", "UID: 1 UID: 2", "UID: https://example.com/1", "http://127.0.0.1:8000/","https://evil.com/123","https://space.bilibili.com.evil.com/123","https://user@space.bilibili.com/123","https://space.bilibili.com/123?fid=nan","file:///etc/passwd","0","-1"])
 def test_source_rejects_arbitrary_destinations(url):
     with pytest.raises(ValueError):parse_source(url)
 

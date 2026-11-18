@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -78,8 +79,9 @@ def parse_source(value: str) -> dict:
     value = value.strip()
     if value in {SONGLIST_URL, SONGLIST_URL.rstrip('/')}:
         return {'source_type': 'songlist', 'uid': None, 'collection_id': None, 'canonical_url': SONGLIST_URL}
-    if value.isdecimal():
-        uid = numeric_id(value)
+    labelled_uid = re.fullmatch(r"(?:(?:uid|ｕｉｄ)[ \t　]*[:：]?[ \t　]*)?([0-9０-９]+)", value, re.IGNORECASE)
+    if labelled_uid:
+        uid = numeric_id(unicodedata.normalize("NFKC", labelled_uid[1]))
         return {"source_type": "uploader", "uid": uid, "collection_id": None, "canonical_url": f"https://space.bilibili.com/{uid}"}
     parsed = urlsplit(value)
     if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port or parsed.hostname not in {"space.bilibili.com", "www.bilibili.com"}:

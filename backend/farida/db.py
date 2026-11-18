@@ -647,13 +647,19 @@ class Database:
         return {'saved': True}
 
     def clip(self, clip_id):
-        row = self.one(CLIP_SELECT + " WHERE p.id=?", (clip_id,))
-        if not row:
-            return None
-        row = self.clip_row(row)
-        row["sources"] = self.all("SELECT s.id,s.display_name,s.source_type,s.canonical_url FROM sources s JOIN memberships m ON m.source_id=s.id WHERE m.video_bvid=?", (row["video_bvid"],))
-        row['songlist_credits'] = self.all('SELECT cs.song_title,cs.original_artist,cs.language,cs.style,cs.fetched_at,s.canonical_url FROM curated_songs cs JOIN sources s ON s.id=cs.source_id WHERE cs.bvid=?', (row['video_bvid'],))
-        return row
+        with self.connect() as con:
+            con.execute("BEGIN")
+            record = con.execute(CLIP_SELECT + " WHERE p.id=?", (clip_id,)).fetchone()
+            if record is None:
+                return None
+            row = dict(record)
+            row["sources"] = [dict(source) for source in con.execute(
+                "SELECT s.id,s.display_name,s.source_type,s.canonical_url FROM sources s "
+                "JOIN memberships m ON m.source_id=s.id WHERE m.video_bvid=?", (row["video_bvid"],))]
+            row["songlist_credits"] = [dict(credit) for credit in con.execute(
+                "SELECT cs.song_title,cs.original_artist,cs.language,cs.style,cs.fetched_at,s.canonical_url "
+                "FROM curated_songs cs JOIN sources s ON s.id=cs.source_id WHERE cs.bvid=?", (row["video_bvid"],))]
+        return self.clip_row(row)
 
     def resume_state(self, *, summary):
         # Removing clip_ids before applying the small checkpoint avoids sending the whole
@@ -841,9 +847,13 @@ class Database:
                     con.execute("INSERT INTO user_state(clip_id,notes) VALUES(?,?) ON CONFLICT(clip_id) DO UPDATE SET notes=excluded.notes", (clip_id,patch["notes"]))
 
     def bookmark(self, clip_id, value):
-        if not self.clip(clip_id):
-            raise KeyError(clip_id)
-        self.execute("INSERT INTO user_state(clip_id,bookmarked) VALUES(?,?) ON CONFLICT(clip_id) DO UPDATE SET bookmarked=excluded.bookmarked", (clip_id,int(value)))
+        with self.connect() as con:
+            updated = con.execute("INSERT INTO user_state(clip_id,bookmarked) "
+                                  "SELECT clip_id,? FROM annotations WHERE clip_id=? "
+                                  "ON CONFLICT(clip_id) DO UPDATE SET bookmarked=excluded.bookmarked",
+                                  (int(value), clip_id))
+            if updated.rowcount == 0:
+                raise KeyError(clip_id)
 
     def overview(self, compact=False):
         jobs = self.jobs(OVERVIEW_JOB_LIMIT)

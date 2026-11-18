@@ -116,6 +116,7 @@ function readRoute() {
 }
 function setView(view, rememberView=false) {
   if(!['catalog','sources'].includes(view))view='catalog';
+  if (state.view!==view) ++detailRequest;
   state.view=view;closePageJump();
   $$('.nav-item').forEach(el=>{el.classList.toggle('active',el.dataset.view===view);if(el.dataset.view===view)el.setAttribute('aria-current','page');else el.removeAttribute('aria-current');});
   const names={catalog:'片段收藏',sources:'采集来源'};
@@ -159,7 +160,8 @@ async function loadOverview() {
   optionList('#uploader-filter',o.uploaders,s=>s.uid,s=>s.name,'全部 UP 主');
   renderJob();if(state.view==='sources')renderSources();
 }
-let displayedCatalogScope, catalogLoadError;
+let displayedCatalogScope, catalogLoadError, bookmarksDuringRead;
+const pendingBookmarks=new Set();
 function catalogScope(params) {
   if (!params) return null;
   const scope=new URLSearchParams(params);
@@ -197,18 +199,25 @@ function guardCatalogResults(scope) {
 }
 async function loadClips() {
   const request=++state.request, params=parameters(), scope=catalogScope(params);
+  const newerBookmarks=new Map();bookmarksDuringRead=newerBookmarks;
   guardCatalogResults(scope);
   try {
     if (!params) throw new Error(searchLimitMessage);
     params.set('compact','true');
     const result=await api('/api/clips?'+params);
     if (request!==state.request || scope!==catalogScope(parameters())) return;
+    // The database may have answered this GET before a star update was committed.
+    if (newerBookmarks.size && params.has('bookmarked')) return loadClips();
+    if (newerBookmarks.size) for (const item of result.items) {
+      if (newerBookmarks.has(item.id)) item.bookmarked=newerBookmarks.get(item.id);
+    }
     const lastPage = Math.max(1, Math.ceil(result.total/state.pageSize));
     if (state.page > lastPage) {
       state.page = lastPage;
       if (result.total) return loadClips();
       result.page=lastPage;
     }
+    const focus=scope===displayedCatalogScope && state.view==='catalog' ? bookmarkFocus() : null;
     displayedCatalogScope=scope;
     showColumnOrder(params.get('sort'));
     state.clips=result;
@@ -219,6 +228,7 @@ async function loadClips() {
     }
     renderClips();
     guardCatalogResults(scope);
+    if (focus) restoreBookmarkFocus(focus);
     if (catalogLoadError && $('#notice').textContent===catalogLoadError) notice('');
     catalogLoadError=null;
   } catch(error) {
@@ -227,6 +237,8 @@ async function loadClips() {
     state.page=displayedCatalogScope===scope && state.clips ? state.clips.page : 1;
     catalogLoadError=error.message;
     notice(error.message,true);
+  } finally {
+    if (bookmarksDuringRead===newerBookmarks) bookmarksDuringRead=null;
   }
 }
 function coverImage(raw) {
@@ -284,7 +296,51 @@ function clipRow(clip) {
     const target=clip.playback_url;
     const title=target?`<a class="row-title" href="${e(target)}" target="_blank" rel="noopener noreferrer" data-play="${e(clip.id)}" title="在此页面播放">${e(clip.display_song_title)}</a>`:`<span class="row-title">${e(clip.display_song_title)}</span>`;
     const status=clip.inclusion_status!=='included'?`<span class="badge ${clip.inclusion_status==='needs_review'?'warn':'muted'}">${clip.inclusion_status==='needs_review'?'待确认':'已排除'}</span>`:'';
-    return `<tr><td class="check-col"><input type="checkbox" data-select="${e(clip.id)}" aria-label="选择 ${e(clip.display_song_title)}" ${state.selected.has(clip.id)?'checked':''}></td><td><div class="clip-content">${coverImage(clip.thumbnail_url)}<div class="clip-text">${title}<div class="row-subtitle">${clip.part_count>1?`<span class="part-badge">P${clip.part_number}</span>`:''}<span class="original-title" title="${e(clip.raw_title)}">${clip.raw_title!==clip.display_song_title?e(clip.raw_title):''}</span>${status}${clip.has_curated_credit?'<span class="badge">歌单 · CLANNADOR</span>':''}${!target?'<span class="badge warn">当前不可用</span>':''}</div></div></div></td><td class="row-uploader-cell"><span class="row-uploader" title="UID ${e(clip.uploader_uid)}">${e(clip.uploader_name)}</span></td><td class="row-date">${e(dates[0])}<small>${e(dates.slice(1).join(' '))}</small></td><td><div class="row-actions"><button class="icon-button ${clip.bookmarked?'active':''}" data-bookmark="${e(clip.id)}" aria-label="${clip.bookmarked?'取消收藏':'收藏'} ${e(clip.display_song_title)}" title="${clip.bookmarked?'取消收藏':'收藏'}">${icon('star')}</button><button class="icon-button" data-detail="${e(clip.id)}" aria-label="查看 ${e(clip.display_song_title)} 的详情" title="详情与修正">${icon('more')}</button></div></td></tr>`;
+    return `<tr><td class="check-col"><input type="checkbox" data-select="${e(clip.id)}" aria-label="选择 ${e(clip.display_song_title)}" ${state.selected.has(clip.id)?'checked':''}></td><td><div class="clip-content">${coverImage(clip.thumbnail_url)}<div class="clip-text">${title}<div class="row-subtitle">${clip.part_count>1?`<span class="part-badge">P${clip.part_number}</span>`:''}<span class="original-title" title="${e(clip.raw_title)}">${clip.raw_title!==clip.display_song_title?e(clip.raw_title):''}</span>${status}${clip.has_curated_credit?'<span class="badge">歌单 · CLANNADOR</span>':''}${!target?'<span class="badge warn">当前不可用</span>':''}</div></div></div></td><td class="row-uploader-cell"><span class="row-uploader" title="UID ${e(clip.uploader_uid)}">${e(clip.uploader_name)}</span></td><td class="row-date">${e(dates[0])}<small>${e(dates.slice(1).join(' '))}</small></td><td><div class="row-actions"><button class="icon-button ${clip.bookmarked?'active':''}" data-bookmark="${e(clip.id)}" aria-label="收藏 ${e(clip.display_song_title)}" aria-pressed="${!!clip.bookmarked}" ${pendingBookmarks.has(clip.id)?'aria-disabled="true"':''} title="${clip.bookmarked?'取消收藏':'收藏'}">${icon('star')}</button><button class="icon-button" data-detail="${e(clip.id)}" aria-label="查看 ${e(clip.display_song_title)} 的详情" title="详情与修正">${icon('more')}</button></div></td></tr>`;
+}
+function bookmarkButton(id) {
+  return $('#clip-rows').querySelector(`[data-bookmark="${CSS.escape(id)}"]`);
+}
+function bookmarkFocus() {
+  const button=document.activeElement;
+  if (!button.matches('#clip-rows [data-bookmark]')) return null;
+  return {id:button.dataset.bookmark, index:$$('#clip-rows [data-bookmark]').indexOf(button), page:state.clips.page,
+          group:state.clips.groups?.findIndex(group=>group.clip_ids.includes(button.dataset.bookmark))};
+}
+function restoreBookmarkFocus(previous) {
+  let target=bookmarkButton(previous.id);
+  if (!target && state.filter==='bookmarked') {
+    const stars=$$('#clip-rows [data-bookmark]'), groups=$$('#clip-rows [data-group]');
+    const index=state.clips.page<previous.page ? stars.length-1 : Math.min(previous.index,stars.length-1);
+    target=stars[index] || groups[Math.min(previous.group??0,groups.length-1)] || $('#clip-filter');
+  }
+  target?.focus({preventScroll:true});
+}
+async function toggleBookmark(button) {
+  const id=button.dataset.bookmark, clip=state.clips?.items.find(item=>item.id===id);
+  if (!clip || pendingBookmarks.has(id) || $('#clip-rows').inert) return;
+  pendingBookmarks.add(id);
+  // aria-disabled keeps the keyboard on this control while duplicate activation is ignored.
+  button.setAttribute('aria-disabled','true');
+  try {
+    const result=await api('/api/clips/'+encodeURIComponent(id)+'/bookmark',{
+      method:'PATCH',body:JSON.stringify({bookmarked:!clip.bookmarked})});
+    bookmarksDuringRead?.set(id,result.bookmarked);
+    const current=state.clips?.items.find(item=>item.id===id);
+    if (current) current.bookmarked=result.bookmarked;
+    const star=bookmarkButton(id);
+    if (star) {
+      star.classList.toggle('active',result.bookmarked);
+      star.setAttribute('aria-pressed',String(result.bookmarked));
+      star.title=result.bookmarked?'取消收藏':'收藏';
+    }
+    if (!result.bookmarked && state.filter==='bookmarked' && state.selected.delete(id)) updateSelection();
+  } finally {
+    pendingBookmarks.delete(id);
+    bookmarkButton(id)?.removeAttribute('aria-disabled');
+  }
+  if (state.view==='catalog' && state.filter==='bookmarked') await Promise.all([loadOverview(),loadClips()]);
+  else await loadOverview();
 }
 function renderClips() {
   const result=state.clips;
@@ -482,15 +538,85 @@ function updateSingingCollectionControl() {
   if(!collection)checkbox.checked=false;
 }
 $('#source-url').addEventListener('input',updateSingingCollectionControl);
-function showSource(source) {
-  state.editSource=source || null;$('#source-name').value=source?.display_name || '';$('#source-url').value=source?.canonical_url || '';
-  $('#singing-collection').checked=!!source?.singing_collection;updateSingingCollectionControl();$('#source-form-error').textContent='';$('#source-dialog-title').textContent=source?'编辑来源':'添加来源';$('#source-dialog').showModal();
+function setSourceSaving(saving) {
+  const submit=$('#source-form button[type=submit]');
+  submit.disabled=saving;
+  submit.textContent=saving?'正在保存…':'保存来源';
+  $('#source-name').readOnly=saving;
+  $('#source-url').readOnly=saving;
+  if(saving)$('#singing-collection').disabled=true;
+  else updateSingingCollectionControl();
 }
+function showSource(source) {
+  state.editSource={source,saving:false};
+  $('#source-name').value=source?.display_name || '';
+  $('#source-url').value=source?.canonical_url || '';
+  $('#singing-collection').checked=!!source?.singing_collection;
+  setSourceSaving(false);
+  $('#source-form-error').textContent='';
+  $('#source-dialog-title').textContent=source?'编辑来源':'添加来源';
+  $('#source-dialog').showModal();
+}
+const detailDialog = $('#detail-dialog');
+let detailRequest=0, detailEditor=null;
+function annotationChanges(editor) {
+  return Object.fromEntries([...new FormData(editor.form)].filter(([field,value])=>editor.original[field]!==value));
+}
+function allowDetailClose() {
+  if (!detailEditor) return true;
+  if (detailEditor.saving) return confirm('修改正在保存，仍要关闭片段详情吗？');
+  return !Object.keys(annotationChanges(detailEditor)).length || confirm('放弃未保存的片段修改？');
+}
+detailDialog.addEventListener('cancel',event=>{if(!allowDetailClose())event.preventDefault();});
+detailDialog.addEventListener('click',event=>{
+  if (event.target.closest('.close-dialog') && !allowDetailClose()) {
+    event.preventDefault();event.stopPropagation();
+  }
+});
+detailDialog.addEventListener('close',()=>{if(!detailDialog.open)detailEditor=null;});
 async function showDetail(id) {
-  const clip=await api('/api/clips/'+encodeURIComponent(id));const el=$('#detail-content');
+  const request=++detailRequest;
+  let clip;
+  try { clip=await api('/api/clips/'+encodeURIComponent(id)); }
+  catch (error) { if (request===detailRequest && !state.stopping) throw error; return; }
+  if (request!==detailRequest || state.stopping || document.querySelector('dialog[open]')) return;
+  const el=$('#detail-content');
   const credit=clip.songlist_credits?.length?`<dt>歌单整理</dt><dd><a href="https://fareeda.songlist.cc/" target="_blank" rel="noopener noreferrer">CLANNADOR · 小法的歌单 ↗</a><br>${clip.songlist_credits.map(song=>`${e(song.song_title)}${song.original_artist?` · 原唱 ${e(song.original_artist)}`:''}`).join('<br>')}</dd>`:'';
-  el.innerHTML=`<div class="dialog-heading"><h2>片段详情</h2><button class="icon-button close-dialog" aria-label="关闭">${icon('x')}</button></div><h3 class="detail-title">${e(clip.display_song_title)}</h3><div class="detail-original">${e(clip.raw_title)}</div><dl class="detail-grid"><dt>UP 主</dt><dd>${e(clip.uploader_name)} · UID ${e(clip.uploader_uid)}</dd><dt>上传时间</dt><dd>${dateTime(clip.published_at)}（当前时区）</dd><dt>分 P 信息</dt><dd>P${clip.part_number} · ${e(clip.raw_part_title)} · CID ${e(clip.cid)}</dd><dt>判断依据</dt><dd>${e(clip.classification_reason)}${clip.manual_fields.length?' · 含手动修正':''}</dd><dt>来源</dt><dd>${clip.sources.map(s=>e(s.display_name)).join('、')}</dd>${credit}</dl><div class="tag-list">${clip.tags.map(tag=>`<span class="badge">${e(tag)}</span>`).join('')}</div><div class="review-actions"><button class="button primary small" data-classify="included" data-id="${e(id)}">确认收录</button><button class="button secondary small" data-classify="excluded" data-id="${e(id)}">排除此片段</button><button class="button secondary small" data-classify="needs_review" data-id="${e(id)}">保留待确认</button>${clip.playback_url?`<a class="button secondary small" href="${e(clip.playback_url)}" data-open="${e(id)}" target="_blank" rel="noopener noreferrer">${icon('external')}打开原视频</a><button type="button" class="button secondary small" data-copy-url="${e(clip.playback_url)}">复制链接</button>`:''}</div><details><summary>修改歌名、分组与备注</summary><form id="annotation-form" data-id="${e(id)}"><label class="field">显示歌名<input name="display_song_title" required maxlength="500" value="${e(clip.display_song_title)}"></label><label class="field">歌曲分组<input name="song_group" maxlength="200" value="${e(clip.song_group)}" placeholder="用于归拢不同演唱版本"></label><label class="field">个人备注<input name="notes" maxlength="5000" value="${e(clip.notes)}"></label><button class="button primary small">保存修正</button></form></details><details><summary>原始描述与数据来源</summary><div class="detail-description">${e(clip.description || '暂无描述')}</div><p class="detail-stats">${Object.entries(clip.statistics).map(([key,v])=>`${({view:'播放',like:'点赞',coin:'投币',favorite:'收藏',share:'分享',reply:'评论',danmaku:'弹幕'})[key]}：${v==null?'未知':v.toLocaleString()}`).join(' · ')}<br>以上为整个原视频的统计，不是此分 P 的单独统计。<br>获取于 ${dateTime(clip.stats_fetched_at)} · ${e(clip.provenance.details)}</p></details>`;
-  if(!$('#detail-dialog').open)$('#detail-dialog').showModal();
+  el.innerHTML=`<div class="dialog-heading"><h2>片段详情</h2><button class="icon-button close-dialog" aria-label="关闭">${icon('x')}</button></div><h3 class="detail-title">${e(clip.display_song_title)}</h3><div class="detail-original">${e(clip.raw_title)}</div><dl class="detail-grid"><dt>UP 主</dt><dd>${e(clip.uploader_name)} · UID ${e(clip.uploader_uid)}</dd><dt>上传时间</dt><dd>${dateTime(clip.published_at)}（当前时区）</dd><dt>分 P 信息</dt><dd>P${clip.part_number} · ${e(clip.raw_part_title)} · CID ${e(clip.cid)}</dd><dt>判断依据</dt><dd data-detail-reason>${e(clip.classification_reason)}${clip.manual_fields.length?' · 含手动修正':''}</dd><dt>来源</dt><dd>${clip.sources.map(s=>e(s.display_name)).join('、')}</dd>${credit}</dl><div class="tag-list">${clip.tags.map(tag=>`<span class="badge">${e(tag)}</span>`).join('')}</div><div class="review-actions"><button class="button primary small" data-classify="included" data-id="${e(id)}">确认收录</button><button class="button secondary small" data-classify="excluded" data-id="${e(id)}">排除此片段</button><button class="button secondary small" data-classify="needs_review" data-id="${e(id)}">保留待确认</button>${clip.playback_url?`<a class="button secondary small" href="${e(clip.playback_url)}" data-open="${e(id)}" target="_blank" rel="noopener noreferrer">${icon('external')}打开原视频</a><button type="button" class="button secondary small" data-copy-url="${e(clip.playback_url)}">复制链接</button>`:''}</div><p id="detail-feedback" class="field-help" role="status" hidden></p><details><summary>修改歌名、分组与备注</summary><form id="annotation-form" data-id="${e(id)}"><label class="field">显示歌名<input name="display_song_title" required maxlength="500" value="${e(clip.display_song_title)}"></label><label class="field">歌曲分组<input name="song_group" maxlength="200" value="${e(clip.song_group)}" placeholder="用于归拢不同演唱版本"></label><label class="field">个人备注<input name="notes" maxlength="5000" value="${e(clip.notes)}"></label><button class="button primary small">保存修正</button></form></details><details><summary>原始描述与数据来源</summary><div class="detail-description">${e(clip.description || '暂无描述')}</div><p class="detail-stats">${Object.entries(clip.statistics).map(([key,v])=>`${({view:'播放',like:'点赞',coin:'投币',favorite:'收藏',share:'分享',reply:'评论',danmaku:'弹幕'})[key]}：${v==null?'未知':v.toLocaleString()}`).join(' · ')}<br>以上为整个原视频的统计，不是此分 P 的单独统计。<br>获取于 ${dateTime(clip.stats_fetched_at)} · ${e(clip.provenance.details)}</p></details>`;
+  const form=el.querySelector('#annotation-form');
+  detailEditor={id,form,original:Object.fromEntries(new FormData(form)),saving:false};
+  detailDialog.showModal();
+}
+async function saveAnnotation(editor, patch, message) {
+  if (!editor || editor!==detailEditor || !detailDialog.open || editor.saving) return;
+  if (!Object.keys(patch).length) { detailDialog.close(); return; }
+  editor.saving=true;
+  const buttons=detailDialog.querySelectorAll('[data-classify], #annotation-form button');
+  buttons.forEach(button=>button.disabled=true);
+  const feedback=$('#detail-feedback');
+  feedback.hidden=true;
+  try {
+    const clip=await api(`/api/clips/${encodeURIComponent(editor.id)}/annotation`,{method:'PATCH',body:JSON.stringify(patch)});
+    if (detailDialog.open && editor===detailEditor) {
+      Object.assign(editor.original,patch);
+      if (patch.inclusion_status) clearSelection();
+      if (Object.keys(annotationChanges(editor)).length) {
+        // The user can keep typing during a save. Preserve edits newer than the submitted values.
+        detailDialog.querySelector('.detail-title').textContent=clip.display_song_title;
+        detailDialog.querySelector('[data-detail-reason]').textContent=clip.classification_reason+(clip.manual_fields.length?' · 含手动修正':'');
+        feedback.textContent='本次修改已保存。其他改动仍待保存。';feedback.hidden=false;
+      } else {
+        detailDialog.close();toast(message);
+      }
+    }
+  } catch(error) {
+    if (detailDialog.open && editor===detailEditor) {feedback.textContent=error.message;feedback.hidden=false;}
+    return;
+  } finally {
+    editor.saving=false;
+    buttons.forEach(button=>button.disabled=false);
+  }
+  await refresh();
 }
 
 document.addEventListener('click',async event=>{
@@ -519,14 +645,9 @@ document.addEventListener('click',async event=>{
       event.preventDefault();const result=await api(`/api/clips/${encodeURIComponent(button.dataset.open)}/open`,{method:'POST'});
       if(!result.opened)toast('无法启动默认浏览器，请使用原视频链接。',result.url);
     }
-    if(button.dataset.bookmark) {
-      const clip=state.clips.items.find(c=>c.id===button.dataset.bookmark);
-      await api(`/api/clips/${encodeURIComponent(clip.id)}/bookmark`,{method:'PATCH',body:JSON.stringify({bookmarked:!clip.bookmarked})});
-      if(clip.bookmarked && state.filter==='bookmarked')state.selected.delete(clip.id);
-      await refresh();
-    }
+    if(button.dataset.bookmark)await toggleBookmark(button);
     if(button.dataset.detail)await showDetail(button.dataset.detail);
-    if(button.dataset.classify){await api(`/api/clips/${encodeURIComponent(button.dataset.id)}/annotation`,{method:'PATCH',body:JSON.stringify({inclusion_status:button.dataset.classify})});$('#detail-dialog').close();clearSelection();await refresh();toast('已保存你的决定，后续采集会保留。');}
+    if(button.dataset.classify)await saveAnnotation(detailEditor,{inclusion_status:button.dataset.classify},'已保存你的决定，后续采集会保留。');
     if(button.dataset.bulk){
       const ids=[...state.selected.keys()];$$('[data-bulk]').forEach(el=>el.disabled=true);let saved=0;
       try {
@@ -550,7 +671,7 @@ document.addEventListener('click',async event=>{
 });
 document.addEventListener('submit',async event=>{
   if(event.target.id!=='annotation-form')return;event.preventDefault();
-  try{await api(`/api/clips/${encodeURIComponent(event.target.dataset.id)}/annotation`,{method:'PATCH',body:JSON.stringify(Object.fromEntries(new FormData(event.target)))});$('#detail-dialog').close();await refresh();toast('修正已保存。');}catch(error){toast(error.message);}
+  if (detailEditor?.form===event.target) await saveAnnotation(detailEditor,annotationChanges(detailEditor),'修正已保存。');
 });
 document.addEventListener('change',event=>{
   const input=event.target;
@@ -641,11 +762,30 @@ $('#export-button').onclick=async()=>{
 };
 $('#add-source').onclick=()=>showSource();
 $('#source-form').onsubmit=async event=>{
-  event.preventDefault();$('#source-form-error').textContent='';
+  event.preventDefault();
+  const draft=state.editSource,dialog=$('#source-dialog');
+  if(!dialog.open || !draft || draft.saving)return;
+  const {source}=draft;
   const data={display_name:$('#source-name').value.trim(),url:$('#source-url').value.trim(),singing_collection:$('#singing-collection').checked};
-  if(!data.display_name && state.editSource)data.display_name=state.editSource.display_name;
-  if(state.editSource && data.url===state.editSource.canonical_url)delete data.url;
-  try{await api('/api/sources'+(state.editSource?'/'+state.editSource.id:''),{method:state.editSource?'PATCH':'POST',body:JSON.stringify(data)});$('#source-dialog').close();await loadOverview();toast('来源已保存。');}catch(error){$('#source-form-error').textContent=error.message;}
+  if(!data.display_name && source)data.display_name=source.display_name;
+  if(source && data.url===source.canonical_url)delete data.url;
+  draft.saving=true;
+  setSourceSaving(true);
+  $('#source-form-error').textContent='';
+  try {
+    await api('/api/sources'+(source?'/'+source.id:''),{method:source?'PATCH':'POST',body:JSON.stringify(data)});
+    if(state.editSource===draft && dialog.open)dialog.close();
+  }catch(error){
+    if(state.editSource===draft && dialog.open)$('#source-form-error').textContent=error.message;
+    else toast(error.message);
+    return;
+  }finally{
+    draft.saving=false;
+    if(state.editSource===draft)setSourceSaving(false);
+  }
+  toast('来源已保存。');
+  try {await loadOverview();}
+  catch(error){notice('来源已保存，列表暂时未能刷新。'+error.message,true);}
 };
 document.addEventListener('keydown',event=>{if(event.key==='/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName) && !document.querySelector('dialog[open]')){event.preventDefault();if(state.view==='sources')setView('catalog',true);$('#search').focus();}});
 window.addEventListener('hashchange',readRoute);

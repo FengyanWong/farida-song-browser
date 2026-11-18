@@ -1,7 +1,14 @@
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
+from threading import Barrier
 
 import pytest
+from fastapi.testclient import TestClient
 
+from farida.app import create_app
+from farida.backup import export_backup, restore_backup
 from farida.classifier import classify
 from farida.db import Database
 
@@ -22,6 +29,94 @@ def test_repeat_scan_and_cross_source_dedup(db,source,video):
     assert db.overview()["entries"]==2
     assert len(db.clip("BV1br4y1R7BP:100")["sources"])==2
     assert db.clip("BV1br4y1R7BP:100")["uploader_uid"]=="394803911"
+
+
+def test_detail_reads_all_source_and_curated_credit_from_one_snapshot(db, source, video, monkeypatch):
+    db.save_video(source, video, [])
+    collection = db.add_source("旧收藏夹", "https://space.bilibili.com/123/favlist?fid=456")
+    db.save_video(collection, video, [])
+    curated = next(s for s in db.sources() if s["source_type"] == "songlist")
+    song = {"id": 1, "bvid": video["bvid"], "song_title": "原始整理曲名", "original_artist": "演唱者", "language": "国语", "style": ""}
+    db.save_songlist(curated, [song])
+    clip_id = video["bvid"] + ":100"
+    old = db.clip(clip_id)
+    assert {row["id"] for row in old["sources"]} == {source["id"], collection["id"]}
+    assert old["has_curated_credit"] and old["songlist_credits"][0]["song_title"] == song["song_title"]
+
+    snapshot = export_backup(db)
+    tables = snapshot["tables"]
+    next(row for row in tables["annotations"] if row["clip_id"] == clip_id)["display_song_title"] = "恢复的曲名"
+    tables["memberships"] = [row for row in tables["memberships"] if row["source_id"] != collection["id"]]
+    tables["curated_songs"] = []
+    other = Database(db.path)
+    connect = db.connect
+    restored, failures, reads = [], [], []
+
+    @contextmanager
+    def restore_between_detail_queries():
+        reads.append(True)
+        with connect() as con:
+            def trace(sql):
+                if sql.startswith("SELECT s.id,s.display_name") and not restored:
+                    try:
+                        restored.append(restore_backup(other, snapshot))
+                    except Exception as exc:
+                        failures.append(exc)
+            con.set_trace_callback(trace)
+            yield con
+    with monkeypatch.context() as patch:
+        patch.setattr(db, "connect", restore_between_detail_queries)
+        result = db.clip(clip_id)
+    assert restored and not failures and len(reads) == 1
+    assert result == old
+    current = db.clip(clip_id)
+    assert current["display_song_title"] == "恢复的曲名" and not current["has_curated_credit"]
+    assert [row["id"] for row in current["sources"]] == [source["id"]] and current["songlist_credits"] == []
+
+
+def test_bookmarks_update_archived_annotated_parts_and_return_404_for_unknown_parts(settings, video, monkeypatch):
+    with TestClient(create_app(settings, scan_on_start=False)) as client:
+        db = client.app.state.db
+        db.save_video(db.source(1), video, [])
+        clip_id = video["bvid"] + ":100"
+        db.annotate([clip_id], {"notes": "个人备注"})
+        db.execute("UPDATE parts SET active=0 WHERE id=?", (clip_id,))
+        client.headers["X-Farida-Token"] = client.get("/api/session").json()["token"]
+        url = "/api/clips/" + clip_id + "/bookmark"
+        monkeypatch.setattr(db, "clip", lambda *args: pytest.fail("Bookmark must not load clip metadata"))
+        for value in (True, True, False):
+            response = client.patch(url, json={"bookmarked": value})
+            assert response.status_code == 200 and response.json() == {"bookmarked": value}
+            assert db.one("SELECT bookmarked,notes FROM user_state WHERE clip_id=?", (clip_id,)) == {
+                "bookmarked": int(value), "notes": "个人备注"}
+        assert client.patch("/api/clips/missing/bookmark", json={"bookmarked": True}).status_code == 404
+        db.execute("DELETE FROM annotations WHERE clip_id=?", (clip_id,))
+        assert client.patch(url, json={"bookmarked": True}).status_code == 404
+        assert db.one("SELECT bookmarked,notes FROM user_state WHERE clip_id=?", (clip_id,)) == {
+            "bookmarked": 0, "notes": "个人备注"}
+
+
+def test_bookmark_and_note_writes_commute_and_failed_update_rolls_back(db, source, video):
+    db.save_video(source, video, [])
+    clip_id = video["bvid"] + ":100"
+    barrier = Barrier(2)
+
+    def save(bookmark):
+        writer = Database(db.path)
+        barrier.wait(timeout=5)
+        if bookmark:
+            writer.bookmark(clip_id, True)
+        else:
+            writer.annotate([clip_id], {"notes": "同时保存的备注"})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(save, (True, False)))
+    db.execute("CREATE TRIGGER reject_bookmark BEFORE UPDATE OF bookmarked ON user_state "
+               "BEGIN SELECT RAISE(ABORT,'fixture rollback'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="fixture rollback"):
+        db.bookmark(clip_id, False)
+    assert db.one("SELECT bookmarked,notes FROM user_state WHERE clip_id=?", (clip_id,)) == {
+        "bookmarked": 1, "notes": "同时保存的备注"}
 
 
 def test_cid_mapping_and_manual_overrides_survive(db,source,video):
