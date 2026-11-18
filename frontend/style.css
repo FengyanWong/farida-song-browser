@@ -56,3 +56,10 @@
 #missing-links-list strong { font-weight: 500; font-size: 13px; }
 #missing-links-list small, #missing-links-list a { font-size: 11px; }
 .missing-links-footer { margin-top: 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.column-sort {
+  display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0;
+  color: inherit; background: transparent; font: inherit; white-space: nowrap;
+}
+.column-sort:hover, .column-sort:focus-visible { color: var(--accent); }
+th:not([aria-sort]) .column-sort [data-icon] { display: none; }
+th[aria-sort="ascending"] .column-sort svg { transform: rotate(180deg); }

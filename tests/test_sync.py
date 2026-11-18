@@ -370,6 +370,39 @@ async def test_incremental_refresh_repairs_legacy_uploader_evidence_and_preserve
     assert db.one("SELECT singing_collection FROM sources WHERE id=1")["singing_collection"] == 0
 
 
+@pytest.mark.parametrize("collection_first", [False, True])
+async def test_shared_collection_evidence_survives_refresh_order(db, settings, video, collection_first):
+    collection = db.add_source("歌唱合集", "https://space.bilibili.com/123/lists/456", singing_collection=True)
+    discovery = next(s for s in db.sources() if s["source_type"] == "search")
+    video.update(title="工作室现场", desc="")
+    video["pages"][0]["part"] = "现场录制"
+    video["pages"][1]["part"] = "闲聊"
+    video["pages"].append({"cid": 300, "page": 3, "part": "个人选择", "duration": 10})
+    first, mixed, manual = [f"{video['bvid']}:{part['cid']}" for part in video["pages"]]
+    adapter = FakeAdapter(video)
+    tag_calls = []
+    async def no_tags(bvid):
+        tag_calls.append(bvid)
+        return []
+    adapter.get_video_tags = no_tags
+    worker = Collector(db, settings, lambda _: adapter)
+    ids = [collection["id"], 1] if collection_first else [1, collection["id"]]
+    for index, source_id in enumerate([*ids, discovery["id"]]):
+        job = worker.start([source_id], "incremental")
+        await worker.task
+        assert db.job(job["id"])["state"] == "completed"
+        if index == 0:
+            assert db.clip(first)["inclusion_status"] == ("included" if collection_first else "needs_review")
+            db.annotate([manual], {"display_song_title": "我的曲名", "inclusion_status": "excluded"})
+        else:
+            included = db.clip(first)
+            assert included["inclusion_status"] == "included" and "歌唱合集" in included["classification_reason"]
+            assert db.clip(mixed)["inclusion_status"] == "needs_review"
+            saved = db.clip(manual)
+            assert (saved["display_song_title"], saved["inclusion_status"]) == ("我的曲名", "excluded")
+    assert adapter.calls == [1, 1, 1] and adapter.video_calls == tag_calls == [video["bvid"]]
+
+
 async def test_first_scan_of_verified_singing_collection_classifies_with_fresh_identity(db, settings, video):
     source = db.add_source("歌唱合集", "https://space.bilibili.com/123/lists/456?type=season", singing_collection=True)
     assert source["verification_status"] == "pending"

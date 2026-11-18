@@ -7,7 +7,7 @@ import secrets
 import sqlite3
 import tempfile
 import webbrowser
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from datetime import date
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -29,11 +29,11 @@ from .sync import Collector
 from .lifetime import WindowLifetime
 from .playback import Playback
 from .player_state import PlayerState
-from .backup import export_backup, restore_validated_backup, validate_backup, LIMIT
+from .backup import BackupTooLarge, LIMIT, restore_validated_backup, validate_backup, write_backup
 
 
 CatalogDate = AwareDatetime | date
-CatalogSort = Literal["newest", "oldest", "title", "uploader", "discovered"]
+CatalogSort = Literal["newest", "oldest", "title", "title_desc", "uploader", "uploader_desc", "discovered"]
 
 
 def csv_cell(value):
@@ -42,17 +42,20 @@ def csv_cell(value):
     return "'" + text if text.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")) else value
 
 
-class CatalogCSVResponse(StreamingResponse):
+class DownloadResponse(StreamingResponse):
     """Own the completed spool until the HTTP download finishes or disconnects."""
 
-    def __init__(self, stream):
+    def __init__(self, stream, media_type, filename):
         self.stream = stream
         size = stream.tell()
         stream.seek(0)
-        super().__init__(
-            iter(lambda: stream.read(32 * 1024), ""), media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": "attachment; filename=farida-clips.csv", "Content-Length": str(size)},
-        )
+        super().__init__(self.chunks(), media_type=media_type, headers={
+            "Content-Disposition": f"attachment; filename={filename}", "Content-Length": str(size),
+        })
+
+    def chunks(self):
+        while chunk := self.stream.read(32 * 1024):
+            yield chunk
 
     async def __call__(self, scope, receive, send):
         try:
@@ -511,7 +514,7 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
             with db.csv_rows(**filters) as rows:
                 for row in rows:
                     writer.writerow(csv_cell(value) for value in row)
-            return CatalogCSVResponse(stream)
+            return DownloadResponse(stream, "text/csv; charset=utf-8", "farida-clips.csv")
         except BaseException:
             stream.close()
             raise
@@ -595,7 +598,15 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
 
     @app.get("/api/backup")
     def backup():
-        return JSONResponse(export_backup(db), headers={"Content-Disposition": "attachment; filename=farida-backup.json"})
+        with ExitStack() as cleanup:
+            try:
+                stream = cleanup.enter_context(tempfile.TemporaryFile())
+                write_backup(db, stream)
+                response = DownloadResponse(stream, "application/json", "farida-backup.json")
+            except OSError as error:
+                raise HTTPException(507, "无法写入备份临时文件，请检查磁盘空间和写入权限。") from error
+            cleanup.pop_all()  # The response now owns the file through download or disconnect.
+            return response
 
     @app.post("/api/restore")
     async def restore(request: Request):
@@ -603,7 +614,7 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
         raw = bytearray()
         async for chunk in request.stream():
             if len(raw) + len(chunk) > LIMIT:
-                raise HTTPException(413, "备份超过 64 MB。")
+                raise HTTPException(413, "可恢复的 JSON 备份上限为 64 MiB。")
             raw.extend(chunk)
         try:
             data = json.loads(raw)
@@ -618,6 +629,8 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
                     safety = restore_validated_backup(db, data)
                     preference_writers.clear()
             return {"restored": True, "safety_backup": safety}
+        except BackupTooLarge as error:
+            raise HTTPException(409, "本机数据超过 64 MiB，无法保存恢复前备份，未替换本机数据。") from error
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError, sqlite3.DatabaseError) as error:
             raise HTTPException(400, "备份无效，未恢复数据。请检查文件格式。") from error
 

@@ -148,9 +148,31 @@ function catalogScope(params) {
   scope.delete('page');
   return scope.toString();
 }
+const sortSelect=$('#sort');
+const sortButtons=$$('th .column-sort');
+function showColumnOrder(order) {
+  for(const button of sortButtons){
+    const {first,reverse}=button.dataset,header=button.closest('th');
+    if(order===first || order===reverse){
+      const ascending=['oldest','title','uploader'].includes(order);
+      header.setAttribute('aria-sort',ascending?'ascending':'descending');
+    }else header.removeAttribute('aria-sort');
+    const next=sortSelect.value===first?reverse:first;
+    button.title=sortSelect.querySelector('option[value="'+next+'"]').textContent;
+  }
+}
+for(const button of sortButtons){
+  button.onclick=()=>{
+    const {first,reverse}=button.dataset;
+    sortSelect.value=sortSelect.value===first?reverse:first;
+    filtersChanged();
+  };
+}
+showColumnOrder(sortSelect.value);
 function guardCatalogResults(scope) {
   const stale=displayedCatalogScope!==undefined && displayedCatalogScope!==scope;
-  $('.table-scroll').inert=stale;
+  $('#clip-rows').inert=stale;
+  $('#select-page').inert=stale;
   $('.table-footer').inert=stale;
   $('#bulk-bar').inert=stale;
   if (stale && state.selected.size) clearSelection();
@@ -169,6 +191,7 @@ async function loadClips() {
       result.page=lastPage;
     }
     displayedCatalogScope=scope;
+    showColumnOrder(params.get('sort'));
     state.clips=result;
     if (state.selected.size) {
       result.items.forEach((clip, index) => {
@@ -634,6 +657,7 @@ try {
   notice('无法连接本地服务，请重新打开法里达 EXE。'+error.message,true);
 }
 
+const backupImportLimit=64*1024*1024;
 $('#backup-download').onclick=async()=>{
   try {
     await playlistPlayer.persistPreferences();
@@ -641,13 +665,14 @@ $('#backup-download').onclick=async()=>{
     const file=await api('/api/backup',{asBlob:true});
     const url=URL.createObjectURL(file);
     const link=document.createElement('a');link.href=url;link.download='farida-backup-'+new Date().toISOString().slice(0,10)+'.json';link.click();
-    setTimeout(()=>URL.revokeObjectURL(url),1000);toast('备份已下载，不含登录凭据。');
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+    toast(file.size>backupImportLimit?'已导出完整备份。此文件超过应用可恢复的 64 MiB 上限。':'备份已下载，不含登录凭据。');
   }catch(error){toast(error.message);}
 };
 $('#backup-restore').onclick=()=>$('#backup-file').click();
 $('#backup-file').onchange=async event=>{
   const file=event.target.files[0];event.target.value='';if(!file)return;
-  if(file.size>64*1024*1024){toast('备份不能超过 64 MB。');return;}
+  if(file.size>backupImportLimit){toast('可恢复的 JSON 备份上限为 64 MiB。');return;}
   if(!confirm('恢复将替换本机的歌曲目录、来源、收藏、备注和歌单。应用会先保存一份恢复前备份；登录信息不变。继续？'))return;
   $('#backup-restore').disabled=true;
   try {

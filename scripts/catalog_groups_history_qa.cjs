@@ -122,6 +122,29 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
     await page.locator('#search').fill('');
     await until(async()=>await page.locator('#clip-rows [data-play]').count()===40);
     pass('Pasting a shared Bilibili link selects the saved clip and Copy Link returns its clean original URL');
+    const sortBy=async (column,sort,direction)=>{
+      const heading=page.locator('th').filter({has:page.locator('button[data-first="'+column+'"]')});
+      const control=heading.getByRole('button');
+      await control.focus();await control.press('Enter');
+      await until(async()=>await heading.getAttribute('aria-sort')===direction);
+      assert.equal(await page.locator('#sort').inputValue(),sort);
+      assert.equal(await page.locator('th[aria-sort]').count(),1);
+      assert.equal(await control.evaluate(el=>document.activeElement===el),true);
+      const rows=(await api('/api/clips?compact=true&sort='+sort)).items.map(row=>row.id);
+      assert.deepEqual(await page.locator('#clip-rows [data-select]').evaluateAll(nodes=>nodes.map(node=>node.dataset.select)),rows);
+    };
+    await sortBy('newest','oldest','ascending');
+    await sortBy('title','title','ascending');
+    await sortBy('title','title_desc','descending');
+    await sortBy('uploader','uploader','ascending');
+    await sortBy('uploader','uploader_desc','descending');
+    await page.locator('#filter-button').click();
+    await page.locator('#sort').selectOption('discovered');
+    await until(async()=>await page.locator('th[aria-sort]').count()===0);
+    await page.locator('#filter-button').click();
+    await sortBy('newest','newest','descending');
+    pass('Column headings sort by title, uploader and date, keep keyboard focus, and show the same order as the advanced filter');
+
     await page.locator('#page-number').click();
     const pageTarget=page.locator('#page-target');
     assert.equal(await pageTarget.inputValue(),'1');

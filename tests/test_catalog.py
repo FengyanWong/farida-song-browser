@@ -69,6 +69,7 @@ def test_latin_spaces_punctuation_and_sort_entire_set(db,source,video):
         db.save_video(source,sample,[])
     assert db.clips(q="ain't no")["total"]==1
     assert db.clips(sort="title",page_size=1)["items"][0]["display_song_title"]=="Abba"
+    assert db.clips(sort="title_desc",page_size=1)["items"][0]["display_song_title"]=="Zulu"
     assert db.clips(sort="oldest",page=2,page_size=1)["items"][0]["video_bvid"]=="BV0000000002"
     assert db.clips(after="2023-11-17")["total"]==1
 
@@ -115,6 +116,48 @@ def test_union_flag_or_name_alone_cannot_verify_uploader(db, source, video, staf
     with pytest.raises(ValueError):
         db.save_video(source, video, ['法里达'])
     assert db.overview()['submissions'] == 0
+
+
+@pytest.mark.parametrize("change", ["unmark", "retarget", "remove_membership", "unverify"])
+def test_reclassification_uses_current_collection_and_curated_evidence(db, video, change):
+    collection = db.add_source("歌唱合集", "https://space.bilibili.com/123/lists/456", singing_collection=True)
+    db.verified_source(collection["id"], {"uid": "123", "name": "歌唱合集", "method": "fixture"})
+    marked = db.source(collection["id"])
+    uploader = db.source(1)
+    db.verified_source(1, {"uid": uploader["uid"], "name": uploader["display_name"], "method": "fixture"})
+    songlist = next(s for s in db.sources() if s["source_type"] == "songlist")
+    db.save_songlist(songlist, [{"id": 1, "bvid": video["bvid"], "song_title": "田间", "original_artist": "", "language": "", "style": ""}])
+    video.update(title="工作室日常", desc="")
+    video["pages"][0]["part"] = "现场记录"
+    video["pages"][1]["part"] = "田间"
+    plain, curated = [f"{video['bvid']}:{part['cid']}" for part in video["pages"]]
+    db.save_video(marked, video, [])
+    db.save_video(uploader, video, [])
+    assert db.clip(plain)["inclusion_status"] == "included"
+    if change == "unmark":
+        db.update_source(marked["id"], {"singing_collection": False})
+        # A caller can still hold a source dictionary from before the edit.
+        db.save_video(marked, video, [])
+        assert db.clip(plain)["inclusion_status"] == "needs_review"
+    elif change == "retarget":
+        db.update_source(marked["id"], {"url": "https://space.bilibili.com/123/lists/999"})
+        db.verified_source(marked["id"], {"uid": "123", "name": "另一合集", "method": "fixture"})
+    elif change == "remove_membership":
+        db.execute("DELETE FROM memberships WHERE source_id=? AND video_bvid=?", (marked["id"], video["bvid"]))
+    else:
+        db.execute("UPDATE sources SET verification_status='pending' WHERE id=?", (marked["id"],))
+    discovery = next(s for s in db.sources() if s["source_type"] == "search")
+    db.save_video(discovery, video, [])
+    assert db.clip(plain)["inclusion_status"] == "needs_review"
+    assert db.clip(curated)["inclusion_status"] == "included" and "CLANNADOR" in db.clip(curated)["classification_reason"]
+
+
+def test_discovery_only_rechecks_required_tags_without_reusing_previous_decision(db, video):
+    discovery = next(s for s in db.sources() if s["source_type"] == "search")
+    clip_id = video["bvid"] + ":100"
+    for tags, status in [(["法里达"], "needs_review"), (["法里达", "直播切片"], "included"), (["直播切片"], "needs_review")]:
+        db.save_video(discovery, video, tags)
+        assert db.clip(clip_id)["inclusion_status"] == status
 
 
 def test_classifier_ambiguity_and_search_tags(video,source):

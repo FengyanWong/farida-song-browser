@@ -12,18 +12,53 @@ TABLES = LEGACY_TABLES + ("listening_history",)
 LIMIT = 64 * 1024 * 1024
 
 
-def _snapshot(con):
-    tables = {}
-    for table in TABLES:
-        query = PLAYER_STATE_SQL if table == "playback_state" else f"SELECT * FROM {table}"
-        tables[table] = [dict(row) for row in con.execute(query)]
-    return {"format": "farida-backup", "version": 2, "created_at": now(), "tables": tables}
+class BackupTooLarge(ValueError):
+    """The current catalog would exceed the maximum restorable JSON size."""
+
+
+def _rows(con, table):
+    query = PLAYER_STATE_SQL if table == "playback_state" else f"SELECT * FROM {table}"
+    return (dict(row) for row in con.execute(query))
+
+
+def _header():
+    return {"format": "farida-backup", "version": 2, "created_at": now()}
 
 
 def export_backup(db):
     with db.connect() as con:
         con.execute("BEGIN")
-        return _snapshot(con)
+        return {**_header(), "tables": {table: list(_rows(con, table)) for table in TABLES}}
+
+
+def _write_snapshot(con, stream, *, max_bytes=None):
+    encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    size = 0
+
+    def write(text):
+        nonlocal size
+        chunk = text.encode("utf-8")
+        size += len(chunk)
+        if max_bytes is not None and size > max_bytes:
+            raise BackupTooLarge("本机数据超过 64 MiB，无法生成可恢复的备份。")
+        stream.write(chunk)
+
+    # Extend the compact metadata object with table arrays, one SQLite row at a time.
+    write(encoder.encode(_header())[:-1] + ',"tables":{')
+    for table_index, table in enumerate(TABLES):
+        write(("," if table_index else "") + encoder.encode(table) + ":[")
+        for row_index, row in enumerate(_rows(con, table)):
+            if row_index:
+                write(",")
+            write(encoder.encode(row))
+        write("]")
+    write("}}")
+
+
+def write_backup(db, stream):
+    with db.connect() as con:
+        con.execute("BEGIN")
+        _write_snapshot(con, stream)
 
 
 def _normalized_backup(data):
@@ -126,11 +161,11 @@ def _save_recovery(con, folder):
     pending = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=folder, prefix="before-restore-" + now().replace(":", "-") + "-",
+            mode="wb", dir=folder, prefix="before-restore-" + now().replace(":", "-") + "-",
             suffix=".tmp", delete=False,
         ) as stream:
             pending = Path(stream.name)
-            json.dump(_snapshot(con), stream, ensure_ascii=False, separators=(",", ":"))
+            _write_snapshot(con, stream, max_bytes=LIMIT)
             stream.flush()
             os.fsync(stream.fileno())
         ready = pending.with_suffix(".json")

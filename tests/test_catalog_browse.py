@@ -32,7 +32,7 @@ def test_compact_catalog_matches_full_page_for_sort_filter_and_group(settings, v
         db.execute("INSERT INTO curated_songs VALUES(6,1,'曲名','歌手','中','翻唱',?,'2026-01-01')",
                    (video["bvid"],))
 
-        for sort in ("newest", "oldest", "uploader", "title", "discovered"):
+        for sort in ("newest", "oldest", "uploader", "uploader_desc", "title", "title_desc", "discovered"):
             for extra in ({}, {"bookmarked": True, "q": "同一首歌", "source_id": 1},
                           {"q": f'https://www.bilibili.com/video/{video["bvid"]}/?p=2'},
                           {"page": 2, "page_size": 1}):

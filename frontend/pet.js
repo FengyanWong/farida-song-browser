@@ -18,12 +18,16 @@ export function spriteVersion(width, height) {
 }
 export function directionIndex(dx, dy) { return Math.round((Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360 / 22.5) % 16; }
 
+const DEFAULT_PET = {name:'Frida', version:2, url:'/assets/frida.webp'};
 let storage;
 function store() {
   if (!storage) storage = new Promise((resolve, reject) => {
     const req = indexedDB.open('farida-pets',1);
     req.onupgradeneeded = () => req.result.createObjectStore('settings');
     req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error);
+  }).catch(error => {
+    storage = undefined;
+    throw error;
   });
   return storage;
 }
@@ -37,12 +41,15 @@ async function storedPet(value, write=false) {
   });
 }
 
+async function savePet(pet) {
+  try { await storedPet(pet,true); return true; }
+  catch { return false; }
+}
+
 export class Pet {
   constructor() {
     this.node = $('#pet-sprite'); this.version = 2; this.row = 0; this.frame = 0;
     this.manualUntil = 0; this.pointerUntil = 0; this.status = 'idle'; this.pageActive = true;
-    this.motion = localStorage.getItem('pet-motion') !== 'false';
-    this.visible = localStorage.getItem('pet-visible') !== 'false';
     this.reduced = matchMedia('(prefers-reduced-motion: reduce)');
     this.node.addEventListener('click', () => this.gesture(3));
     this.node.addEventListener('dblclick', () => this.gesture(4));
@@ -55,20 +62,31 @@ export class Pet {
     this.resize.observe(this.node);
     $('#pet-settings').onclick = () => $('#pet-dialog').showModal();
     $('#pet-files').onchange = e => this.import(e.target.files);
-    $('#pet-visible').checked = this.visible; $('#pet-motion').checked = this.motion;
-    $('#pet-visible').onchange = e => { this.visible = e.target.checked; localStorage.setItem('pet-visible',this.visible); this.node.hidden = !this.visible; this.resetAnimation(); };
-    $('#pet-motion').onchange = e => { this.motion = e.target.checked; localStorage.setItem('pet-motion',this.motion); this.resetAnimation(); };
+    for (const option of ['visible','motion']) {
+      const control = $('#pet-' + option);
+      try { this[option] = localStorage.getItem(control.id) !== 'false'; }
+      catch { this[option] = true; }
+      control.checked = this[option];
+      control.onchange = () => {
+        this[option] = control.checked;
+        this.node.hidden = !this.visible;
+        this.resetAnimation();
+        try { localStorage.setItem(control.id, String(control.checked)); }
+        catch { $('#pet-message').textContent = '此设置仅在当前页面生效。'; }
+      };
+    }
     $('#pet-reset').onclick = async () => {
-      try { await storedPet(null,true); this.apply({name:'Frida',version:2,url:'/assets/frida.webp'}); $('#pet-message').textContent = '已恢复默认 Frida。'; }
-      catch { toast('无法保存宠物设置，请检查浏览器存储权限。'); }
+      const saved = await savePet(null);
+      this.apply(DEFAULT_PET);
+      $('#pet-message').textContent = saved ? '已恢复默认 Frida。' : '已在当前页面恢复默认 Frida，浏览器未能保存此设置。';
     };
     this.node.hidden = !this.visible;
   }
   async initialize() {
     try {
       const saved = await storedPet();
-      this.apply(saved ? {...saved,url:URL.createObjectURL(saved.blob)} : {name:'Frida',version:2,url:'/assets/frida.webp'});
-    } catch { this.apply({name:'Frida',version:2,url:'/assets/frida.webp'}); }
+      this.apply(saved ? {...saved,url:URL.createObjectURL(saved.blob)} : DEFAULT_PET);
+    } catch { this.apply(DEFAULT_PET); }
   }
   apply(pet) {
     if (this.url?.startsWith('blob:')) URL.revokeObjectURL(this.url);
@@ -178,8 +196,10 @@ export class Pet {
       }
       if (!hasTransparency) throw new Error('请选择带透明背景的精灵图。');
       const pet={name:String(metadata.displayName || sheet.name.replace(/\.(png|webp)$/i,'')).slice(0,80),version,blob:sheet};
-      await storedPet(pet,true); this.apply({...pet,url:URL.createObjectURL(sheet)});this.gesture(3);
-      message.textContent=`已加载 ${pet.name}（v${version}），并保存在此浏览器。`; toast('宠物已加载');
+      const saved = await savePet(pet);
+      this.apply({...pet,url:URL.createObjectURL(sheet)}); this.gesture(3);
+      const persistence = saved ? '并保存在此浏览器' : '仅在当前页面生效';
+      message.textContent = `已加载 ${pet.name}（v${version}），${persistence}。`; toast('宠物已加载');
     } catch(error) {message.textContent=error.message || '无法读取宠物文件。';}
     finally {$('#pet-files').value='';}
   }

@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from .adapter import BVID, parse_source, validated_video, video_has_uploader
-from .classifier import SINGING_COLLECTION_TYPES, classify, normalize
+from .classifier import SINGING_COLLECTION_TYPES, classify, is_singing_collection, normalize
 from .songlist import CURATOR, URL as SONGLIST_URL
 
 
@@ -189,7 +189,9 @@ def clip_order(sort):
         "newest": "v.published_at DESC",
         "oldest": "v.published_at ASC",
         "title": "fold(a.display_song_title) ASC",
+        "title_desc": "fold(a.display_song_title) DESC",
         "uploader": "fold(v.uploader_name) ASC",
+        "uploader_desc": "fold(v.uploader_name) DESC",
         # The first source that recorded the video determines discovery for
         # all of its parts. Later refreshes or additional sources cannot move it.
         "discovered": "(SELECT MIN(julianday(m.first_seen_at)) FROM memberships m "
@@ -417,13 +419,24 @@ class Database:
             curated = con.execute('SELECT song_title FROM curated_songs WHERE bvid=?', (bvid,)).fetchall()
             con.execute("INSERT INTO videos(" + ",".join(fields) + ") VALUES(" + ",".join("?" for _ in fields) + ") ON CONFLICT(bvid) DO UPDATE SET " + ",".join(f"{k}=excluded.{k}" for k in fields if k != "bvid"), list(fields.values()))
             con.execute("INSERT INTO memberships VALUES(?,?,?,?) ON CONFLICT(source_id,video_bvid) DO UPDATE SET last_seen_at=excluded.last_seen_at", (source["id"],bvid,stamp,stamp))
+            # Prefer verified singing evidence from any source that still lists this BV.
+            # A video found only by tag discovery must still pass that source's tag rules.
+            classification_source = source
+            for membership in con.execute("""
+                SELECT s.source_type,s.singing_collection,s.verification_status
+                FROM memberships m JOIN sources s ON s.id=m.source_id
+                WHERE m.video_bvid=? AND s.source_type!='search' AND (s.id=? OR s.verification_status='verified')
+            """, (bvid, source["id"])):
+                classification_source = dict(membership)
+                if is_singing_collection(classification_source):
+                    break
             # Old CIDs stay stored so annotations/bookmarks can survive a later reappearance.
             con.execute("UPDATE parts SET active=0 WHERE video_bvid=?", (bvid,))
             for part in data["pages"]:
                 clip_id = f"{bvid}:{part['cid']}"
                 con.execute("INSERT INTO parts(id,video_bvid,cid,part_number,raw_part_title,duration_seconds,active) VALUES(?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET part_number=excluded.part_number,raw_part_title=excluded.raw_part_title,duration_seconds=excluded.duration_seconds,active=1", (clip_id,bvid,str(part["cid"]),part["page"],part.get("part", ""),part.get("duration")))
                 song_names = {row['song_title'] for row in curated if len(data['pages']) == 1 or normalize(part.get('part', '').strip('《》')) == normalize(row['song_title'])}
-                title,status,reason,version = classify(data,part,tags,source,curated_song=next(iter(song_names)) if len(song_names) == 1 else None)
+                title,status,reason,version = classify(data,part,tags,classification_source,curated_song=next(iter(song_names)) if len(song_names) == 1 else None)
                 if clip_id not in existing_ids:
                     added_clips += 1
                     added_included += int(status == "included")
@@ -433,9 +446,6 @@ class Database:
                     if "display_song_title" in manual:
                         title = previous["display_song_title"]
                     if "inclusion_status" in manual:
-                        status,reason = previous["inclusion_status"],previous["classification_reason"]
-                    # A discovery search must not downgrade positive evidence from an uploader/collection.
-                    elif source["source_type"] == "search" and previous["inclusion_status"] == "included" and status == "needs_review":
                         status,reason = previous["inclusion_status"],previous["classification_reason"]
                     con.execute("UPDATE annotations SET display_song_title=?,inclusion_status=?,classification_reason=?,classification_version=? WHERE clip_id=?", (title,status,reason,version,clip_id))
                 else:

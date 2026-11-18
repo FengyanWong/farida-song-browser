@@ -27,6 +27,11 @@ async function until(test) {
     await until(async () => { assert.equal(server.exitCode,null); try {return (await fetch(base+'/api/health')).ok;} catch {return false;} });
     browser = await chromium.launch({channel:'msedge',headless:true});
     const page = await browser.newPage();
+    await page.addInitScript(() => {
+      for (const key of ['localStorage', 'indexedDB']) {
+        Object.defineProperty(window, key, {get() { throw new DOMException('Storage denied', 'SecurityError'); }});
+      }
+    });
     const errors = []; page.on('pageerror', error => errors.push(error.message));
     let overviews=0, clips=0, active=false;
     let readLists=false,readPlayer=false,releaseLists;
@@ -59,6 +64,37 @@ async function until(test) {
     await page.locator('[data-view=catalog]').click();
     await page.locator('#clip-rows tr').first().waitFor();
     await until(async()=>await page.locator('#pet-sprite').evaluate(el=>el.style.backgroundImage.includes('frida.webp')));
+    // Exercise both layouts and a rejected file without read or write access to browser storage.
+    await page.locator('#pet-settings').click();
+    assert.equal(await page.locator('#pet-visible').isChecked(),true);
+    assert.equal(await page.locator('#pet-motion').isChecked(),true);
+    const files = page.locator('#pet-files');
+    const spriteV1 = await page.evaluate(() => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1536;
+      canvas.height = 1872;
+      const ctx = canvas.getContext('2d');
+      for (let y=0; y<canvas.height; y+=208) {
+        for (let x=0; x<canvas.width; x+=192) ctx.fillRect(x,y,4,4);
+      }
+      return canvas.toDataURL('image/png').split(',')[1];
+    });
+    for (const [version, mimeType, buffer] of [
+      [1, 'image/png', Buffer.from(spriteV1,'base64')],
+      [2, 'image/webp', fs.readFileSync(path.resolve('frontend/assets/frida.webp'))],
+    ]) {
+      const name = `本页小伙伴${version}`;
+      await files.setInputFiles({name:name+(version===1 ? '.png' : '.webp'),mimeType,buffer});
+      await page.waitForFunction(expected => document.querySelector('#pet-name').textContent===expected, name);
+      assert.match(await page.locator('#pet-message').textContent(),/仅在当前页面/);
+    }
+    await files.setInputFiles({name:'invalid.png',mimeType:'image/png',buffer:Buffer.from('invalid')});
+    await page.waitForFunction(()=>document.querySelector('#pet-message').textContent.includes('不是 PNG'));
+    assert.equal(await page.locator('#pet-name').textContent(),'本页小伙伴2');
+    await page.locator('#pet-reset').click();
+    await page.waitForFunction(()=>document.querySelector('#pet-sprite').style.backgroundImage.includes('frida.webp'));
+    assert.match(await page.locator('#pet-message').textContent(),/当前页面/);
+    await page.locator('#pet-dialog .close-dialog').last().click();
     await page.clock.install();
     await page.evaluate(async () => {
       const {Pet} = await import('/pet.js');
@@ -81,6 +117,7 @@ async function until(test) {
     for (const [selector,enabled] of [['#pet-motion',false],['#pet-visible',false]]) {
       await page.evaluate(([choice,value])=>{window.petOption(choice,value);window.petTicks=0;},[selector,enabled]);
       await page.clock.runFor(3000);assert.equal(await page.evaluate(()=>window.petTicks),0);
+      if (selector==='#pet-visible') assert.equal(await page.locator('#pet-sprite').isHidden(),true);
       await page.evaluate(choice=>window.petOption(choice,true),selector);
     }
     await page.emulateMedia({reducedMotion:'reduce'});await page.clock.runFor(500);
@@ -118,7 +155,7 @@ async function until(test) {
     await page.clock.runFor(500);assert.ok(await page.evaluate(()=>window.petTicks)>0);
     await page.close();await until(()=>server.exitCode!==null);assert.equal(server.exitCode,0);
     assert.deepEqual(errors,[]);
-    console.log(JSON.stringify({idleFrames,intervalMs:2160,inactiveTicks:0,backgroundOverviewRequests:0,activeAndIdlePolling:true,restoredOnPageshow:true,errors}));
+    console.log(JSON.stringify({idleFrames,intervalMs:2160,inactiveTicks:0,backgroundOverviewRequests:0,activeAndIdlePolling:true,restoredOnPageshow:true,deniedStoragePetLayouts:[1,2],errors}));
   } finally {
     if (browser) await browser.close();
     if (server.exitCode===null) {
