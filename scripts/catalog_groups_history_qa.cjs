@@ -198,6 +198,49 @@ print(json.dumps({'ids':ids,'source_ids':[source['id'] for source in sources]},e
       await api(detailPath(clip.id)+'/annotation','PATCH',{display_song_title:clip.display_song_title,notes:clip.notes});
     }
     pass('Automatic titles are available only with a saved override and preserve drafts on cancellation, failed requests, retry and late replies');
+    const [clipC,clipD]=await firstDetails.evaluateAll(buttons=>buttons.slice(2,4).map(b=>b.dataset.detail));
+    const checkRow=(tab,id)=>tab.locator(`[data-select="${id}"]`);
+    const classify=async(tab,id,status)=>{
+      await tab.locator(`[data-detail="${id}"]`).click();
+      await tab.locator(`[data-classify="${status}"]`).click();
+      await tab.locator('#detail-dialog').waitFor({state:'hidden'});
+    };
+    const revisitCatalog=async()=>{
+      await page.locator('[data-view=sources]').click();
+      const loaded=page.waitForResponse(reply=>new URL(reply.url()).pathname==='/api/clips');
+      await page.locator('[data-view=catalog]').click();await(await loaded).finished();
+    };
+    await checkRow(page,clipA).check();await checkRow(page,clipB).check();
+    await classify(page,clipC,'excluded');await until(async()=>await checkRow(page,clipC).count()===0);
+    assert.equal(await checkRow(page,clipA).isChecked(),true);assert.equal(await checkRow(page,clipB).isChecked(),true);
+    const secondTab=await context.newPage();
+    try {
+      await secondTab.goto(base);await classify(secondTab,clipA,'excluded');
+      await revisitCatalog();await until(async()=>await checkRow(page,clipA).count()===0);
+      assert.match(await page.locator('#selected-count').textContent(),/2 项（本页 1 项）/);
+      let releaseBulk, bulkSeen;
+      const bulkGate=new Promise(resolve=>{releaseBulk=resolve;});
+      const receivedBulk=new Promise(resolve=>{bulkSeen=resolve;});
+      await page.route(url=>url.pathname==='/api/review/bulk',async route=>{
+        const response=await route.fetch();bulkSeen(await response.json());
+        await bulkGate;await route.fulfill({response});
+      },{times:1});
+      await page.locator('[data-bulk=included]').click();
+      try {
+        assert.deepEqual(await receivedBulk,{updated:1,conflicts:[clipA]});
+        await checkRow(page,clipB).uncheck();await checkRow(page,clipB).check();await checkRow(page,clipD).check();
+      } finally {releaseBulk();}
+      await until(async()=>await page.locator('[data-bulk=included]').isEnabled());
+      assert.match(await page.locator('#toast').textContent(),/已保存 1 个片段.*1 个片段.*已跳过/);
+      assert.equal((await api(detailPath(clipA))).inclusion_status,'excluded');
+      assert.equal(await checkRow(page,clipB).isChecked(),true);assert.equal(await checkRow(page,clipD).isChecked(),true);
+      await classify(page,clipB,'excluded');await until(async()=>await checkRow(page,clipB).count()===0);
+      assert.equal(await checkRow(page,clipD).isChecked(),true);assert.match(await page.locator('#selected-count').textContent(),/已选择 1 项/);
+    } finally {await secondTab.close();}
+    await page.locator('#clear-selection').click();
+    await api('/api/review/bulk','PATCH',{ids:[clipA,clipB,clipC],inclusion_status:'included'});
+    await revisitCatalog();
+    pass('Single-clip review preserves unrelated selections; bulk review skips changes made in another tab and preserves rows selected or reselected during a pending reply');
 
     const queries=[];
     page.on('request',req=>{

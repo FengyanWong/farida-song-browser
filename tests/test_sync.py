@@ -110,6 +110,98 @@ async def test_failed_scan_resumes_with_overlap_and_keeps_data(db,settings,video
     assert len(adapter.video_calls)==2
 
 
+@pytest.mark.parametrize("replace", [False, True])
+async def test_full_uploader_resume_finds_new_head_even_if_count_is_unchanged(db, settings, video, replace):
+    class PagedUploader(FakeAdapter):
+        list_entries = BilibiliAdapter.list_entries
+
+        async def signed(self, path, params):
+            assert path == "/x/space/wbi/arc/search" and params["ps"] == 30
+            page = params["pn"]
+            self.calls.append(page)
+            if page == 4 and not interrupted.is_set():
+                interrupted.set()
+                await asyncio.Event().wait()
+            offset = (page - 1) * params["ps"]
+            return {"list": {"vlist": [{"bvid": bvid} for bvid in upstream[offset:offset + params["ps"]]]},
+                    "page": {"count": len(upstream)}}
+
+        async def get_video_tags(self, bvid):
+            tag_calls.append(bvid)
+            return []
+
+    interrupted = asyncio.Event()
+    upstream = [f"BV{i:010d}" for i in range(100, 0, -1)]
+    tag_calls = []
+    video["pages"] = video["pages"][:1]
+    adapter = PagedUploader(video)
+    collector = Collector(db, settings, lambda _: adapter)
+    job_id = collector.start([1], "full")["id"]
+    await asyncio.wait_for(interrupted.wait(), timeout=15)
+    await collector.close()
+    assert db.job(job_id)["state"] == "interrupted" and db.job(job_id)["processed"] == 90
+    original_head = upstream[0]
+    db.bookmark(original_head + ":100", True)
+
+    # The source changes while the app is closed. Replacing its first upload even
+    # leaves the resumed boundary page and the advertised number of videos unchanged.
+    if replace:
+        upstream.pop(0)
+    newest = "BV0000000101"
+    upstream.insert(0, newest)
+    restarted = Collector(db, settings, lambda _: adapter)
+    restarted.resume(job_id)
+    await restarted.task
+    saved = db.job(job_id)
+    assert saved["state"] == "completed" and db.source(1)["last_complete_scan_at"]
+    assert saved["checkpoints"]["1"]["total"] == len(upstream)
+    assert adapter.calls == [1, 2, 3, 4, 1, 2, 3, 4]
+    assert len(tag_calls) == len(adapter.video_calls) == len(set(adapter.video_calls)) == 101
+    assert db.clip(newest + ":100") and db.clip(original_head + ":100")["bookmarked"]
+    assert saved["processed"] == 101
+
+
+async def test_full_resume_does_not_count_removed_bvs_toward_short_current_listing(db, settings, video):
+    a, b, c = (f"BV{i:010d}" for i in range(1, 4))
+    adapter = FakeAdapter(video, {1: Page([a], True, 3), 2: Page([b], True, 3)}, fail_at=3)
+    worker = Collector(db, settings, lambda _: adapter)
+    job_id = worker.start([1], "full")["id"]
+    await worker.task
+    assert db.job(job_id)["processed"] == 2
+    db.bookmark(a + ":100", True)
+
+    # The source now advertises only two videos. Seeing just B cannot certify
+    # the pass even though the interrupted task checked both A and B in the past.
+    adapter.fail_at = None
+    adapter.pages = {1: Page([b], False, 2)}
+    worker.resume(job_id)
+    await worker.task
+    saved = db.job(job_id)
+    assert saved["state"] == "failed" and saved["errors"][0]["category"] == "pagination"
+    assert not db.source(1)["last_complete_scan_at"] and db.clip(a + ":100")["bookmarked"]
+    assert adapter.video_calls == [a, b] and adapter.calls == [1, 2, 3, 1]
+
+    adapter.pages = {1: Page([b, c], False, 2)}
+    worker.resume(job_id)
+    await worker.task
+    assert db.job(job_id)["state"] == "completed" and db.source(1)["last_complete_scan_at"]
+    assert adapter.video_calls == [a, b, c] and db.job(job_id)["processed"] == 3
+
+
+async def test_full_scan_rejects_mid_pass_total_change_until_explicit_resume(db, settings, video):
+    a, b = (f"BV{i:010d}" for i in range(1, 3))
+    adapter = FakeAdapter(video, {1: Page([a], True, 3), 2: Page([b], False, 2)})
+    worker = Collector(db, settings, lambda _: adapter)
+    job_id = worker.start([1], "full")["id"]
+    await worker.task
+    assert db.job(job_id)["errors"][0]["category"] == "pagination"
+    assert not db.source(1)["last_complete_scan_at"] and adapter.calls == [1, 2]
+    adapter.pages[1] = Page([a], True, 2)
+    worker.resume(job_id)
+    await worker.task
+    assert db.job(job_id)["state"] == "completed" and adapter.video_calls == [a, b]
+
+
 async def test_repeated_page_cannot_complete(db,settings,video):
     adapter=FakeAdapter(video,{1:Page([video["bvid"]],True,2),2:Page([video["bvid"]],True,2)})
     worker=Collector(db,settings,lambda _:adapter)

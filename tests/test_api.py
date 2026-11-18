@@ -132,6 +132,28 @@ def test_csv_formula_safety_and_raw_data_preserved(settings,video):
         assert client.get('/api/clips/'+identity).json()['display_song_title']=='=1+1'
 
 
+def test_guarded_bulk_skips_changed_and_missing_clips_without_losing_other_updates(settings, video):
+    app, _ = client_app(settings)
+    with TestClient(app) as client:
+        authorize(client)
+        db = app.state.db
+        db.save_video(db.source(1), video, [])
+        a, b = (video["bvid"] + suffix for suffix in (":100", ":200"))
+        db.annotate([a, b], {"inclusion_status": "included"})
+        db.annotate([a], {"inclusion_status": "excluded"})
+        url = "/api/review/bulk"
+        body = {"ids": [a, b, "gone"], "inclusion_status": "needs_review",
+                "expected_statuses": {a: "included", b: "included", "gone": "included"}}
+        partial = client.patch(url, json={**body, "expected_statuses": {b: "included"}})
+        assert partial.status_code == 400 and db.clip(b)["inclusion_status"] == "included"
+        assert client.patch(url, json=body).json() == {"updated": 1, "conflicts": [a, "gone"]}
+        assert db.clip(a)["inclusion_status"] == "excluded"
+        assert db.clip(b)["inclusion_status"] == "needs_review"
+        # An explicit legacy write still works and returns its original response shape.
+        assert client.patch(url, json={"ids": [a, b], "inclusion_status": "included"}).json() == {"updated": 2}
+        assert db.clip(a)["inclusion_status"] == db.clip(b)["inclusion_status"] == "included"
+
+
 def test_bulk_validation_is_atomic(settings,video):
     app,_=client_app(settings)
     with TestClient(app) as client:

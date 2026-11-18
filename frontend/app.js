@@ -500,10 +500,12 @@ function selectClip(clip, index, checked) {
     return;
   }
   const {id, display_song_title, uploader_name, raw_title, raw_part_title, playback_url} = clip;
-  state.selected.set(id, {
-    page: state.clips.page, index,
-    clip: {id, display_song_title, uploader_name, raw_title, raw_part_title, playback_url}
-  });
+  // A page reload can refresh the label and location of the same selection.
+  // A deselect/reselect starts a new selection with its own observed status.
+  const selection=state.selected.get(id) || {expectedStatus:clip.inclusion_status};
+  selection.page=state.clips.page;selection.index=index;
+  selection.clip={id, display_song_title, uploader_name, raw_title, raw_part_title, playback_url};
+  state.selected.set(id,selection);
 }
 function selectedClips() {
   return [...state.selected.values()].sort((a,b)=>a.page-b.page || a.index-b.index).map(row=>row.clip);
@@ -597,6 +599,7 @@ async function saveAnnotation(editor, patch, message, {automaticTitle=false}={})
     if (!confirm(prompt)) return;
   } else if (!Object.keys(patch).length) { detailDialog.close(); return; }
   editor.saving=true;
+  const selection=state.selected.get(editor.id);
   const autoButton=$('#detail-auto-title');
   const buttons=detailDialog.querySelectorAll('[data-classify], #annotation-form button, #detail-auto-title');
   buttons.forEach(button=>button.disabled=true);
@@ -607,6 +610,11 @@ async function saveAnnotation(editor, patch, message, {automaticTitle=false}={})
     const clip=automaticTitle
       ? await api(path+'/automatic-title',{method:'POST'})
       : await api(path+'/annotation',{method:'PATCH',body:JSON.stringify(patch)});
+    if (patch.inclusion_status && selection && selection===state.selected.get(editor.id)) {
+      if (state.filter!=='all' && state.filter!=='bookmarked' && state.filter!==clip.inclusion_status) state.selected.delete(editor.id);
+      else selection.expectedStatus=clip.inclusion_status;
+      updateSelection();
+    }
     if (detailDialog.open && editor===detailEditor) {
       Object.assign(editor.original,patch);
       if (automaticTitle) {
@@ -615,7 +623,6 @@ async function saveAnnotation(editor, patch, message, {automaticTitle=false}={})
         editor.original.display_song_title=automaticValue;
         if (titleInput.value===submittedTitle) titleInput.value=automaticValue;
       }
-      if (patch.inclusion_status) clearSelection();
       const hasDraft=Object.keys(annotationChanges(editor)).length>0;
       if (automaticTitle || hasDraft) {
         // The user can keep typing during a save. Preserve edits newer than the submitted values.
@@ -670,16 +677,24 @@ document.addEventListener('click',async event=>{
     if(button.dataset.classify)await saveAnnotation(detailEditor,{inclusion_status:button.dataset.classify},'已保存你的决定，后续采集会保留。');
     if(button.id==='detail-auto-title')await saveAnnotation(detailEditor,{},'已使用自动歌名。',{automaticTitle:true});
     if(button.dataset.bulk){
-      const ids=[...state.selected.keys()];$$('[data-bulk]').forEach(el=>el.disabled=true);let saved=0;
+      const selected=[...state.selected.values()].map(selection=>({id:selection.clip.id,selection,expected:selection.expectedStatus}));
+      $$('[data-bulk]').forEach(el=>el.disabled=true);
+      let saved=0, skipped=0;
+      const resultMessage=()=>`已保存 ${saved} 个片段的决定。`+(skipped?`${skipped} 个片段的状态已改变或已移除，已跳过。`:'');
       try {
-        for(let offset=0;offset<ids.length;offset+=100){
-          const batch=ids.slice(offset,offset+100);
-          await api('/api/review/bulk',{method:'PATCH',body:JSON.stringify({ids:batch,inclusion_status:button.dataset.bulk})});
-          batch.forEach(id=>state.selected.delete(id));saved+=batch.length;updateSelection();
+        for(let offset=0;offset<selected.length;offset+=100){
+          const batch=selected.slice(offset,offset+100);
+          const ids=batch.map(item=>item.id),expected_statuses=Object.fromEntries(batch.map(item=>[item.id,item.expected]));
+          const result=await api('/api/review/bulk',{method:'PATCH',body:JSON.stringify({ids,inclusion_status:button.dataset.bulk,expected_statuses})});
+          saved+=result.updated;skipped+=result.conflicts.length;
+          for(const item of batch) if(state.selected.get(item.id)===item.selection) state.selected.delete(item.id);
+          updateSelection();
         }
-        await refresh();toast(`已保存 ${saved} 个片段的决定。`);
-      } catch(error){if(saved)toast(`已保存 ${saved} 个片段，其余仍保持选中。`);throw error;}
-      finally{$$('[data-bulk]').forEach(el=>el.disabled=false);}
+        await refresh();toast(resultMessage());
+      } catch(error) {
+        if(saved || skipped){await refresh();error.message=resultMessage()+'其余片段未能处理。'+error.message;}
+        throw error;
+      } finally{$$('[data-bulk]').forEach(el=>el.disabled=false);}
     }
     if(button.dataset.cancel){await api(`/api/sync/${button.dataset.cancel}/cancel`,{method:'POST'});await loadOverview();}
     if(button.dataset.resume){notice('');await api(`/api/sync/${button.dataset.resume}/resume`,{method:'POST'});await loadOverview();}

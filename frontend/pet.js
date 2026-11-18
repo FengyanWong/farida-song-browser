@@ -19,6 +19,10 @@ export function spriteVersion(width, height) {
 export function directionIndex(dx, dy) { return Math.round((Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360 / 22.5) % 16; }
 
 const DEFAULT_PET = {name:'Frida', version:2, url:'/assets/frida.webp'};
+const PET_CHANGE_KEY = 'farida-pet-change';
+function preference(key) {
+  try { return localStorage.getItem(key); } catch { return undefined; }
+}
 let storage;
 function store() {
   if (!storage) storage = new Promise((resolve, reject) => {
@@ -50,13 +54,17 @@ export class Pet {
   constructor() {
     this.node = $('#pet-sprite'); this.version = 2; this.row = 0; this.frame = 0;
     this.manualUntil = 0; this.pointerUntil = 0; this.status = 'idle'; this.pageActive = true;
+    this.choice = 0; this.petStamp = preference(PET_CHANGE_KEY);
     this.reduced = matchMedia('(prefers-reduced-motion: reduce)');
     this.node.addEventListener('click', () => this.gesture(3));
     this.node.addEventListener('dblclick', () => this.gesture(4));
     this.onPointer = e => this.pointer(e);
-    document.addEventListener('visibilitychange', () => this.resetAnimation());
+    document.addEventListener('visibilitychange', () => { this.readPetIfVisible(); this.resetAnimation(); });
     window.addEventListener('pagehide', () => this.setPageActive(false));
-    window.addEventListener('pageshow', () => this.setPageActive(true));
+    window.addEventListener('pageshow', event => {
+      if (event.persisted) this.syncSettings();
+      this.setPageActive(true);
+    });
     this.reduced.addEventListener('change', () => this.resetAnimation());
     this.resize = new ResizeObserver(() => { if (this.visible && this.pageActive && !document.hidden) this.paint(); });
     this.resize.observe(this.node);
@@ -64,29 +72,75 @@ export class Pet {
     $('#pet-files').onchange = e => this.import(e.target.files);
     for (const option of ['visible','motion']) {
       const control = $('#pet-' + option);
-      try { this[option] = localStorage.getItem(control.id) !== 'false'; }
-      catch { this[option] = true; }
+      this[option] = preference(control.id) !== 'false';
       control.checked = this[option];
       control.onchange = () => {
-        this[option] = control.checked;
-        this.node.hidden = !this.visible;
-        this.resetAnimation();
+        this.setOption(option,control.checked);
         try { localStorage.setItem(control.id, String(control.checked)); }
         catch { $('#pet-message').textContent = '此设置仅在当前页面生效。'; }
       };
     }
+    window.addEventListener('storage', event => {
+      if (event.key===null || [PET_CHANGE_KEY,'pet-visible','pet-motion'].includes(event.key)) this.syncSettings();
+    });
     $('#pet-reset').onclick = async () => {
-      const saved = await savePet(null);
-      this.apply(DEFAULT_PET);
-      $('#pet-message').textContent = saved ? '已恢复默认 Frida。' : '已在当前页面恢复默认 Frida，浏览器未能保存此设置。';
+      const choice = this.beginChoice();
+      const saved = await this.commitPet(null,choice);
+      if (choice===this.choice) $('#pet-message').textContent = saved ? '已恢复默认 Frida。' : '已在当前页面恢复默认 Frida，浏览器未能保存此设置。';
     };
     this.node.hidden = !this.visible;
   }
+  setOption(option,value) {
+    if (this[option]===value) return;
+    this[option]=value;
+    $('#pet-'+option).checked=value;
+    this.node.hidden=!this.visible;
+    this.resetAnimation();
+  }
+  syncSettings() {
+    for (const option of ['visible','motion']) {
+      const value=preference('pet-'+option);
+      if (value!==undefined) this.setOption(option,value!=='false');
+    }
+    const stamp=preference(PET_CHANGE_KEY);
+    if (stamp===undefined || stamp===this.petStamp) return;
+    this.petStamp=stamp;++this.choice;
+    $('#pet-message').textContent='';
+    this.needsRead=true;
+    this.readPetIfVisible();
+  }
+  readPetIfVisible() {
+    if (this.needsRead && this.pageActive && !document.hidden) this.initialize();
+  }
+  beginChoice() {
+    this.petStamp=preference(PET_CHANGE_KEY);
+    this.needsRead=false;
+    return ++this.choice;
+  }
   async initialize() {
+    this.needsRead=false;
+    const choice=++this.choice;
     try {
       const saved = await storedPet();
-      this.apply(saved ? {...saved,url:URL.createObjectURL(saved.blob)} : DEFAULT_PET);
-    } catch { this.apply(DEFAULT_PET); }
+      if (choice===this.choice) this.apply(saved ? {...saved,url:URL.createObjectURL(saved.blob)} : DEFAULT_PET);
+    } catch { if (choice===this.choice) this.apply(DEFAULT_PET); }
+  }
+  async commitPet(pet,choice) {
+    if (choice!==this.choice) return;
+    // A peer may have committed while this tab was decoding, before its storage event ran.
+    const previous=preference(PET_CHANGE_KEY);
+    if (previous!==undefined && previous!==this.petStamp) { this.syncSettings(); return; }
+    const saved=await savePet(pet);
+    // Even if the dialog has moved on, notify peers about every completed database write.
+    if (saved) {
+      try {
+        const stamp=crypto.randomUUID();
+        localStorage.setItem(PET_CHANGE_KEY,stamp);
+        this.petStamp=stamp;
+      } catch { /* The local IndexedDB save still succeeded. */ }
+    }
+    if (choice===this.choice) this.apply(pet ? {...pet,url:URL.createObjectURL(pet.blob)} : DEFAULT_PET);
+    return saved;
   }
   apply(pet) {
     if (this.url?.startsWith('blob:')) URL.revokeObjectURL(this.url);
@@ -106,7 +160,7 @@ export class Pet {
   }
   setPageActive(active) {
     this.pageActive = active;
-    this.resetAnimation();
+    this.readPetIfVisible(); this.resetAnimation();
   }
   canAnimate() {
     return this.url && this.pageActive && this.visible && !document.hidden && this.motion && !this.reduced.matches;
@@ -167,9 +221,10 @@ export class Pet {
     this.paint(); this.schedule(STATES[row][this.frame]);
   }
   async import(files) {
-    const message=$('#pet-message'); message.textContent='正在检查精灵图…';
+    const choice=this.beginChoice(),list=[...files],message=$('#pet-message');
+    $('#pet-files').value='';message.textContent='正在检查精灵图…';
     try {
-      const list=[...files], sheet=list.find(f=>/\.(png|webp)$/i.test(f.name)), config=list.find(f=>/\.json$/i.test(f.name));
+      const sheet=list.find(f=>/\.(png|webp)$/i.test(f.name)), config=list.find(f=>/\.json$/i.test(f.name));
       if (!sheet) throw new Error('请选择 PNG 或 WebP 精灵图；pet.json 可一并选择。');
       if (sheet.size>20*1024*1024 || !sheet.size) throw new Error('精灵图必须在 1 字节至 20 MB 之间。');
       if (config && config.size>65536) throw new Error('pet.json 超过 64 KB。');
@@ -177,13 +232,17 @@ export class Pet {
       const png=bytes[0]===137 && bytes[1]===80 && bytes[2]===78 && bytes[3]===71;
       const webp=String.fromCharCode(...bytes.slice(0,4))==='RIFF' && String.fromCharCode(...bytes.slice(8,12))==='WEBP';
       if (!png && !webp) throw new Error('文件内容不是 PNG 或 WebP。');
-      const bitmap=await createImageBitmap(sheet);
-      const version=spriteVersion(bitmap.width,bitmap.height);
       const metadata=config ? JSON.parse(await config.text()) : {};
       if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw new Error('pet.json 必须是一个 JSON 对象。');
-      if (metadata.spriteVersionNumber != null && Number(metadata.spriteVersionNumber)!==version) throw new Error('pet.json 版本与精灵图尺寸不一致。');
-      const canvas=document.createElement('canvas'); canvas.width=bitmap.width;canvas.height=bitmap.height;
-      const ctx=canvas.getContext('2d',{willReadFrequently:true}); ctx.drawImage(bitmap,0,0);bitmap.close();
+      const bitmap=await createImageBitmap(sheet), canvas=document.createElement('canvas');
+      let version,ctx;
+      try {
+        if (choice!==this.choice) return;
+        version=spriteVersion(bitmap.width,bitmap.height);
+        if (metadata.spriteVersionNumber != null && Number(metadata.spriteVersionNumber)!==version) throw new Error('pet.json 版本与精灵图尺寸不一致。');
+        canvas.width=bitmap.width;canvas.height=bitmap.height;
+        ctx=canvas.getContext('2d',{willReadFrequently:true});ctx.drawImage(bitmap,0,0);
+      } finally { bitmap.close(); }
       let hasTransparency=false;
       for (let row=0;row<(version===2?11:9);row++) {
         const frames=row<9?STATES[row].length:8;
@@ -196,11 +255,11 @@ export class Pet {
       }
       if (!hasTransparency) throw new Error('请选择带透明背景的精灵图。');
       const pet={name:String(metadata.displayName || sheet.name.replace(/\.(png|webp)$/i,'')).slice(0,80),version,blob:sheet};
-      const saved = await savePet(pet);
-      this.apply({...pet,url:URL.createObjectURL(sheet)}); this.gesture(3);
+      const saved = await this.commitPet(pet,choice);
+      if (choice!==this.choice) return;
+      this.gesture(3);
       const persistence = saved ? '并保存在此浏览器' : '仅在当前页面生效';
       message.textContent = `已加载 ${pet.name}（v${version}），${persistence}。`; toast('宠物已加载');
-    } catch(error) {message.textContent=error.message || '无法读取宠物文件。';}
-    finally {$('#pet-files').value='';}
+    } catch(error) {if (choice===this.choice) message.textContent=error.message || '无法读取宠物文件。';}
   }
 }

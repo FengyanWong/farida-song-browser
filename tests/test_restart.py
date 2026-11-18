@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import pytest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 import time
@@ -67,3 +68,51 @@ def test_remembered_port_must_be_a_local_port_number(tmp_path):
         assert launcher.read_port(path) is None
     path.write_text("8767", encoding="utf-8")
     assert launcher.read_port(path) == 8767
+
+
+def test_reserved_port_is_held_until_the_server_takes_over():
+    import socket
+
+    with launcher.bind_ui_socket(0, allow_fallback=False) as first:
+        port = first.getsockname()[1]
+        with launcher.bind_ui_socket(port, allow_fallback=True) as second:
+            assert second.getsockname()[1] != port
+            with socket.socket() as client:
+                client.settimeout(1)
+                client.connect(("127.0.0.1", port))
+            with pytest.raises(OSError):
+                launcher.bind_ui_socket(port, allow_fallback=False)
+
+
+def test_launch_remembers_its_reserved_port_even_at_the_end_of_the_port_range(tmp_path, monkeypatch):
+    import socket
+    import sys
+    import uvicorn
+    from farida import catalog_snapshot
+
+    # Simulate the last numbered port being occupied without depending on whether
+    # a Windows service or another test currently owns that particular port.
+    real_bind = launcher.bind_ui_socket
+    chosen = []
+
+    def reserve_last(preferred, *, allow_fallback):
+        assert preferred == 65535 and allow_fallback
+        chosen.append(real_bind(taken.getsockname()[1], allow_fallback=True))
+        return chosen[-1]
+
+    def run_on_reserved_socket(self, sockets=None):
+        assert sockets == chosen
+        address = sockets[0].getsockname()
+        assert self.config.port == address[1] == launcher.read_port(tmp_path / "ui-port.txt")
+        assert address[0] == "127.0.0.1"
+        with socket.create_connection(address, timeout=1):
+            pass
+
+    monkeypatch.setattr(sys, "argv", ["run.py", "--data-dir", str(tmp_path), "--no-browser"])
+    monkeypatch.setattr(uvicorn.Server, "run", run_on_reserved_socket)
+    monkeypatch.setattr(catalog_snapshot, "seed_new_catalog", lambda *args: False)
+    monkeypatch.setattr(launcher, "bind_ui_socket", reserve_last)
+    (tmp_path / "ui-port.txt").write_text("65535", encoding="utf-8")
+    with real_bind(0, allow_fallback=False) as taken:
+        assert launcher.main() == 0
+    assert chosen[0].fileno() == -1

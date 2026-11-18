@@ -58,6 +58,12 @@ class Collector:
             if cp.get("state") != "completed":
                 cp["state"] = "pending"
                 cp.pop("index_fetched_at", None)
+                if job["mode"] == "full" and source["source_type"] in {"uploader", "season", "series", "favorites"}:
+                    # New uploads, removals and reordering can move any earlier page.
+                    # Recheck the list while retaining the BV details already committed.
+                    cp.update(page=1, page_hashes={}, enumeration_finished=False)
+                    cp.pop("current_page", None)
+                    cp.pop("total", None)
         job.update(state="queued", errors=[], finished_at=None)
         try:
             self.db.save_job(job)
@@ -211,11 +217,13 @@ class Collector:
             self.db.save_job(job)
 
     async def scan_source(self, adapter, source, job, cp):
-        # Replay one page on resume; fingerprints distinguish overlap from a pagination loop.
+        # Bounded updates can resume with one overlapping page. Mutable full lists restart at the head.
         page_number = max(1, cp["page"] - 1)
         seen = set(cp["seen"])
         enumerated = set()
         kind = source["source_type"]
+        check_total = kind == "songlist" or (job["mode"] == "full" and kind in {"uploader", "season", "series"})
+        first_total = None
         limit = self.settings.discovery_pages if kind == "search" else 10000 if kind == 'songlist' else self.settings.incremental_pages if job["mode"] == "incremental" else 10000
         while page_number <= limit:
             self.check_cancel(job)
@@ -224,6 +232,10 @@ class Collector:
             cp["total"] = page.total
             cp["current_page"] = page_number
             cp["scope"] = "discovery" if kind == "search" else job["mode"]
+            if check_total and page.total is not None:
+                if first_total is not None and page.total != first_total:
+                    raise UpstreamError("pagination", "来源条目数在扫描期间发生变化，请继续任务以重新核对列表。")
+                first_total = page.total
             resource_ids = page.resource_ids if page.resource_ids is not None else page.bvids
             fingerprint = hashlib.sha256(encode(resource_ids).encode()).hexdigest()
             previous_page = cp["page_hashes"].get(fingerprint)
@@ -279,9 +291,9 @@ class Collector:
             cp["page"] = page_number + 1
             self.db.save_job(job)
             if not page.has_more:
-                # A short or overlapping pagination response cannot establish full coverage.
-                if kind in {"uploader","season","series","songlist"} and (job["mode"] == "full" or kind == 'songlist') and page.total is not None and len(seen) < page.total:
-                    raise UpstreamError("pagination", "Enumeration ended before all advertised submissions were found")
+                # Older saved BVs may have disappeared. Only this pass can establish current coverage.
+                if check_total and first_total is not None and len(enumerated) != first_total:
+                    raise UpstreamError("pagination", "本次列表中的不同视频数与来源公布的总数不一致。")
                 cp["enumeration_finished"] = True
                 break
             page_number += 1

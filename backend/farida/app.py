@@ -91,6 +91,7 @@ class Annotation(Model):
 class BulkAnnotation(Model):
     ids: list[str] = Field(min_length=1,max_length=100)
     inclusion_status: Literal["included","excluded","needs_review"]
+    expected_statuses: dict[str, Literal["included","excluded","needs_review"]] | None = Field(default=None,max_length=100)
 
 
 class Bookmark(Model):
@@ -430,8 +431,13 @@ def create_app(settings=None, adapter_factory=None, browser_opener=None, *, scan
 
     @app.patch("/api/review/bulk")
     def bulk_annotation(body: BulkAnnotation):
-        db.annotate(body.ids,{"inclusion_status":body.inclusion_status})
-        return {"updated":len(body.ids)}
+        expected = body.expected_statuses
+        if expected is not None and (expected.keys() != set(body.ids) or len(expected) != len(body.ids)):
+            raise ValueError("每个所选片段都必须有一个对应的原始状态。")
+        conflicts = db.annotate(body.ids, {"inclusion_status": body.inclusion_status}, expected_statuses=expected)
+        if expected is None:
+            return {"updated": len(body.ids)}
+        return {"updated": len(body.ids) - len(conflicts), "conflicts": conflicts}
 
     @app.patch("/api/clips/{clip_id}/bookmark")
     def bookmark(clip_id: str, body: Bookmark):

@@ -85,3 +85,29 @@ def test_collection_alias_and_real_replacement_are_distinguished(settings, video
             assert new[field] is None
         assert db.collection_status(new)["job_id"] is None
         assert db.source(1)["submissions"] == 1 and db.clip(clip)["bookmarked"] == 1
+
+
+def test_retargeted_default_source_and_restored_source_list_survive_restart(settings):
+    from farida.backup import export_backup, restore_backup
+
+    app = create_app(settings, scan_on_start=False)
+    with TestClient(app) as client:
+        db = app.state.db
+        old = next(row for row in db.sources() if row["uid"] == "394803911")
+        token = client.get("/api/session").json()["token"]
+        response = client.patch(f"/api/sources/{old['id']}", headers={"X-Farida-Token": token},
+                                json={"url": "UID: 123456790", "display_name": "新来源"})
+        assert response.status_code == 200
+        modified = {row["canonical_url"] for row in db.sources()}
+        assert len(modified) == 6 and old["canonical_url"] not in modified
+
+    with TestClient(create_app(settings, scan_on_start=False)) as reopened:
+        db = reopened.app.state.db
+        assert {row["canonical_url"] for row in db.sources()} == modified
+        assert db.source(old["id"])["display_name"] == "新来源"
+        supplied = export_backup(db)
+        supplied["tables"]["sources"] = []
+        restore_backup(db, supplied)
+
+    with TestClient(create_app(settings, scan_on_start=False)) as restored:
+        assert restored.get("/api/sources").json() == []

@@ -99,15 +99,25 @@ def open_when_ready(port):
         time.sleep(0.1)
 
 
-def port_available(port):
-    with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as probe:
+def bind_ui_socket(port, *, allow_fallback):
+    """Reserve the loopback listener through catalog startup and the server handoff."""
+    # Port zero lets the OS select any free port when the preferred one is busy.
+    candidates = (port, 0) if allow_fallback and port else (port,)
+    for candidate in candidates:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            if os.name == 'nt':
-                probe.setsockopt(socket.SOL_SOCKET,socket.SO_EXCLUSIVEADDRUSE,1)
-            probe.bind(('127.0.0.1',port))
-            return True
+            if os.name == "nt":
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", candidate))
+            listener.listen()
         except OSError:
-            return False
+            listener.close()
+            if candidate == candidates[-1]:
+                raise
+        else:
+            return listener
 
 
 def acquire_catalog_lock(data_dir, on_running, timeout=30):
@@ -163,16 +173,16 @@ def main():
     lock = acquire_catalog_lock(settings.data_dir, reuse_running)
     if lock is None:
         return 0
-    if not port_available(port):
+    try:
+        listener = bind_ui_socket(port, allow_fallback=args.port is None)
+    except OSError as error:
+        lock.close()
         if args.port is not None:
-            print(f"Port {port} is already used by another application. Omit --port to select a free port automatically.")
-            lock.close()
-            return 1
-        port=next((candidate for candidate in range(port+1,min(port+51,65536)) if port_available(candidate)),None)
-        if port is None:
-            print('No free local port was found. Close an unused application and try again.')
-            lock.close()
-            return 1
+            print(f"本机端口 {port} 无法使用。省略 --port 可自动选择可用端口。", file=sys.stderr)
+        else:
+            print(f"无法打开本机服务端口：{error}", file=sys.stderr)
+        return 1
+    port = listener.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
     try:
         try:
@@ -196,8 +206,9 @@ def main():
                                              log_level="warning", use_colors=False, ws="wsproto", timeout_graceful_shutdown=5))
         if not args.no_browser:
             threading.Thread(target=open_when_ready,args=(port,),daemon=True).start()
-        server.run()
+        server.run(sockets=[listener])
     finally:
+        listener.close()
         lock.close()
     return 0
 

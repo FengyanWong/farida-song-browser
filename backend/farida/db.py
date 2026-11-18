@@ -264,12 +264,17 @@ class Database:
                 raise RuntimeError("This catalog was created by a newer version of Farida Song Browser")
             con.execute("PRAGMA journal_mode=WAL")
             con.executescript(SCHEMA)
-            con.execute("PRAGMA user_version=1")
+            con.execute("BEGIN IMMEDIATE")
             con.execute("UPDATE sync_jobs SET state='interrupted',finished_at=?,heartbeat=? WHERE state IN ('queued','running')", (now(),now()))
+            if version:
+                return
+            # Seed the six defaults only when creating the catalog. Later starts
+            # must respect retargeted uploaders and the source list in a backup.
             for name, uid in [("离落", "394803911"), ("CLANNADOR", "210887872"), ("阿见", "290566607"), ("稻草仁尔", "475349220")]:
                 con.execute("INSERT OR IGNORE INTO sources(source_type,display_name,uid,canonical_url,created_at) VALUES('uploader',?,?,?,?)", (name,uid,f"https://space.bilibili.com/{uid}",now()))
             con.execute("INSERT OR IGNORE INTO sources(source_type,display_name,canonical_url,query,required_tags,created_at) VALUES('search',?,?,?,?,?)", ("标签发现", "https://search.bilibili.com/all?keyword=%E6%B3%95%E9%87%8C%E8%BE%BE%20%E7%9B%B4%E6%92%AD%E5%88%87%E7%89%87", "法里达 直播切片", encode(["法里达", "直播切片"]),now()))
             con.execute("INSERT OR IGNORE INTO sources(source_type,display_name,canonical_url,created_at) VALUES('songlist',?,?,?)", ('CLANNADOR 歌单', SONGLIST_URL, now()))
+            con.execute("PRAGMA user_version=1")
 
     def one(self, sql, args=()):
         with self.connect() as con:
@@ -858,15 +863,19 @@ class Database:
             clip.update(display_song_title=title, manual_fields=fields)
             return clip
 
-    def annotate(self, ids, patch):
+    def annotate(self, ids, patch, *, expected_statuses=None):
+        conflicts = []
         with self.connect() as con:
             # Reset and edit must read the same manual fields they are about to update.
             con.execute("BEGIN IMMEDIATE")
             for clip_id in ids:
-                previous = con.execute("SELECT manual_fields FROM annotations WHERE clip_id=?", (clip_id,)).fetchone()
+                previous = con.execute("SELECT manual_fields,inclusion_status FROM annotations WHERE clip_id=?", (clip_id,)).fetchone()
+                if expected_statuses is not None and (not previous or previous["inclusion_status"] != expected_statuses[clip_id]):
+                    conflicts.append(clip_id)
+                    continue
                 if not previous:
                     raise KeyError(clip_id)
-                fields = set(json.loads(previous[0]))
+                fields = set(json.loads(previous["manual_fields"]))
                 values = {k:v for k,v in patch.items() if k in {"display_song_title","inclusion_status","song_group"}}
                 fields.update(values)
                 if "inclusion_status" in values:
@@ -875,6 +884,7 @@ class Database:
                 con.execute("UPDATE annotations SET " + ",".join(k + "=?" for k in values) + " WHERE clip_id=?", [*values.values(),clip_id])
                 if "notes" in patch:
                     con.execute("INSERT INTO user_state(clip_id,notes) VALUES(?,?) ON CONFLICT(clip_id) DO UPDATE SET notes=excluded.notes", (clip_id,patch["notes"]))
+        return conflicts
 
     def bookmark(self, clip_id, value):
         with self.connect() as con:
