@@ -270,12 +270,11 @@ class Collector:
                     cp["unavailable"].append({"bvid":bvid,**exc.as_dict()})
                     if existing:
                         self.db.execute("UPDATE videos SET availability_status='unavailable' WHERE bvid=?", (bvid,))
+                    cp["seen"] = sorted(seen | {bvid})
+                    cp["processed"] = len(cp["seen"])
+                    job["processed"] = sum(c.get("processed", 0) for c in job["checkpoints"].values())
+                    self.db.save_job(job)
                 seen.add(bvid)
-                cp["seen"] = sorted(seen)
-                cp["processed"] = len(seen)
-                job["processed"] = sum(c.get("processed",0) for c in job["checkpoints"].values())
-                # Save after the video transaction; replay is idempotent if interrupted in between.
-                self.db.save_job(job)
                 await asyncio.sleep(0)
             cp["page"] = page_number + 1
             self.db.save_job(job)

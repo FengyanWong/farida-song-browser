@@ -1,4 +1,7 @@
 from copy import deepcopy
+import sqlite3
+
+import pytest
 from farida.adapter import Page, UpstreamError
 from farida.db import Database, encode, now
 from farida.sync import Collector
@@ -49,16 +52,71 @@ async def test_partial_failure_resume_and_unattempted_source(db, settings, video
     assert skipped['error'] is None and skipped['added_clips']==0
 
 
+def make_running_job(db, source, checkpoint):
+    stamp = now()
+    checkpoints = {str(source['id']):checkpoint, '99':{'processed':3,'state':'completed'}}
+    db.execute("""INSERT INTO sync_jobs(id,source_ids,mode,state,checkpoints,processed,started_at,heartbeat)
+        VALUES('atomic',?,'full','running',?,3,?,?)""", (encode([99,source['id']]),encode(checkpoints),stamp,stamp))
+    job = db.job('atomic')
+    return job, job['checkpoints'][str(source['id'])]
+
+
 def test_count_checkpoint_and_video_commit_together(db, source, video):
-    stamp=now()
-    db.execute("INSERT INTO sync_jobs(id,source_ids,mode,state,started_at,heartbeat) VALUES('atomic','[1]','full','running',?,?)",(stamp,stamp))
-    job=db.job('atomic');cp={'added_clips':0,'added_included':0};job['checkpoints']['1']=cp
-    db.save_video(source,video,['法里达','翻唱'],collection_job=(job,cp))
-    # Re-read the durable job before any normal collector checkpoint: a crash
-    # here must not lose the count or count the replayed video twice.
-    recovered=db.job('atomic');assert recovered['checkpoints']['1']['added_clips']==2
-    db.save_video(source,video,['法里达','翻唱'],collection_job=(recovered,recovered['checkpoints']['1']))
-    assert db.job('atomic')['checkpoints']['1']['added_clips']==2
+    job, cp = make_running_job(db, source, {'added_clips':0,'added_included':0})
+    db.save_video(source, video, ['法里达','翻唱'], collection_job=(job,cp))
+    # A fresh connection immediately sees all parts, new counters and the resume ID.
+    recovered = db.job('atomic')
+    assert recovered['checkpoints']['1'] == cp == {
+        'added_clips':2, 'added_included':2, 'seen':[video['bvid']], 'processed':1}
+    assert recovered['processed'] == job['processed'] == 4
+    assert db.source(source['id'])['entries'] == 2
+    # Replaying an already committed item cannot advance counts twice.
+    db.save_video(source, video, ['法里达','翻唱'], collection_job=(recovered,recovered['checkpoints']['1']))
+    assert db.job('atomic')['checkpoints'] == recovered['checkpoints'] == job['checkpoints']
+    assert db.job('atomic')['processed'] == 4
+
+
+@pytest.mark.parametrize('cached', [False, True], ids=['new-multipart', 'cached-membership'])
+def test_failed_video_commit_rolls_back_catalog_and_live_progress(db, source, video, cached):
+    if cached:
+        db.save_video(source, video, ['法里达'])
+        source = db.add_source('测试合集', 'https://space.bilibili.com/123/lists/456?type=season')
+    job, cp = make_running_job(db, source, {'added_clips':0,'added_included':0,'seen':[],'processed':0})
+    previous = deepcopy(job)
+    # The checkpoint statement succeeds. Only COMMIT discovers this deferred
+    # foreign-key error, after both the video and job updates have executed.
+    db.execute("CREATE TABLE reject_commit(job TEXT REFERENCES sync_jobs(id) DEFERRABLE INITIALLY DEFERRED)")
+    db.execute("""CREATE TRIGGER reject_video_progress AFTER UPDATE OF checkpoints ON sync_jobs
+        WHEN NEW.processed > OLD.processed BEGIN INSERT INTO reject_commit VALUES('missing'); END""")
+    def save():
+        if cached:
+            existing = db.one("SELECT * FROM videos WHERE bvid=?", (video['bvid'],))
+            db.reuse_video(source, existing, collection_job=(job,cp))
+        else:
+            db.save_video(source, video, ['法里达','翻唱'], collection_job=(job,cp))
+
+    with pytest.raises(sqlite3.IntegrityError):
+        save()
+    assert job == previous == db.job(job['id'])
+    assert cp == previous['checkpoints'][str(source['id'])]
+    assert db.source(source['id'])['submissions'] == 0
+    assert bool(db.clip(video['bvid'] + ':100')) == cached
+    db.execute("DROP TRIGGER reject_video_progress")
+    save()
+    assert db.job(job['id'])['processed'] == 4
+    assert cp['seen'] == [video['bvid']] and cp['added_clips'] == (0 if cached else 2)
+    assert db.source(source['id'])['entries'] == 2
+
+
+def test_legacy_checkpoint_keeps_unknown_counts_and_records_cached_video(db, source, video):
+    db.save_video(source, video, ['法里达','翻唱'])
+    existing = db.one("SELECT * FROM videos WHERE bvid=?", (video['bvid'],))
+    job, cp = make_running_job(db, source, {'state':'running','seen':[],'processed':0})
+    db.reuse_video(source, existing, collection_job=(job,cp))
+    recovered = db.job(job['id'])
+    assert recovered['processed'] == 4
+    assert recovered['checkpoints']['1'] == cp == {'state':'running', 'seen':[video['bvid']], 'processed':1}
+    assert db.clip(video['bvid'] + ':100')['fetched_at'] == existing['fetched_at']
 
 
 def test_status_beyond_history_limit_and_changed_source(db):

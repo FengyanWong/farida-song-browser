@@ -26,10 +26,13 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
       if(callback)window.mediaActions.set(name,callback);else window.mediaActions.delete(name);
     };
   });
-  let restricted=false;
+  let restricted=false, signedOut=false, queueUploads=0;
   const page=await context.newPage(),checks=[],errors=[],plays=[];
   const pass=message=>{checks.push(message);console.log('Passed: '+message);};
   page.on('pageerror',error=>errors.push(error.message));
+  page.on('request',request=>{
+    if (request.method()==='PUT' && new URL(request.url()).pathname==='/api/player-state') queueUploads++;
+  });
   try{
     await page.goto('about:blank');
     const encoded=await page.evaluate(async()=>{
@@ -49,7 +52,12 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     const playlist=await(await fetch(base+'/api/playlists',{method:'POST',headers:{'Content-Type':'application/json','X-Farida-Token':token},body:JSON.stringify({name:'迷你播放器测试',clip_ids:all.map(item=>item.id)})})).json();
     await context.route('**/*',async route=>{
       const url=new URL(route.request().url());if(url.origin!==base)return route.abort();
-      if(url.pathname.startsWith('/api/auth'))return route.fulfill({json:{state:'connected',stored:true,account:{uid:'123',name:'迷你播放器测试'},message:''}});
+      if(url.pathname.startsWith('/api/auth')) {
+        if(url.pathname==='/api/auth/logout')signedOut=true;
+        if(signedOut && url.pathname.startsWith('/api/auth/qr'))return route.fulfill({status:503,json:{detail:'测试页面已退出登录'}});
+        return route.fulfill({json:signedOut?{state:'signed_out',stored:false,account:null,message:''}:
+          {state:'connected',stored:true,account:{uid:'123',name:'迷你播放器测试'},message:''}});
+      }
       if(/^\/api\/clips\/[^/]+\/play$/.test(url.pathname)){
         plays.push(decodeURIComponent(url.pathname.split('/')[3]));
         if(restricted)return route.fulfill({status:429,json:{detail:'播放已暂停，请稍后重试。'}});
@@ -113,7 +121,63 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.equal(await page.locator('body').evaluate(el=>el.classList.contains('has-mini-player')),false);
     assert.deepEqual(errors,[]);pass('390px layout stays compact with reachable bottom content; stopping playback removes pinned controls and reserved space without JavaScript errors');
 
+    const remembered=page.locator('#player-remembered');
+    assert.equal(await remembered.isVisible(),true);
+    assert.equal(await remembered.evaluate(el=>document.activeElement===el),true);
+    const uploadsBefore=queueUploads;
+    await remembered.click();await ready();
+    await page.locator('#player-next').click();await ready();
+    await page.locator('#player-shuffle').click();await page.locator('#player-repeat').click();
+    await page.locator('#player-skip-unavailable').click();
+    await page.waitForFunction(()=>document.querySelector('#song-video').currentTime>.6);
+    const stoppedAt=await page.locator('#song-video').evaluate(video=>{video.pause();return video.currentTime;});
+    const beforeStop=plays.length;
+    await page.locator('#player-close').click();await remembered.waitFor();
+    assert.equal(await remembered.textContent(),'继续播放：'+all[1].display_song_title);
+    await until(async()=>{const saved=await state();return saved.current_id===all[1].id && Math.abs(saved.position-stoppedAt)<.05 && saved.shuffle && saved.repeat==='all' && saved.skip_unavailable;});
+    assert.equal(plays.length,beforeStop);assert.equal(await page.locator('#song-video').getAttribute('src'),null);
+    await page.locator('#song-video').evaluate(video=>{
+      video.addEventListener('seeked',()=>{window.resumedPosition=video.currentTime;},{once:true});
+    });
+    await remembered.press('Enter');await ready();
+    await page.waitForFunction(()=>window.resumedPosition!==undefined);
+    assert.ok(Math.abs(await page.evaluate(()=>window.resumedPosition)-stoppedAt)<.2);
+    assert.equal(plays.length,beforeStop+1);assert.equal(plays.at(-1),all[1].id);
+    assert.equal(await page.locator('#player-position').textContent(),'2 / 3');
+    assert.equal(await page.locator('#player-compact').evaluate(el=>document.activeElement===el),true);
+    assert.equal(await page.locator('#player-shuffle').getAttribute('aria-pressed'),'true');
+    assert.equal(await page.locator('#player-skip-unavailable').getAttribute('aria-pressed'),'true');
+    assert.equal(await page.locator('#player-repeat').textContent(),'列表循环');
+    assert.equal(queueUploads,uploadsBefore);
+    // Hold the first mode change until the old document has unloaded. Its older
+    // sequence must not overwrite the final state sent when the player closes.
+    let heldModeSave;
+    await page.exposeFunction('holdModeSave',request=>{heldModeSave=request;});
+    await page.evaluate(()=>{
+      const send=window.fetch.bind(window);
+      window.fetch=async (url,options)=>{
+        if(url==='/api/player-state'&&options?.method==='PATCH'&&!options.keepalive){
+          const progress=JSON.parse(options.body);
+          if(!progress.shuffle&&progress.repeat==='all'){
+            window.fetch=send;
+            await window.holdModeSave({headers:options.headers,body:options.body});
+            return new Promise(()=>{});
+          }
+        }
+        return send(url,options);
+      };
+    });
+    await page.locator('#player-shuffle').click();await until(()=>!!heldModeSave);
+    await page.locator('#player-repeat').click();await page.locator('#player-repeat').click();await page.locator('#player-skip-unavailable').click();
+    await page.locator('#player-close').click();
+    pass('Explicit close offers the current song in the same page without autoplay; keyboard resume restores the position, queue and modes without uploading the queue again');
+
     await page.reload();await page.locator('#player-remembered').waitFor({state:'visible'});
+    const lateModeSave=await fetch(base+'/api/player-state',{method:'PATCH',headers:heldModeSave.headers,body:heldModeSave.body});
+    assert.equal((await lateModeSave.json()).saved,false);
+    const closedState=await state();
+    assert.deepEqual([closedState.current_id,closedState.shuffle,closedState.repeat,closedState.skip_unavailable],[all[1].id,false,'off',false]);
+    pass('Immediate reload after closing preserves the last playback modes even when an older checkpoint arrives late');
     assert.equal(await page.locator('#song-video').evaluate(v=>v.volume),.37);assert.equal(await page.locator('#song-video').evaluate(v=>v.muted),true);
     assert.equal(await page.locator('#music-player').evaluate(el=>el.classList.contains('compact')),true);
     assert.equal(await page.locator('#music-player').isVisible(),false);assert.deepEqual((await state()).clip_ids,all.map(item=>item.id));
@@ -182,6 +246,55 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.equal((await older.json()).saved,false);
     assert.equal((await state()).volume,.77);
     pass('Immediate reload delivers the final volume while an earlier write is pending and rejects the delayed value');
+    await remembered.waitFor({state:'visible'});
+    restricted=false;await remembered.click();await ready();
+    const beforeCheck=plays.length, sourceBeforeCheck=await page.locator('#song-video').getAttribute('src');
+    await page.locator('#account-toggle').click();await page.locator('#check-login').click();
+    await until(async()=>!(await page.locator('#check-login').isDisabled()));
+    assert.equal(await page.locator('#song-video').getAttribute('src'),sourceBeforeCheck);
+    assert.equal(await page.locator('#music-player').isVisible(),true);
+    assert.equal(plays.length,beforeCheck);
+    await page.waitForFunction(()=>document.querySelector('#song-video').currentTime>.45);
+    const currentId=plays.at(-1);
+    let signalLogout, releaseLogout;
+    const logoutStarted=new Promise(resolve=>{signalLogout=resolve;}), holdLogout=new Promise(resolve=>{releaseLogout=resolve;});
+    await page.route('**/api/auth/logout',async route=>{
+      signalLogout();await holdLogout;await route.fulfill({status:503,json:{detail:'退出失败测试'}});
+    },{times:1});
+    const beforeLogout=plays.length;
+    await page.locator('#account-toggle').click();await page.locator('#logout-button').click();await logoutStarted;
+    assert.equal(await page.locator('#account-status').textContent(),'正在退出登录');
+    assert.equal(await page.locator('#song-video').getAttribute('src'),null);
+    assert.equal(await page.locator('#music-player').isHidden(),true);
+    assert.equal(await remembered.isHidden(),true);
+    await until(async()=>{const s=await state();return s.current_id===currentId && s.position>.4;});
+    const savedOnLogout=(await state()).position;
+    let queueReads=0;
+    const countReads=request=>{if(new URL(request.url()).pathname==='/api/play-queue')queueReads++;};
+    page.on('request',countReads);
+    await page.locator('#play-all').focus();await page.keyboard.press('Enter');
+    await page.evaluate(()=>{document.querySelector('#player-retry').click();document.querySelector('#player-next').click();});
+    await delay(150);
+    page.off('request',countReads);
+    assert.equal(queueReads,0);assert.equal(plays.length,beforeLogout);
+    releaseLogout();await remembered.waitFor({state:'visible'});
+    assert.equal(await page.locator('#account-status').textContent(),'已登录');
+    assert.equal(await page.locator('#logout-button').isEnabled(),true);
+    assert.equal(await page.locator('#music-player').isHidden(),true);
+    assert.equal(plays.length,beforeLogout);
+    await remembered.click();await ready();
+    assert.equal(plays.at(-1),currentId);
+    assert.ok((await page.locator('#song-video').evaluate(v=>v.currentTime))>=savedOnLogout-.1);
+    await page.locator('#player-close').click();
+    pass('Pending logout stops playback and blocks new lookups or retries; failure restores login controls and a paused resume offer while a routine account check leaves playback alone');
+    await page.locator('#account-toggle').click();await page.locator('#logout-button').click();
+    await page.locator('#login-dialog').waitFor({state:'visible'});
+    assert.equal(await remembered.isHidden(),true);
+    const loggedOutPlays=plays.length;
+    await page.reload();await page.locator('#login-dialog').waitFor({state:'visible'});await page.locator('#clip-rows tr').first().waitFor();
+    assert.equal(await remembered.isHidden(),true);assert.equal(await page.locator('#music-player').isHidden(),true);
+    assert.equal(plays.length,loggedOutPlays);
+    pass('Logging out hides an existing resume offer; signed-out startup keeps the saved queue idle and hidden');
     await page.close();await until(()=>server.exitCode!==null);assert.equal(server.exitCode,0);
     fs.writeFileSync(path.join(root,'results.json'),JSON.stringify({checks,errors,output,packaged:!!exe},null,2));
   }finally{await browser.close();if(server.exitCode===null)spawnSync('taskkill',['/PID',String(server.pid),'/T','/F'],{stdio:'ignore'});}

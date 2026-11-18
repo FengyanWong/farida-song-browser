@@ -4,7 +4,8 @@ import { bindPlaylistDrag } from './playlist-drag.js';
 const maxPlaylistItems = 20000;
 
 export class PlaylistPlayer {
-  constructor(api, parameters, selectedClips) {
+  constructor(api, parameters, selectedClips, canPlay) {
+    this.canPlay=canPlay;
     this.api=api;this.parameters=parameters;this.selectedClips=selectedClips;
     this.queue=[];this.index=-1;this.generation=0;this.queueRequest=0;this.segments=[];this.segment=0;this.editing=null;
     this.video=$('#song-video');this.preferencesReady=false;this.compact=false;
@@ -12,7 +13,7 @@ export class PlaylistPlayer {
     $('#player-shuffle').onclick=()=>{this.shuffle=!this.shuffle;this.visited=new Set([this.index]);this.history=[];this.modeButtons();this.remember();};
     $('#player-skip-unavailable').onclick=()=>{this.skipUnavailable=!this.skipUnavailable;this.modeButtons();this.remember();};
     $('#player-repeat').onclick=()=>{this.repeat={off:'all',all:'one',one:'off'}[this.repeat];this.modeButtons();this.remember();};
-    $('#player-remembered').onclick=()=>{const saved=this.saved;if(saved)this.start(saved.items,saved.name,saved.current_id,saved);};
+    $('#player-remembered').onclick=()=>this.resumeRemembered();
     this.video.addEventListener('timeupdate',()=>{if(Date.now()-(this.lastSave||0)>5000)this.remember();});
     this.video.addEventListener('pause',()=>this.remember());
     this.video.addEventListener('volumechange',()=>this.schedulePreferences());
@@ -56,7 +57,7 @@ export class PlaylistPlayer {
       }
     });
     $('#player-save').onclick=()=>this.edit({name:this.name,items:this.queue});
-    $('#player-close').onclick=()=>this.stop();
+    $('#player-close').onclick=()=>this.stop(true);
     $('#player-prev').onclick=()=>this.previous();
     $('#player-next').onclick=()=>this.next(false);
     $('#player-retry').onclick=()=>this.retry();
@@ -148,16 +149,24 @@ export class PlaylistPlayer {
 
   bindSearch(inputId,clearId,render) {
     const input=$('#'+inputId),clear=$('#'+clearId);
-    const update=()=>{clear.hidden=!input.value;render();};
-    input.oninput=update;
+    let composing=false;
+    const update=()=>{
+      clear.hidden=!input.value;
+      if(input.dataset.appliedQuery!==input.value)render();
+    };
+    input.addEventListener('compositionstart',()=>{composing=true;});
+    input.addEventListener('compositionend',()=>{composing=false;update();});
+    input.oninput=event=>{if(!composing&&!event.isComposing)update();};
     input.onkeydown=event=>{
+      if(composing||event.isComposing||event.keyCode===229)return;
       if(event.key==='Enter')event.preventDefault();
       if(event.key==='Escape'&&input.value){event.preventDefault();event.stopPropagation();input.value='';update();}
     };
     clear.onclick=()=>{input.value='';update();input.focus();};
   }
   matchingItems(items,query) {
-    const normalize=value=>String(value??'').normalize('NFKC').toLocaleLowerCase('zh-CN');
+    const normalize=value=>String(value??'').normalize('NFKC').toLocaleLowerCase('zh-CN')
+      .replace(/fareeda|farida|法里達/g,'法里达');
     const terms=normalize(query).trim().split(/\s+/).filter(Boolean);
     const rows=items.map((item,index)=>({item,index}));
     if(!terms.length)return rows;
@@ -173,7 +182,8 @@ export class PlaylistPlayer {
     this.queueTabStop = button;
   }
   renderQueue() {
-    const query=$('#player-queue-search').value,rows=this.matchingItems(this.queue,query);
+    const input=$('#player-queue-search'),query=input.value,rows=this.matchingItems(this.queue,query);
+    input.dataset.appliedQuery=query;
     $('#player-queue-count').textContent=query.trim()?`${rows.length} / ${this.queue.length} 首`:`共 ${this.queue.length} 首`;
     const list = $('#player-queue'), hadFocus = list.contains(document.activeElement);
     list.innerHTML=rows.length?rows.map(({item,index})=>`<li><button tabindex="-1" data-queue-index="${index}" ${index===this.index?'aria-current="true"':''} title="${e(item.raw_title||item.display_song_title)}"><span>${index+1}</span><b>${e(item.display_song_title)}</b><small>${e(item.uploader_name)}</small></button></li>`).join(''):'<li class="playlist-search-empty">没有匹配的歌曲</li>';
@@ -190,7 +200,7 @@ export class PlaylistPlayer {
     return {segment:this.segment,position:Number.isFinite(this.video.currentTime)?this.video.currentTime:0};
   }
   retry(automatic=false) {
-    if(!this.queue[this.index])return;
+    if(!this.canPlay()||!this.queue[this.index])return;
     const position=this.position();
     if(!automatic){this.recoveryAttempts=0;this.unavailable.delete(this.index);}
     return this.play(this.index,position,true);
@@ -241,10 +251,33 @@ export class PlaylistPlayer {
       this.setCompact(!!this.saved.compact,false);
       this.lastPreferenceBody=JSON.stringify(this.preferences());this.preferencesReady=true;
       this.shuffle=this.saved.shuffle;this.repeat=this.saved.repeat;this.skipUnavailable=!!this.saved.skip_unavailable;this.modeButtons();
-      const clip=this.saved.items.find(item=>item.id===this.saved.current_id);
-      if(clip){$('#player-remembered').textContent='继续播放：'+clip.display_song_title;$('#player-remembered').hidden=false;}
+      this.updateResumeButton();
     } catch { /* Playback memory must not prevent opening the library. */ }
     await lists;
+  }
+  updateResumeButton() {
+    const button=$('#player-remembered');
+    const canShow=this.saved && !this.persistenceSuspended && this.canPlay() && $('#music-player').hidden;
+    const clip=canShow && (this.saved.items===this.queue ? this.queue[this.index]
+      : this.saved.items.find(item=>item.id===this.saved.current_id));
+    button.hidden=!clip;
+    if (clip) button.textContent='继续播放：'+clip.display_song_title;
+  }
+  resumeRemembered() {
+    const saved=this.saved;
+    if (!saved || this.persistenceSuspended || !this.canPlay()) return;
+    if (saved.items===this.queue) {
+      // The queue, its progress key, shuffle history and search results are still in memory.
+      this.saved=null;
+      $('#player-remembered').hidden=true;
+      $('#music-player').hidden=false;
+      this.logicalPlay=saved.logicalPlay;
+      this.recoveryAttempts=0;
+      this.play(this.index,saved,!!this.logicalPlay);
+    } else {
+      this.start(saved.items,saved.name,saved.current_id,saved);
+    }
+    if (!$('#music-player').hidden) $('#player-compact').focus({preventScroll:true});
   }
   modeButtons() {
     $('#player-shuffle').textContent=this.shuffle?'随机：开':'随机：关';
@@ -272,13 +305,14 @@ export class PlaylistPlayer {
     return undefined;
   }
   next(ended) {
-    if(!this.queue.length)return;
+    if(!this.canPlay()||!this.queue.length)return;
     const target=this.nextIndex(ended);
     if(target===undefined){this.status('歌单已播放完');this.remember();return;}
     if(target!==this.index)this.history.push(this.index);
     this.play(target);
   }
   previous() {
+    if (!this.canPlay()) return;
     const target=this.shuffle?this.history.pop():this.index-1;
     if(target!==undefined&&target>=0){this.visited.delete(this.index);this.play(target);}
   }
@@ -306,7 +340,11 @@ export class PlaylistPlayer {
         queueSave.key=result.queue_key;
       }
     };
-    if(keepalive&&queueSave.key)return save().catch(()=>{});
+    if(keepalive&&queueSave.key){
+      const finalSave=save().catch(()=>{});
+      this.saveChain=Promise.all([this.saveChain,finalSave]).then(()=>{});
+      return finalSave;
+    }
     this.saveChain=this.saveChain.then(save).catch(()=>{});
     return this.saveChain;
   }
@@ -315,6 +353,7 @@ export class PlaylistPlayer {
     return (await this.api('/api/play-queue?'+params)).items;
   }
   async fromResults(id) {
+    if (!this.canPlay()) return;
     const request=++this.queueRequest;
     try {
       $('#play-all').disabled=true;
@@ -325,6 +364,7 @@ export class PlaylistPlayer {
     finally {if(request===this.queueRequest)$('#play-all').disabled=false;}
   }
   start(items,name,id,resume=null) {
+    if (!this.canPlay()) return;
     ++this.queueRequest;$('#play-all').disabled=false;
     const seen=new Set();
     const playable=items.filter(item=>item.playback_url&&!seen.has(item.id)&&seen.add(item.id));
@@ -332,6 +372,7 @@ export class PlaylistPlayer {
     if(id&&!playable.some(item=>item.id===id)){toast('此片段当前不可播放。');return;}
     this.remember();this.segments=[];
     this.queueSave={key:null,sequence:0};
+    this.saved=null;
     this.queue=playable;this.name=name;this.visited=new Set();this.history=[];this.unavailable=new Set();
     $('#player-remembered').hidden=true;
     $('#player-queue-name').textContent=name;
@@ -342,7 +383,7 @@ export class PlaylistPlayer {
     this.play(id?playable.findIndex(item=>item.id===id):0,resume);
   }
   async play(index,resume=null,recovering=false) {
-    if(index<0||index>=this.queue.length)return;
+    if(!this.canPlay()||index<0||index>=this.queue.length)return;
     this.remember();
     const generation=++this.generation;
     this.abort?.abort();this.abort=new AbortController();
@@ -393,6 +434,7 @@ export class PlaylistPlayer {
     this.resume(generation);
   }
   async resume(generation) {
+    if (generation!==this.generation || !this.canPlay()) return;
     try {await this.video.play();}
     catch(error) {
       if(generation!==this.generation||error.name==='AbortError')return;
@@ -402,11 +444,24 @@ export class PlaylistPlayer {
       else this.handleFailure(Object.assign(new Error('暂时无法播放，请重试或打开原视频。'),{category:error.name==='NotSupportedError'?'unsupported':'network'}),generation);
     }
   }
-  stop() {
-    this.persistPreferences();this.remember();
+  stop(keepResume=false) {
+    const panel=$('#music-player'), remembered=$('#player-remembered'), current=this.queue[this.index];
+    if (keepResume && !this.persistenceSuspended) {
+      if (current && !panel.hidden)
+        this.saved={items:this.queue,current_id:current.id,logicalPlay:this.logicalPlay,...this.position()};
+    } else if (!panel.hidden || this.saved?.items===this.queue) {
+      this.saved=null;
+    }
+    this.persistPreferences();
+    // Closing removes the media source, so pagehide cannot capture this checkpoint later.
+    this.remember(keepResume);
     ++this.generation;++this.queueRequest;this.abort?.abort();this.segments=[];this.logicalPlay=null;this.handlingFailure=null;this.failed=false;
     this.video.pause();this.video.removeAttribute('src');this.video.load();
-    $('#music-player').hidden=true;$('#play-all').disabled=false;
+    panel.hidden=true;$('#play-all').disabled=false;
+    if (keepResume) {
+      this.updateResumeButton();
+      if (!remembered.hidden) remembered.focus({preventScroll:true});
+    } else remembered.hidden=true;
   }
   async loadPlaylists(id) {
     const previous=id??$('#playlist-select').value;
@@ -420,6 +475,7 @@ export class PlaylistPlayer {
     $('#playlist-play').disabled=empty;$('#playlist-edit').disabled=empty;
   }
   async playSaved() {
+    if (!this.canPlay()) return;
     const request=++this.queueRequest;
     try {
       const result=await this.api('/api/playlists/'+$('#playlist-select').value);
@@ -554,7 +610,8 @@ export class PlaylistPlayer {
     $('#playlist-copy-status').textContent = '';
     $('#playlist-copy-text').hidden = true;
     $('#playlist-copy-text').value = '';
-    const items=this.editing.items,query=$('#playlist-search').value,rows=this.matchingItems(items,query);
+    const input=$('#playlist-search'),query=input.value,items=this.editing.items,rows=this.matchingItems(items,query);
+    input.dataset.appliedQuery=query;
     $('#playlist-item-count').textContent=query.trim()?`${rows.length} / ${items.length} 首 · 仅筛选显示`:`${items.length} 首 · 按此顺序播放`;
     $('#playlist-items').innerHTML=rows.length?rows.map(({item,index})=>`<li><button type="button" class="playlist-drag-handle" data-drag-index="${index}" aria-label="拖动调整 ${e(item.display_song_title)} 的顺序" title="拖动调整顺序">⠿</button><span>${index+1}</span><b title="${e(item.raw_title||item.display_song_title)}">${e(item.display_song_title)}${item.playback_url?'':' · 当前不可用'}<small>${e(item.uploader_name)}</small></b><button type="button" class="icon-button" data-move="-1" data-item="${index}" aria-label="上移 ${e(item.display_song_title)}" ${index===0?'disabled':''}>↑</button><button type="button" class="icon-button" data-move="1" data-item="${index}" aria-label="下移 ${e(item.display_song_title)}" ${index===items.length-1?'disabled':''}>↓</button><button type="button" class="icon-button" data-remove="${index}" aria-label="移除 ${e(item.display_song_title)}">${icon('x')}</button></li>`).join(''):`<li class="playlist-search-empty">${items.length?'没有匹配的歌曲':'在列表中勾选歌曲后加入歌单，或添加当前筛选结果。'}</li>`;
   }

@@ -27,7 +27,7 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     assert.ok(all.length>=6);
     assert.ok(Object.hasOwn(all[0],'raw_title'),'Queue must include original video title');
     assert.ok(Object.hasOwn(all[0],'raw_part_title'),'Queue must include original part title');
-    const fixtures=all.slice(0,6).map((clip,index)=>({...clip,display_song_title:['第一首','月亮 Café','第三首','第四首','月亮之上','<夜色> ＭＯＯＮ'][index],uploader_name:index===4?'阿见':'CLANNADOR',raw_title:index===3?'隐藏标题 古典 2026':'原始标题 '+index,raw_part_title:index===2?'独特分P名称':'分P '+index}));
+    const fixtures=all.slice(0,6).map((clip,index)=>({...clip,display_song_title:['第一首','月亮 Café','第三首','第四首','月亮之上','<夜色> ＭＯＯＮ'][index],uploader_name:index===4?'阿见':'CLANNADOR',raw_title:index===3?'隐藏标题 古典 2026':index===0?'Fareeda 歌切':index===5?'法里達 歌切':'原始标题 '+index,raw_part_title:index===2?'独特分P名称':'分P '+index}));
     const fixtureById=new Map(fixtures.map(item=>[item.id,item]));
     let useFullQueue=false;
     await context.route('**/*',async route=>{
@@ -54,6 +54,32 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     await page.goto(base);await page.locator('#clip-rows tr').first().waitFor();
     await page.locator('#play-all').click();await until(()=>plays.length===1);
     assert.equal(await page.locator('#player-queue button').count(),6);
+    async function checkComposition(inputSelector, listSelector) {
+      await page.locator(inputSelector).waitFor({state:'visible'});
+      await page.locator(inputSelector).focus();
+      const actual=await page.locator(inputSelector).evaluate((input,listSelector)=>{
+        const list=document.querySelector(listSelector), first=list.firstElementChild;
+        input.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true}));
+        for(const value of ['f','fa','fali']){
+          input.value=value;
+          input.dispatchEvent(new InputEvent('input',{bubbles:true,isComposing:true}));
+        }
+        const unchanged=list.firstElementChild===first;
+        const enter=new KeyboardEvent('keydown',{key:'Enter',bubbles:true,isComposing:true,cancelable:true});
+        input.dispatchEvent(enter);
+        input.value='法里达';
+        input.dispatchEvent(new CompositionEvent('compositionend',{data:'法里达',bubbles:true}));
+        const committed=list.firstElementChild;
+        input.dispatchEvent(new InputEvent('input',{bubbles:true}));
+        return [unchanged,enter.defaultPrevented,list.children.length,list.firstElementChild===committed];
+      },listSelector);
+      assert.deepEqual(actual,[true,false,2,true]);
+    }
+    await checkComposition('#player-queue-search','#player-queue');
+    for(const query of ['Ｆａｒｅｅｄａ','Farida','法里達']){
+      await page.locator('#player-queue-search').fill(query);
+      assert.deepEqual(await page.locator('#player-queue button').evaluateAll(rows=>rows.map(row=>row.dataset.queueIndex)),['0','5']);
+    }
     await page.locator('#player-queue-search').fill('月亮');
     assert.equal(await page.locator('#player-queue button').count(),2);
     assert.equal(await page.locator('#player-queue-count').textContent(),'2 / 6 首');
@@ -98,6 +124,8 @@ async function until(check,timeout=20000){const end=Date.now()+timeout;while(Dat
     let saved=await(await fetch(base+'/api/playlists/'+savedId)).json();
     assert.deepEqual(saved.items.map(item=>item.id),fixtures.map(item=>item.id));
     await page.locator('#playlist-edit').click();
+    await checkComposition('#playlist-search','#playlist-items');
+    pass('Chinese IME keeps both lists stable until confirmation and searches all performer spellings after one redraw');
     await page.locator('#playlist-search').fill('月亮');
     assert.equal(await page.locator('#playlist-items li').count(),2);
     assert.match(await page.locator('#playlist-item-count').textContent(),/^2 \/ 6 首/);

@@ -5,7 +5,7 @@ const activeStates=new Set(['waiting','scanned']);
 
 export class AccountLogin {
   constructor(api, changed) {
-    this.api=api;this.changed=changed;this.preview=true;this.busy=false;this.initialized=false;this.stopped=false;
+    this.api=api;this.changed=changed;this.preview=true;this.busy=false;this.loggingOut=false;this.initialized=false;this.stopped=false;
     this.generation=0;this.revision=0;this.attempt=null;this.operations=Promise.resolve();
     this.dialog=$('#login-dialog');
     $('#account-toggle').onclick=()=>this.toggleMenu();
@@ -19,7 +19,7 @@ export class AccountLogin {
     document.addEventListener('click',event=>{if(!event.target.closest('#account-menu-wrap'))this.toggleMenu(false);});
     document.addEventListener('keydown',event=>{if(event.key==='Escape')this.toggleMenu(false);});
   }
-  canCollect() {return this.initialized&&(this.preview||this.auth?.state==='connected');}
+  canCollect() {return this.initialized && !this.loggingOut && (this.preview||this.auth?.state==='connected');}
   stop() {
     this.stopped=true;++this.generation;++this.revision;clearTimeout(this.timer);
     this.attempt=null;this.hideImage();this.toggleMenu(false);
@@ -54,9 +54,10 @@ export class AccountLogin {
     this.auth=auth;const preview=this.preview||auth.state==='preview',account=auth.account;
     const name=account?.name||(account?.uid?`UID ${account.uid}`:'哔哩哔哩账号');
     $('#account-name').textContent=name;$('#account-name').title=name;
-    $('#account-status').textContent=labels[auth.state]||'状态待检查';
+    const status=this.loggingOut?'正在退出登录':(labels[auth.state]||'状态待检查');
+    $('#account-status').textContent=status;
     $('#account-toggle').classList.toggle('connected',auth.state==='connected');
-    $('#account-toggle').setAttribute('aria-label',`${name}，${labels[auth.state]||'状态待检查'}，账号设置`);
+    $('#account-toggle').setAttribute('aria-label',`${name}，${status}，账号设置`);
     const avatar=$('#account-avatar');if(account)avatar.textContent=Array.from(account.name||'B')[0];else avatar.innerHTML=icon('user');
     $('#account-uid').textContent=account?.uid?`UID ${account.uid}`:'';
     $('#account-detail').textContent=preview?'演示预览不连接真实账号。':auth.message||(auth.state==='connected'?'采集将使用此账号。':auth.stored?'本机已保存登录信息，验证后即可使用。':'请扫码登录，验证后开始采集。');
@@ -99,19 +100,21 @@ export class AccountLogin {
   }
   async accountAction(action) {
     if(this.stopped||this.busy||this.preview)return;
-    this.busy=true;++this.revision;this.render(this.auth);this.toggleMenu(false);
+    this.busy=true;this.loggingOut=action==='logout';++this.revision;this.render(this.auth);this.toggleMenu(false);
     // Startup verification stays in the header. Open the login dialog only
     // after checking the saved session, so a valid login never flashes a QR box.
     if(action==='check'&&this.dialog.open&&!this.canCollect())this.showChecking();
     try {
       const auth=await this.api(`/api/auth/${action}`,{method:'POST'});
       if(this.stopped)return;
-      this.initialized=true;this.render(auth);
+      this.loggingOut=false;this.initialized=true;this.render(auth);
       if(action==='logout'){await this.changed();toast('已退出本机账号，采集任务已停止。');}
       await this.settle(auth);
     }catch(error){
       if(this.stopped)return;
-      this.initialized=true;$('#account-detail').textContent=error.message;
+      this.initialized=true;
+      if(this.loggingOut){this.loggingOut=false;this.render(this.auth);}
+      $('#account-detail').textContent=error.message;
       if(!this.canCollect()){this.showDialog();this.failure(error.message);$('#login-check').hidden=false;}
       else toast(error.message);
     }finally{

@@ -126,6 +126,13 @@ CLIP_JOINS = """ JOIN videos v ON v.bvid=p.video_bvid
  LEFT JOIN user_state u ON u.clip_id=p.id """
 CLIP_FROM = " FROM parts p" + CLIP_JOINS
 
+SOURCE_SELECT = """SELECT s.*, (SELECT COUNT(*) FROM memberships m WHERE m.source_id=s.id) AS submissions,
+            (SELECT COUNT(*) FROM memberships m JOIN parts p ON p.video_bvid=m.video_bvid WHERE m.source_id=s.id AND p.active=1) AS entries,
+            (SELECT COUNT(*) FROM curated_songs cs WHERE cs.source_id=s.id) AS listed_songs,
+            (SELECT COUNT(DISTINCT bvid) FROM curated_songs cs WHERE cs.source_id=s.id) AS linked_songs,
+            (SELECT MAX(fetched_at) FROM curated_songs cs WHERE cs.source_id=s.id) AS list_fetched_at
+            FROM sources s"""
+
 OVERVIEW_JOB_LIMIT = 10
 
 PLAYABLE = "p.active=1 AND v.verification_status='verified' AND v.availability_status='available'"
@@ -162,6 +169,10 @@ DETAIL_COLUMNS = """p.*,v.description,v.tags,v.availability_status,v.verificatio
 CLIP_SELECT = "SELECT " + DETAIL_COLUMNS + CLIP_FROM
 
 
+def search_text(value):
+    return normalize(value).replace("fareeda", "法里达").replace("farida", "法里达").replace("法里達", "法里达")
+
+
 def clip_order(sort):
     columns = {
         "newest": "v.published_at DESC",
@@ -186,6 +197,7 @@ class Database:
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
         con.create_function("fold", 1, normalize, deterministic=True)
+        con.create_function("search_text", 1, search_text, deterministic=True)
         try:
             with con:
                 yield con
@@ -221,15 +233,8 @@ class Database:
             return con.execute(sql, args).lastrowid
 
     def sources(self, include_status=False, *, recent_jobs=None):
-        rows = self.all("""SELECT s.*, (SELECT COUNT(*) FROM memberships m WHERE m.source_id=s.id) AS submissions,
-            (SELECT COUNT(*) FROM memberships m JOIN parts p ON p.video_bvid=m.video_bvid WHERE m.source_id=s.id AND p.active=1) AS entries,
-            (SELECT COUNT(*) FROM curated_songs cs WHERE cs.source_id=s.id) AS listed_songs,
-            (SELECT COUNT(DISTINCT bvid) FROM curated_songs cs WHERE cs.source_id=s.id) AS linked_songs,
-            (SELECT MAX(fetched_at) FROM curated_songs cs WHERE cs.source_id=s.id) AS list_fetched_at
-            FROM sources s ORDER BY s.id""")
-        for row in rows:
-            row["required_tags"] = json.loads(row["required_tags"])
-            row["last_error"] = json.loads(row["last_error"]) if row["last_error"] else None
+        with self.connect() as con:
+            rows = [self._source_row(row) for row in con.execute(SOURCE_SELECT + " ORDER BY s.id")]
         if include_status:
             if recent_jobs is None:
                 recent_jobs = self.jobs(OVERVIEW_JOB_LIMIT)
@@ -288,8 +293,20 @@ class Database:
                       scope=cp.get('scope'), unavailable=cp.get('unavailable', []), can_resume=state != 'completed' and job['state'] in {'failed','paused','interrupted','cancelled'})
         return result
 
+    @staticmethod
+    def _source_row(row):
+        row = dict(row)
+        row["required_tags"] = json.loads(row["required_tags"])
+        row["last_error"] = json.loads(row["last_error"]) if row["last_error"] else None
+        return row
+
+    def _read_source(self, con, source_id):
+        row = con.execute(SOURCE_SELECT + " WHERE s.id=?", (source_id,)).fetchone()
+        return self._source_row(row) if row is not None else None
+
     def source(self, source_id):
-        return next((s for s in self.sources() if s["id"] == source_id), None)
+        with self.connect() as con:
+            return self._read_source(con, source_id)
 
     def add_source(self, name, url, singing_collection=False):
         fields = parse_source(url)
@@ -299,21 +316,26 @@ class Database:
         return self.source(source_id)
 
     def update_source(self, source_id, patch):
-        source = self.source(source_id)
-        if not source:
-            raise KeyError(source_id)
-        if "url" in patch:
-            fields = parse_source(patch.pop("url"))
-            patch.update(fields)
-            patch.update(verification_status="pending", verified_uid=None, resolved_name=None, verification_method=None,
-                         last_complete_scan_at=None, last_refresh_at=None, last_discovery_at=None, last_error=None)
-            # A changed source retains cached video/user data but gets fresh memberships.
-            with self.connect() as con:
-                con.execute("DELETE FROM memberships WHERE source_id=?", (source_id,))
-                con.execute("UPDATE sources SET " + ",".join(k + "=?" for k in patch) + " WHERE id=?", [*patch.values(),source_id])
-        elif patch:
-            self.execute("UPDATE sources SET " + ",".join(k + "=?" for k in patch) + " WHERE id=?", [*patch.values(),source_id])
-        return self.source(source_id)
+        changes = dict(patch)
+        url = changes.pop("url", None)
+        with self.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            current = con.execute("SELECT canonical_url FROM sources WHERE id=?", (source_id,)).fetchone()
+            if current is None:
+                raise KeyError(source_id)
+            if url is not None and url.strip() != current["canonical_url"]:
+                identity = parse_source(url)
+                if identity["canonical_url"] != current["canonical_url"]:
+                    changes.update(identity)
+                    changes.update(verification_status="pending", verified_uid=None, resolved_name=None,
+                                   verification_method=None, last_complete_scan_at=None, last_refresh_at=None,
+                                   last_discovery_at=None, last_error=None)
+                    # Other sources and local video/user data keep their original records.
+                    con.execute("DELETE FROM memberships WHERE source_id=?", (source_id,))
+            if changes:
+                assignments = ",".join(key + "=?" for key in changes)
+                con.execute("UPDATE sources SET " + assignments + " WHERE id=?", [*changes.values(), source_id])
+            return self._read_source(con, source_id)
 
     def verified_source(self, source_id, identity):
         self.execute("UPDATE sources SET resolved_name=?,verified_uid=?,verification_status='verified',verification_method=?,last_error=NULL WHERE id=?", (identity["name"],identity["uid"],identity["method"],source_id))
@@ -404,13 +426,29 @@ class Database:
                     con.execute("INSERT INTO annotations(clip_id,display_song_title,inclusion_status,classification_reason,classification_version) VALUES(?,?,?,?,?)", (clip_id,title,status,reason,version))
             if collection_job:
                 job, cp = collection_job
-                if 'added_clips' in cp:
-                    cp['added_clips'] += added_clips
-                    cp['added_included'] += added_included
-                    # Count new local IDs in the same transaction as saving them.
-                    # Resume replay cannot double count a committed clip.
-                    con.execute("UPDATE sync_jobs SET checkpoints=? WHERE id=?", (encode(job['checkpoints']),job['id']))
+                next_cp, processed = self._write_video_checkpoint(con, source["id"], bvid, job, cp, added_clips, added_included)
+        if collection_job:
+            # The surrounding transaction has committed. A failed commit must
+            # leave the live checkpoint intact for the failure handler and resume.
+            cp.update(next_cp)
+            job["processed"] = processed
         return len(data["pages"])
+
+    @staticmethod
+    def _write_video_checkpoint(con, source_id, bvid, job, cp, added_clips, added_included):
+        seen = sorted({*cp.get("seen", ()), bvid})
+        next_cp = {**cp, "seen": seen, "processed": len(seen)}
+        if "added_clips" in cp:
+            next_cp["added_clips"] += added_clips
+            next_cp["added_included"] = cp.get("added_included", 0) + added_included
+        checkpoints = {**job["checkpoints"], str(source_id): next_cp}
+        processed = sum(checkpoint.get("processed", 0) for checkpoint in checkpoints.values())
+        heartbeat = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        update = con.execute("UPDATE sync_jobs SET checkpoints=?,processed=?,heartbeat=? WHERE id=?",
+                             (encode(checkpoints), processed, heartbeat, job["id"]))
+        if update.rowcount != 1:
+            raise ValueError("找不到此采集任务。")
+        return next_cp, processed
 
     def reuse_video(self, source, video, collection_job=None):
         # Reclassification and a new membership are not a fresh upstream retrieval.
@@ -430,9 +468,9 @@ class Database:
                 clauses.append("p.part_number=?")
                 args.append(part)
         elif q:
-            folded = normalize(q).replace("farida", "法里达")
+            folded = search_text(q)
             folded = folded.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            clauses.append("replace(fold(a.display_song_title || ' ' || a.song_group || ' ' || v.raw_title || ' ' || p.raw_part_title || ' ' || v.uploader_name || ' ' || v.tags),'farida','法里达') LIKE ? ESCAPE '\\'")
+            clauses.append("search_text(a.display_song_title || ' ' || a.song_group || ' ' || v.raw_title || ' ' || p.raw_part_title || ' ' || v.uploader_name || ' ' || v.tags) LIKE ? ESCAPE '\\'")
             args.append("%" + folded + "%")
         if source_id:
             clauses.append("EXISTS(SELECT 1 FROM memberships m WHERE m.video_bvid=v.bvid AND m.source_id=?)")

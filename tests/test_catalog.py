@@ -54,6 +54,14 @@ def test_unicode_parameterized_substring_search(db,source,video,query,expected):
     assert db.clips(q=query)["total"]==expected
 
 
+@pytest.mark.parametrize("performer", ["Fareeda", "法里達", "法里达", "Farida"])
+def test_performer_aliases_find_original_spelling(db, source, video, performer):
+    video["title"] = f"{performer} 直播翻唱"
+    db.save_video(source, video, [])
+    for query in ("ＦＡＲＥＥＤＡ", "Farida", "法里达", "法里達"):
+        assert db.clips(q=query, status="all")["total"] == 2
+
+
 def test_latin_spaces_punctuation_and_sort_entire_set(db,source,video):
     for index,title in enumerate(["Zulu","Ain't No Sunshine","Abba"],1):
         sample=deepcopy(video);sample["bvid"]=f"BV{index:010d}";sample["pages"]=sample["pages"][:1]

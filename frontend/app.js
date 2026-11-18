@@ -40,12 +40,12 @@ const accountLogin = new AccountLogin(api, async()=>{
   notice('');
   if(initialViewReady)await refresh();
 });
-const playlistPlayer = new PlaylistPlayer(api, parameters, selectedClips);
+const playlistPlayer = new PlaylistPlayer(api, parameters, selectedClips, ()=>accountLogin.canCollect() && !state.stopping);
 const miniPlayer = new MiniPlayer(playlistPlayer);
 connectMediaControls(playlistPlayer);
 async function quitApp() {
   if(state.stopping)return;
-  state.stopping=true;clearTimeout(pollTimer);
+  state.stopping=true;playlistPlayer.updateResumeButton();clearTimeout(pollTimer);
   $$('[data-quit-app]').forEach(button=>button.disabled=true);
   try {
     await playlistPlayer.persistPreferences();
@@ -60,14 +60,14 @@ async function quitApp() {
     $('#connection-label').textContent='应用已退出';
     $('.status-dot').style.background='var(--muted)';
   } catch(error) {
-    state.stopping=false;schedulePoll(10000);
+    state.stopping=false;playlistPlayer.updateResumeButton();schedulePoll(10000);
     $$('[data-quit-app]').forEach(button=>button.disabled=false);
     toast(error.message);
   }
 }
 $$('[data-quit-app]').forEach(button=>button.onclick=quitApp);
 $('#shutdown-dialog').addEventListener('cancel',event=>event.preventDefault());
-document.addEventListener('farida-auth-change',()=>{renderJob();if(!accountLogin.canCollect())playlistPlayer.stop();if(state.view==='sources')renderSources();});
+document.addEventListener('farida-auth-change',()=>{renderJob();if(!accountLogin.canCollect())playlistPlayer.stop(accountLogin.loggingOut);else playlistPlayer.updateResumeButton();if(state.view==='sources')renderSources();});
 function parameters() {
   const result=new URLSearchParams({status:state.filter==='bookmarked'?'all':state.filter,sort:$('#sort').value,page:state.page,page_size:state.pageSize});
   const inputs={q:'#search',source_id:'#source-filter',uploader:'#uploader-filter',after:'#after',before:'#before'};
@@ -619,6 +619,7 @@ $('#backup-file').onchange=async event=>{
     // Keep the current player intact while validating the file. Once replaced,
     // stale saves from this page must never reach the restored catalog.
     playlistPlayer.persistenceSuspended=true;
+    playlistPlayer.updateResumeButton();
     await playlistPlayer.saveChain;
     const result=await api('/api/restore',{method:'POST',body:file});
     playlistPlayer.preferencesReady=false;
@@ -628,6 +629,7 @@ $('#backup-file').onchange=async event=>{
     location.reload();
   } catch(error){
     playlistPlayer.persistenceSuspended=false;
+    playlistPlayer.updateResumeButton();
     playlistPlayer.persistPreferences();
     playlistPlayer.remember();
     if(!playlistPlayer.video.paused)playlistPlayer.recordHistory();
