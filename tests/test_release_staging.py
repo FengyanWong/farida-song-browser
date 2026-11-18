@@ -48,3 +48,17 @@ def test_retargeted_staging_path_is_never_removed(tmp_path, monkeypatch, capsys)
         monkeypatch.setattr(Path, "resolve", changed)
     assert sibling.is_dir() and current.is_dir()
     assert "staging path changed" in capsys.readouterr().err
+
+
+def test_checksums_only_cover_named_downloads_for_one_exact_version(tmp_path):
+    import hashlib
+
+    valid = {"FaridaSongBrowser-0.0.2-windows-x64.exe": b"large" * 50000,
+             "FaridaSongBrowser-0.0.2-dependency-sources.zip": b"source"}
+    for name, content in valid.items():
+        (tmp_path / name).write_bytes(content)
+    for extra in ("FaridaSongBrowser-0.0.26-windows-x64.exe", "personal-0.0.2.txt", "SHA256SUMS.txt"):
+        (tmp_path / extra).write_text("unrelated")
+    release_staging.write_release_checksums(tmp_path, "0.0.2")
+    assert (tmp_path / "SHA256SUMS.txt").read_text().splitlines() == [
+        f"{hashlib.sha256(valid[name]).hexdigest()}  {name}" for name in sorted(valid)]

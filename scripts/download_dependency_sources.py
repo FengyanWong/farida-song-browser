@@ -11,6 +11,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 from farida import __version__
+if __package__:
+    from .release_staging import write_release_checksums
+else:
+    from release_staging import write_release_checksums
 
 
 def download_source(requirement):
@@ -52,9 +56,7 @@ def main():
                         "Application source and build instructions: https://github.com/FengyanWong/farida-song-browser/tree/v"
                         + __version__ + "\nThe Python runtime is distributed under the Python Software Foundation license; "
                         "the binary ZIP contains its full license notices.\n")
-    assets = sorted(path for path in destination.iterdir() if path.is_file() and f"-{__version__}" in path.name)
-    (destination / "SHA256SUMS.txt").write_text(
-        "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in assets), encoding="utf-8")
+    write_release_checksums(destination, __version__)
     print(json.dumps({"source_distributions": len(sources), "archive": output.name,
                       "bytes": output.stat().st_size}, indent=2))
 

@@ -1,5 +1,4 @@
 """Build the Windows x64 single-file executable and downloadable release files."""
-import hashlib
 import importlib.metadata as metadata
 import json
 import os
@@ -15,9 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 from farida import __version__
 if __package__:
-    from .release_staging import staging_directory
+    from .release_staging import staging_directory, write_release_checksums
 else:
-    from release_staging import staging_directory
+    from release_staging import staging_directory, write_release_checksums
 
 
 def runtime_packages():
@@ -135,9 +134,7 @@ def build_release(snapshot, build, dist, release, licenses, work):
         target = release / target_name
         shutil.copy2(ROOT / "data" / source_name, target)
         downloads.append(target)
-    all_assets = sorted(path for path in release.iterdir() if path.is_file() and f"-{__version__}" in path.name)
-    (release / "SHA256SUMS.txt").write_text(
-        "".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in all_assets), encoding="utf-8")
+    write_release_checksums(release, __version__)
     print(json.dumps({"version": __version__, "catalog": snapshot["counts"],
                       "files": [{"name": path.name, "bytes": path.stat().st_size} for path in downloads]}, indent=2))
 
